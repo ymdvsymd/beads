@@ -1,0 +1,37 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '30 1 * * *'  # 毎日01:30 UTC (最頻PRマージ時間01:00の30分後)
+  workflow_dispatch:      # 手動実行も可能
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/steveyegge/beads.git
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Merge upstream/main
+        run: |
+          git merge upstream/main --no-edit --allow-unrelated-histories || {
+            echo "Merge conflict detected. Manual intervention required."
+            exit 1
+          }
+
+      - name: Push changes
+        run: git push origin main
