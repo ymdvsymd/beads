@@ -73,8 +73,8 @@ bd create "Bug description" -t bug -p 0 --json
 ### Working on Issues
 
 ```bash
-# Update status to in_progress
-bd update <issue-id> --status in_progress
+# Start work (atomic claim)
+bd update <issue-id> --claim
 
 # Add a comment
 bd comments add <issue-id> "Progress update"
@@ -99,7 +99,7 @@ bd dep tree <issue-id>
 2. **Create issues proactively**: When you notice work, file it immediately
 3. **Link discovered work**: Use `bd dep add --type discovered-from`
 4. **Close with context**: Always provide --reason when closing
-5. **Commit .beads/**: The .beads/issues.jsonl file should be committed to git
+5. **Sync changes**: Run `bd sync` to push changes to the Dolt remote
 ```
 
 ### Step 4: Commit and Push
@@ -118,7 +118,7 @@ git push
 2. **Hook runs** → `.claude/hooks/session-start.sh` executes automatically
 3. **npm install** → Downloads @beads/bd package from npm
 4. **Postinstall** → Downloads native bd binary for platform (~17MB)
-5. **bd init** → Imports existing issues from `.beads/issues.jsonl` in git
+5. **bd init** → Sets up the .beads directory and Dolt database
 6. **Ready** → `bd` command is available, shows ready work
 
 **Time: ~5-10 seconds**
@@ -126,8 +126,7 @@ git push
 ### Subsequent Sessions
 
 Same process, but:
-- Git clone pulls existing `.beads/issues.jsonl`
-- `bd init --quiet` imports all existing issues
+- `bd init --quiet` sets up Dolt and syncs existing data
 - Agent picks up right where it left off
 
 **Time: ~5-10 seconds**
@@ -147,7 +146,7 @@ System: bd-a1b2 [P1] Fix authentication bug
 System: bd-f14c [P1] Add user profile page
 System:
 Agent: I can see there are 2 ready tasks. Let me work on bd-a1b2 (Fix authentication bug).
-Agent: [runs] bd update bd-a1b2 --status in_progress
+Agent: [runs] bd update bd-a1b2 --claim
 ```
 
 ### Pattern 2: Discovering New Work
@@ -272,11 +271,11 @@ bd version
 bd init
 ```
 
-### "Issues.jsonl merge conflict"
+### "Merge conflict during sync"
 
 **Cause**: Two sessions modified issues concurrently
 
-**Fix**: See the main beads TROUBLESHOOTING.md for merge resolution
+**Fix**: Run `bd sync` to resolve via Dolt's merge. See the main beads TROUBLESHOOTING.md for details.
 
 ### Slow Installation
 
@@ -315,25 +314,25 @@ You have access to bd (beads) for issue tracking. It's automatically installed i
 WORKFLOW:
 1. Start each session: Check `bd ready --json` for available work
 2. Choose a task: Pick highest priority with no blockers
-3. Update status: `bd update <id> --status in_progress`
+3. Start work: `bd update <id> --claim`
 4. Work on it: Implement, test, document
 5. File new issues: Create issues for any work discovered
 6. Link issues: Use `bd dep add` to track relationships
 7. Close when done: `bd close <id> --reason "what you did"`
-8. Commit changes: Include .beads/issues.jsonl in commits
+8. Sync changes: Run `bd sync` at end of session
 
 ALWAYS:
 - Use --json flags for programmatic parsing
 - Create issues proactively (don't let work be forgotten)
 - Link related issues with dependencies
 - Close issues with descriptive reasons
-- Commit .beads/issues.jsonl with code changes
+- Run `bd sync` at end of sessions
 
 NEVER:
 - Use markdown TODOs (use bd instead)
 - Work on blocked issues (check `bd show <id>` for blockers)
 - Close issues without --reason
-- Forget to commit .beads/issues.jsonl
+- Forget to run `bd sync` at end of sessions
 ```
 
 ## 🎉 Success Criteria

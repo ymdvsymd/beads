@@ -18,9 +18,6 @@ First time in a repository:
 # Basic setup (prompts for contributor mode)
 bd init
 
-# Dolt backend (version-controlled SQL database)
-bd init --backend dolt
-
 # OSS contributor (fork workflow with separate planning repo)
 bd init --contributor
 
@@ -32,18 +29,17 @@ bd init --branch beads-sync
 ```
 
 The wizard will:
-- Create `.beads/` directory and database
+- Create `.beads/` directory and Dolt database
 - **Prompt for your role** (maintainer or contributor) unless a flag is provided
 - Import existing issues from git (if any)
 - Prompt to install git hooks (recommended)
 - Prompt to configure git merge driver (recommended)
-- Auto-start daemon for sync (SQLite backend only)
+- Auto-start Dolt server for database operations
 
 Notes:
-- SQLite backend stores data in `.beads/beads.db`.
-- Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
-- Dolt backend runs **single-process-only**; daemon mode is disabled.
-- Dolt backend **auto-commits** after each successful write command by default (`dolt.auto-commit: on`). Disable with `bd --dolt-auto-commit off ...` or config.
+- Dolt is the default (and only) storage backend. Data is stored in `.beads/dolt/`.
+- Dolt uses a `dolt sql-server` for database operations.
+- To migrate from an older SQLite installation, run `bd migrate --to-dolt`.
 
 ### Role Configuration
 
@@ -88,15 +84,6 @@ git config --get beads.role
 
 **Note:** Issue IDs are hash-based (e.g., `bd-a1b2`, `bd-f14c`) to prevent collisions when multiple agents/branches work concurrently.
 
-**Dependency visibility:** When issues have blocking dependencies, `bd list` shows them inline:
-```
-○ bd-a1b2 [P1] [task] - Set up database
-○ bd-f14c [P2] [feature] - Create API (blocked by: bd-a1b2)
-○ bd-g25d [P2] [feature] - Add authentication (blocked by: bd-f14c)
-```
-
-This makes dependencies unmissable when reviewing epic subtasks.
-
 ## Hierarchical Issues (Epics)
 
 For large features, use hierarchical IDs to organize work:
@@ -107,9 +94,9 @@ For large features, use hierarchical IDs to organize work:
 # Returns: bd-a3f8e9
 
 # Create child tasks (automatically get .1, .2, .3 suffixes)
-./bd create "Design login UI" -p 1       # bd-a3f8e9.1
-./bd create "Backend validation" -p 1    # bd-a3f8e9.2
-./bd create "Integration tests" -p 1     # bd-a3f8e9.3
+./bd create "Design login UI" -p 1 --parent bd-a3f8e9       # bd-a3f8e9.1
+./bd create "Backend validation" -p 1 --parent bd-a3f8e9    # bd-a3f8e9.2
+./bd create "Integration tests" -p 1 --parent bd-a3f8e9     # bd-a3f8e9.3
 
 # View hierarchy
 ./bd dep tree bd-a3f8e9
@@ -147,6 +134,13 @@ Output:
     → bd-1: Set up database [P1] (open)
 ```
 
+**Dependency visibility:** `bd list` shows blocking dependencies inline:
+```
+○ bd-a1b2 [P1] [task] - Set up database
+○ bd-f14c [P2] [feature] - Create API (blocked by: bd-a1b2)
+○ bd-g25d [P2] [feature] - Add authentication (blocked by: bd-f14c)
+```
+
 ## Find Ready Work
 
 ```bash
@@ -166,7 +160,7 @@ Only bd-1 is ready because bd-2 and bd-3 are blocked!
 
 ```bash
 # Start working on bd-1
-./bd update bd-1 --status in_progress
+./bd update bd-1 --claim
 
 # Complete it
 ./bd close bd-1 --reason "Database setup complete"
@@ -229,10 +223,10 @@ As your project accumulates closed issues, the database grows. Manage size with 
 bd admin compact --stats
 
 # Preview compaction candidates (30+ days closed)
-bd admin compact --analyze --json --no-daemon
+bd admin compact --analyze --json
 
 # Apply agent-generated summary
-bd admin compact --apply --id bd-42 --summary summary.txt --no-daemon
+bd admin compact --apply --id bd-42 --summary summary.txt
 
 # Immediately delete closed issues (CAUTION: permanent!)
 bd admin cleanup --force
@@ -245,33 +239,12 @@ bd admin cleanup --force
 
 **Note:** Compaction is permanent graceful decay. Original content is discarded but viewable via `bd restore <id>` from git history.
 
-## Background Daemon
-
-bd runs a background daemon for auto-sync and performance. You rarely need to manage it directly:
-
-```bash
-# Check daemon status
-bd info | grep daemon
-
-# List all running daemons
-bd daemons list
-
-# Force direct mode (skip daemon)
-bd --no-daemon ready
-```
-
-**When to disable daemon:**
-- Git worktrees (required: `bd --no-daemon`)
-- CI/CD pipelines
-- Resource-constrained environments
-
-See [DAEMON.md](DAEMON.md) for complete daemon management guide.
-
 ## Next Steps
 
 - Add labels: `./bd create "Task" -l "backend,urgent"`
 - Filter ready work: `./bd ready --priority 1`
 - Search issues: `./bd list --status open`
 - Detect cycles: `./bd dep cycles`
+- Use gates for PR/CI sync: See [DEPENDENCIES.md](DEPENDENCIES.md)
 
 See [README.md](../README.md) for full documentation.

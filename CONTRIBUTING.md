@@ -38,7 +38,7 @@ beads/
 ├── internal/
 │   ├── types/           # Core data types (Issue, Dependency, etc.)
 │   └── storage/         # Storage interface and implementations
-│       └── sqlite/      # SQLite backend
+│       └── dolt/        # Dolt database backend
 ├── .golangci.yml        # Linter configuration
 └── .github/workflows/   # CI/CD pipelines
 ```
@@ -54,7 +54,7 @@ go test -v -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Run specific package tests
-go test ./internal/storage/sqlite -v
+go test ./internal/storage/dolt/ -v
 
 # Run tests with race detection
 go test -race ./...
@@ -113,18 +113,6 @@ Add cycle detection for dependency graphs
 - Update documentation with examples
 ```
 
-### Important: Don't Include .beads/issues.jsonl Changes
-
-The `.beads/issues.jsonl` file is the project's issue database. **Do not include changes to this file in your PR.** CI will fail if this file is modified.
-
-If you accidentally committed changes to this file, fix it with:
-
-```bash
-git checkout origin/main -- .beads/issues.jsonl
-git commit --amend
-git push --force
-```
-
 ### Pull Requests
 
 - Keep PRs focused on a single feature or fix
@@ -132,7 +120,6 @@ git push --force
 - Update documentation as needed
 - Ensure CI passes before requesting review
 - Respond to review feedback promptly
-- **Do not include `.beads/issues.jsonl` changes** (see above)
 
 ## Testing Guidelines
 
@@ -180,13 +167,13 @@ go test -race -coverprofile=coverage.out ./...
 
 ### Dual-Mode Testing Pattern
 
-**IMPORTANT**: bd supports two execution modes: *direct mode* (SQLite access) and *daemon mode* (RPC via background process). Commands must work identically in both modes. To prevent bugs like GH#719, GH#751, and bd-fu83, use the dual-mode test framework for testing commands.
+**IMPORTANT**: bd supports two execution modes: *embedded mode* (direct Dolt database access) and *server mode* (RPC via Dolt server). Commands must work identically in both modes. To prevent bugs like GH#719, GH#751, and bd-fu83, use the dual-mode test framework for testing commands.
 
 ```go
 // cmd/bd/dual_mode_test.go provides the framework
 
 func TestMyCommand(t *testing.T) {
-    // This test runs TWICE: once in direct mode, once with a live daemon
+    // This test runs TWICE: once in embedded mode, once with a live Dolt server
     RunDualModeTest(t, "my_test", func(t *testing.T, env *DualModeTestEnv) {
         // Create test data using mode-agnostic helpers
         issue := &types.Issue{
@@ -220,7 +207,7 @@ Available `DualModeTestEnv` helper methods:
 - `ListIssues(filter)` - List issues matching filter
 - `GetReadyWork()` - Get issues ready for work
 - `AddLabel(id, label)` - Add a label to an issue
-- `Mode()` - Returns "direct" or "daemon" for error messages
+- `Mode()` - Returns "embedded" or "server" for error messages
 
 Run dual-mode tests:
 ```bash
@@ -312,14 +299,27 @@ go build -o bd ./cmd/bd && ./bd init --prefix test
 ### Database Inspection
 
 ```bash
-# Inspect the SQLite database directly
-sqlite3 .beads/test.db
-
-# Useful queries
-SELECT * FROM issues;
-SELECT * FROM dependencies;
-SELECT * FROM events WHERE issue_id = 'test-1';
+# Inspect the Dolt database directly
+bd query "SELECT * FROM issues"
+bd query "SELECT * FROM dependencies"
+bd query "SELECT * FROM events WHERE issue_id = 'test-1'"
 ```
+
+### Updating Nix flake.lock (without nix installed)
+
+The `flake.lock` file pins a specific nixpkgs revision. When `go.mod` bumps the Go version beyond what's in the pinned nixpkgs, the Nix CI job will fail. To update `flake.lock` without installing nix locally, use Docker:
+
+```bash
+# Update flake.lock
+docker run --rm -v $(pwd):/workspace -w /workspace nixos/nix \
+  sh -c 'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && nix flake update'
+
+# Verify the build works
+docker run --rm -v $(pwd):/workspace -w /workspace nixos/nix \
+  sh -c 'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && nix build .#default && ./result/bin/bd version'
+```
+
+If the build fails with a `vendorHash` mismatch, update `default.nix` with the `got:` hash from the error message and rebuild.
 
 ### Debugging
 

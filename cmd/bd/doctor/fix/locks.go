@@ -7,16 +7,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/lockfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // StaleLockFiles removes stale lock files from the .beads directory.
 // This is safe because:
 // - Bootstrap/sync/startup locks use flock, which is released on process exit
 // - If the flock is released but the file remains, the file is just clutter
-// - Daemon lock staleness is verified via flock probe (not just file age)
 func StaleLockFiles(path string) error {
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return nil
 	}
@@ -50,16 +49,29 @@ func StaleLockFiles(path string) error {
 		}
 	}
 
-	// Remove stale daemon lock (only if no process holds the flock)
-	daemonLockPath := filepath.Join(beadsDir, "daemon.lock")
-	if _, err := os.Stat(daemonLockPath); err == nil {
-		running, _ := lockfile.TryDaemonLock(beadsDir)
-		if !running {
-			if err := os.Remove(daemonLockPath); err != nil {
-				errors = append(errors, fmt.Sprintf("daemon.lock: %v", err))
+	// Remove stale dolt-access.lock (embedded dolt advisory flock).
+	// This lock uses flock which is released on process exit, but the file
+	// persists and can confuse diagnostics or cause issues if flock behavior
+	// varies across platforms.
+	accessLockPath := filepath.Join(beadsDir, "dolt-access.lock")
+	if info, err := os.Stat(accessLockPath); err == nil {
+		age := time.Since(info.ModTime())
+		if age > 5*time.Minute {
+			if err := os.Remove(accessLockPath); err != nil {
+				errors = append(errors, fmt.Sprintf("dolt-access.lock: %v", err))
 			} else {
-				removed = append(removed, "daemon.lock")
+				removed = append(removed, "dolt-access.lock")
 			}
+		}
+	}
+
+	// Remove stale Dolt noms LOCK files via shared helper.
+	// Same cleanup that runs pre-flight in PersistentPreRun.
+	doltDir := getDatabasePath(beadsDir)
+	if n, errs := dolt.CleanStaleNomsLocks(doltDir); n > 0 {
+		removed = append(removed, fmt.Sprintf("%d noms LOCK file(s)", n))
+		for _, e := range errs {
+			errors = append(errors, e.Error())
 		}
 	}
 

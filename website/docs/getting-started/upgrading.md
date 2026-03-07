@@ -21,10 +21,34 @@ bd info --whats-new --json  # Machine-readable
 
 ## Upgrading
 
+Use the command that matches your install method.
+
+| Install method | Platforms | Command |
+|---|---|---|
+| Quick install script | macOS, Linux, FreeBSD | `curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh \| bash` |
+| PowerShell installer | Windows | `irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 \| iex` |
+| Homebrew | macOS, Linux | `brew upgrade beads` |
+| go install | macOS, Linux, FreeBSD, Windows | `go install github.com/steveyegge/beads/cmd/bd@latest` |
+| npm | macOS, Linux, Windows | `npm update -g @beads/bd` |
+| bun | macOS, Linux, Windows | `bun install -g --trust @beads/bd` |
+| From source (Unix shell) | macOS, Linux, FreeBSD | `git pull && go build -o bd ./cmd/bd` |
+
+### Quick install script (macOS/Linux/FreeBSD)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+```
+
+### PowerShell installer (Windows)
+
+```pwsh
+irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+```
+
 ### Homebrew
 
 ```bash
-brew upgrade bd
+brew upgrade beads
 ```
 
 ### go install
@@ -44,7 +68,7 @@ sudo mv bd /usr/local/bin/
 
 ## After Upgrading
 
-**Important:** After upgrading, update your hooks and restart daemons:
+**Important:** After upgrading, update your hooks:
 
 ```bash
 # 1. Check what changed
@@ -53,11 +77,11 @@ bd info --whats-new
 # 2. Update git hooks to match new version
 bd hooks install
 
-# 3. Restart all daemons
-bd daemons killall
-
-# 4. Check for any outdated hooks
+# 3. Check for any outdated hooks
 bd info  # Shows warnings if hooks are outdated
+
+# 4. If using Dolt backend, restart the server
+bd dolt stop && bd dolt start
 ```
 
 **Why update hooks?** Git hooks are versioned with bd. Outdated hooks may miss new auto-sync features or bug fixes.
@@ -80,28 +104,7 @@ bd migrate
 bd migrate --cleanup --yes
 ```
 
-## Daemon Version Mismatches
-
-If you see daemon version mismatch warnings:
-
-```bash
-# List all running daemons
-bd daemons list --json
-
-# Check for version mismatches
-bd daemons health --json
-
-# Restart all daemons with new version
-bd daemons killall --json
-```
-
 ## Troubleshooting Upgrades
-
-### Old daemon still running
-
-```bash
-bd daemons killall
-```
 
 ### Hooks out of date
 
@@ -122,5 +125,5 @@ Check the import configuration:
 
 ```bash
 bd config get import.orphan_handling
-bd import -i .beads/issues.jsonl --orphan-handling allow
+bd import -i backup.jsonl --orphan-handling allow
 ```

@@ -7,13 +7,18 @@ before:
   hooks:
     # Ensure dependencies are up to date
     - go mod tidy
+    # Generate Windows PE version info resources (.syso files)
+    # Reduces antivirus false positives by embedding legitimate metadata
+    - ./scripts/gen-winres.sh
 
 builds:
   - id: bd-linux-amd64
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
+      - CC=gcc
+      - CXX=g++
     goos:
       - linux
     goarch:
@@ -24,12 +29,18 @@ builds:
       - -X main.Build={{.ShortCommit}}
       - -X main.Commit={{.Commit}}
       - -X main.Branch={{.Branch}}
+    hooks:
+      post:
+        - ./scripts/verify-cgo.sh "{{ .Path }}"
 
   - id: bd-linux-arm64
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
+      - CC=aarch64-linux-gnu-gcc
+    tags:
+      - gms_pure_go
     goos:
       - linux
     goarch:
@@ -40,12 +51,17 @@ builds:
       - -X main.Build={{.ShortCommit}}
       - -X main.Commit={{.Commit}}
       - -X main.Branch={{.Branch}}
+    hooks:
+      post:
+        - ./scripts/verify-cgo.sh "{{ .Path }}"
 
   - id: bd-android-arm64
     main: ./cmd/bd
     binary: bd
     env:
       - CGO_ENABLED=0
+    tags:
+      - gms_pure_go
     goos:
       - android
     goarch:
@@ -62,6 +78,9 @@ builds:
     binary: bd
     env:
       - CGO_ENABLED=0
+    tags:
+      - gms_pure_go
+      - netgo
     goos:
       - darwin
     goarch:
@@ -78,6 +97,9 @@ builds:
     binary: bd
     env:
       - CGO_ENABLED=0
+    tags:
+      - gms_pure_go
+      - netgo
     goos:
       - darwin
     goarch:
@@ -93,7 +115,10 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
+      - CC=x86_64-w64-mingw32-gcc
+    tags:
+      - gms_pure_go
     goos:
       - windows
     goarch:
@@ -107,6 +132,7 @@ builds:
       - -buildmode=exe
     hooks:
       post:
+        - ./scripts/verify-cgo.sh "{{ .Path }}"
         # Sign Windows executable with Authenticode certificate
         # Requires WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD secrets
         - ./scripts/sign-windows.sh "{{ .Path }}"
@@ -115,7 +141,11 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
+      - CC=/tmp/zigcc/cc-aarch64-windows-gnu
+
+    tags:
+      - gms_pure_go
     goos:
       - windows
     goarch:
@@ -129,6 +159,7 @@ builds:
       - -buildmode=exe
     hooks:
       post:
+        - ./scripts/verify-cgo.sh "{{ .Path }}"
         # Sign Windows executable with Authenticode certificate
         # Requires WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD secrets
         - ./scripts/sign-windows.sh "{{ .Path }}"
@@ -138,6 +169,8 @@ builds:
     binary: bd
     env:
       - CGO_ENABLED=0
+    tags:
+      - gms_pure_go
     goos:
       - freebsd
     goarch:
@@ -160,6 +193,20 @@ archives:
       - LICENSE
       - README.md
       - CHANGELOG.md
+
+brews:
+  - name: bd
+    repository:
+      owner: steveyegge
+      name: homebrew-beads
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    skip_upload: auto
+    homepage: "https://github.com/steveyegge/beads"
+    description: "AI-supervised issue tracker for coding workflows"
+    license: "MIT"
+    install: |
+      bin.install "bd"
 
 checksum:
   name_template: "checksums.txt"

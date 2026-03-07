@@ -7,7 +7,20 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
+
+// transact wraps store.RunInTransaction and marks that a transactional
+// DOLT_COMMIT occurred, preventing the redundant maybeAutoCommit in
+// PersistentPostRun. Use this instead of calling store.RunInTransaction
+// directly from command handlers.
+func transact(ctx context.Context, s *dolt.DoltStore, commitMsg string, fn func(tx storage.Transaction) error) error {
+	err := s.RunInTransaction(ctx, commitMsg, fn)
+	if err == nil {
+		commandDidExplicitDoltCommit = true
+	}
+	return err
+}
 
 type doltAutoCommitParams struct {
 	// Command is the top-level bd command name (e.g., "create", "update").
@@ -21,21 +34,24 @@ type doltAutoCommitParams struct {
 // maybeAutoCommit creates a Dolt commit after a successful write command when enabled.
 //
 // Semantics:
-// - Only applies when dolt auto-commit is enabled (on) AND the active store is versioned (Dolt).
-// - Uses Dolt's "commit all" behavior under the hood (DOLT_COMMIT -Am).
-// - Treats "nothing to commit" as a no-op.
+//   - Only applies when dolt auto-commit is "on" AND the active store is versioned (Dolt).
+//   - In "batch" mode, commits are deferred — changes accumulate in the working set
+//     until an explicit commit point (bd sync, bd dolt commit).
+//   - Uses Dolt's "commit all" behavior under the hood (DOLT_COMMIT -Am).
+//   - Treats "nothing to commit" as a no-op.
 func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 	mode, err := getDoltAutoCommitMode()
 	if err != nil {
 		return err
 	}
+	// In batch mode, skip per-command commits. Changes stay in the working set
+	// and are committed at logical boundaries (bd sync, bd dolt commit).
 	if mode != doltAutoCommitOn {
 		return nil
 	}
 
 	st := getStore()
-	vs, ok := storage.AsVersioned(st)
-	if !ok {
+	if st == nil || st.IsClosed() {
 		return nil
 	}
 
@@ -44,7 +60,7 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		msg = formatDoltAutoCommitMessage(p.Command, getActor(), p.IssueIDs)
 	}
 
-	if err := vs.Commit(ctx, msg); err != nil {
+	if err := st.Commit(ctx, msg); err != nil {
 		if isDoltNothingToCommit(err) {
 			return nil
 		}

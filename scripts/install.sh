@@ -74,6 +74,40 @@ resign_for_macos() {
 detect_platform() {
     local os arch
 
+    # Detect Windows environments where this bash script won't produce a usable install.
+    # MSYS2, Git Bash, and Cygwin report MINGW*, MSYS*, or CYGWIN* from uname -s.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            log_error "Windows detected ($(uname -s))."
+            echo ""
+            echo "  This bash installer is for macOS/Linux. On Windows, use the PowerShell installer:"
+            echo ""
+            echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
+            echo ""
+            exit 1
+            ;;
+    esac
+
+    # Detect WSL (Windows Subsystem for Linux).
+    # WSL reports uname -s as "Linux" but installs into the Linux filesystem,
+    # which is not accessible from native Windows tools.
+    if [ -f /proc/version ] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
+        log_warning "WSL (Windows Subsystem for Linux) detected."
+        echo ""
+        echo "  This will install the Linux version of bd, usable only inside WSL."
+        echo "  If you want bd available in native Windows (PowerShell, cmd), use:"
+        echo ""
+        echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
+        echo ""
+        # Only show interactive message and pause if running in a terminal (skip in CI/non-interactive shells)
+        if [ -t 0 ]; then
+            echo "  Continuing with Linux install for WSL in 5 seconds... (Ctrl+C to cancel)"
+            sleep 5
+        else
+            echo "  Continuing with Linux install (non-interactive mode)..."
+        fi
+    fi
+
     case "$(uname -s)" in
         Darwin)
             os="darwin"
@@ -109,23 +143,18 @@ detect_platform() {
     echo "${os}_${arch}"
 }
 
-# Stop existing daemons before upgrade (safe for fresh installs)
-stop_existing_daemons() {
-    # Skip if bd isn't installed (fresh install)
-    if ! command -v bd &> /dev/null; then
-        return 0
-    fi
+# Create 'beads' symlink alias for bd
+create_beads_alias() {
+    local install_dir=$1
 
-    log_info "Stopping existing bd daemons before upgrade..."
-
-    # Try graceful shutdown via bd daemons killall
-    if bd daemons killall 2>/dev/null; then
-        log_success "Stopped existing daemons"
+    log_info "Creating 'beads' alias..."
+    rm -f "$install_dir/beads"
+    if [[ -w "$install_dir" ]]; then
+        ln -s bd "$install_dir/beads"
     else
-        log_warning "No daemons running or failed to stop (continuing anyway)"
+        sudo ln -s bd "$install_dir/beads"
     fi
-
-    return 0
+    log_success "Created 'beads' alias -> bd"
 }
 
 # Download and install from GitHub releases
@@ -217,6 +246,9 @@ install_from_release() {
     # Re-sign for macOS to avoid Gatekeeper delays
     resign_for_macos "$install_dir/bd"
 
+    # Create 'beads' alias symlink
+    create_beads_alias "$install_dir"
+
     log_success "bd installed to $install_dir/bd"
 
     # Check if install_dir is in PATH
@@ -260,11 +292,36 @@ check_go() {
     fi
 }
 
+# Verify a built/installed binary has CGO enabled.
+verify_binary_has_cgo() {
+    local binary_path=$1
+    local install_method=$2
+
+    if [[ ! -f "$binary_path" ]]; then
+        log_error "Expected binary not found at $binary_path"
+        return 1
+    fi
+
+    if ! command -v strings &> /dev/null; then
+        log_warning "'strings' not found; unable to verify CGO metadata for $binary_path"
+        return 0
+    fi
+
+    if strings "$binary_path" | awk '/^build[[:space:]]+CGO_ENABLED=0$/ { found=1 } END { exit(found?0:1) }'; then
+        log_error "Binary produced by ${install_method} was built without CGO support"
+        log_warning "CGO is required for some features. Install ICU headers and retry."
+        return 1
+    fi
+
+    log_success "Verified CGO support in $binary_path"
+    return 0
+}
+
 # Install using go install (fallback)
 install_with_go() {
     log_info "Installing bd using 'go install'..."
 
-    if go install github.com/steveyegge/beads/cmd/bd@latest; then
+    if CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest; then
         log_success "bd installed successfully via go install"
 
         # Record where we expect the binary to have been installed
@@ -278,8 +335,15 @@ install_with_go() {
         fi
         LAST_INSTALL_PATH="$bin_dir/bd"
 
+        if ! verify_binary_has_cgo "$LAST_INSTALL_PATH" "go install"; then
+            return 1
+        fi
+
         # Re-sign for macOS to avoid Gatekeeper delays
         resign_for_macos "$bin_dir/bd"
+
+        # Create 'beads' alias symlink
+        create_beads_alias "$bin_dir"
 
         # Check if GOPATH/bin (or GOBIN) is in PATH
         if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
@@ -293,6 +357,7 @@ install_with_go() {
         return 0
     else
         log_error "go install failed"
+        log_warning "If you see 'unicode/uregex.h' missing, install ICU headers (macOS: brew install icu4c; Linux: libicu-dev or libicu-devel) and try again."
         return 1
     fi
 }
@@ -311,7 +376,13 @@ build_from_source() {
         cd beads
         log_info "Building binary..."
 
-        if go build -o bd ./cmd/bd; then
+        if CGO_ENABLED=1 go build -o bd ./cmd/bd; then
+            if ! verify_binary_has_cgo "./bd" "source build"; then
+                cd - > /dev/null || cd "$HOME"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+
             # Determine install location
             local install_dir
             if [[ -w /usr/local/bin ]]; then
@@ -330,6 +401,9 @@ build_from_source() {
 
             # Re-sign for macOS to avoid Gatekeeper delays
             resign_for_macos "$install_dir/bd"
+
+            # Create 'beads' alias symlink
+            create_beads_alias "$install_dir"
 
             log_success "bd installed to $install_dir/bd"
 
@@ -350,6 +424,7 @@ build_from_source() {
             return 0
         else
             log_error "Build failed"
+            log_warning "If you see 'unicode/uregex.h' missing, install ICU headers (macOS: brew install icu4c; Linux: libicu-dev or libicu-devel) and try again."
     cd - > /dev/null || cd "$HOME"
             cd - > /dev/null
             rm -rf "$tmp_dir"
@@ -371,6 +446,8 @@ verify_installation() {
         log_success "bd is installed and ready!"
         echo ""
         bd version 2>/dev/null || echo "bd (development build)"
+        echo ""
+        echo "You can use either 'bd' or 'beads' to run the command."
         echo ""
         echo "Get started:"
         echo "  cd your-project"
@@ -468,9 +545,6 @@ main() {
     platform=$(detect_platform)
     log_info "Platform: $platform"
 
-    # Stop any running daemons before replacing binary
-    stop_existing_daemons
-
     # Try downloading from GitHub releases first
     if install_from_release "$platform"; then
         verify_installation
@@ -518,10 +592,9 @@ main() {
     echo ""
     echo "Or install from source:"
     echo "  1. Install Go from https://go.dev/dl/"
-    echo "  2. Run: go install github.com/steveyegge/beads/cmd/bd@latest"
+    echo "  2. Run: CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest"
     echo ""
     exit 1
 }
 
 main "$@"
-

@@ -6,20 +6,18 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/steveyegge/beads/internal/lockfile"
 )
 
 // staleLockThresholds defines the age thresholds for each lock type.
 // Lock files older than these thresholds are considered stale.
 var staleLockThresholds = map[string]time.Duration{
-	"bootstrap.lock": 5 * time.Minute,  // Bootstrap should complete quickly
-	".sync.lock":     1 * time.Hour,    // Sync can be slow for large repos
-	"daemon.lock":    0,                // Handled separately via flock check
+	"bootstrap.lock":   5 * time.Minute, // Bootstrap should complete quickly
+	".sync.lock":       1 * time.Hour,   // Sync can be slow for large repos
+	"dolt-access.lock": 5 * time.Minute, // Dolt advisory lock
 }
 
 // CheckStaleLockFiles detects leftover lock files from crashed processes.
-// Stale lock files can block bootstrap, sync, and daemon operations.
+// Stale lock files can block bootstrap and sync operations.
 func CheckStaleLockFiles(path string) DoctorCheck {
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
@@ -57,16 +55,22 @@ func CheckStaleLockFiles(path string) DoctorCheck {
 		}
 	}
 
-	// Check daemon lock - use flock probe instead of age
-	daemonLockPath := filepath.Join(beadsDir, "daemon.lock")
-	if _, err := os.Stat(daemonLockPath); err == nil {
-		// Check if daemon is actually running via flock
-		running, _ := lockfile.TryDaemonLock(beadsDir)
-		if !running {
-			staleFiles = append(staleFiles, "daemon.lock")
-			details = append(details, "daemon.lock: file exists but no daemon process holds the lock")
+	// Check dolt-access.lock (embedded dolt advisory flock)
+	accessLockPath := filepath.Join(beadsDir, "dolt-access.lock")
+	if info, err := os.Stat(accessLockPath); err == nil {
+		age := time.Since(info.ModTime())
+		if age > staleLockThresholds["dolt-access.lock"] {
+			staleFiles = append(staleFiles, "dolt-access.lock")
+			details = append(details, fmt.Sprintf("dolt-access.lock: age %s (threshold: %s)",
+				age.Round(time.Second), staleLockThresholds["dolt-access.lock"]))
 		}
 	}
+
+	// Note: Dolt internal noms LOCK files (.beads/dolt/<db>/.dolt/noms/LOCK)
+	// are NOT checked here as diagnostics. These are auto-cleaned on bd startup
+	// (pre-flight in PersistentPreRun) and by 'bd doctor --fix'. Stale noms LOCK
+	// files from crashed processes would prevent the Dolt server from opening
+	// databases. The auto-cleanup makes this a non-issue for most users.
 
 	// Check startup lock (bd.sock.startlock)
 	// Look for any .startlock files in beadsDir

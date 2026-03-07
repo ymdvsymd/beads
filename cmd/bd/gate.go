@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,13 +10,10 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -74,42 +70,10 @@ By default, shows only open gates. Use --all to include closed gates.`,
 
 		ctx := rootCtx
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			listArgs := &rpc.ListArgs{
-				IssueType: "gate",
-				Limit:     limit,
-			}
-			if !allFlag {
-				listArgs.ExcludeStatus = []string{"closed"}
-			}
-
-			resp, err := daemonClient.List(listArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			var issues []*types.Issue
-			if err := json.Unmarshal(resp.Data, &issues); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-				os.Exit(1)
-			}
-
-			if jsonOutput {
-				outputJSON(issues)
-				return
-			}
-
-			displayGates(issues, allFlag)
-			return
-		}
-
 		// Direct mode
 		issues, err := store.SearchIssues(ctx, "", filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		if jsonOutput {
@@ -219,33 +183,13 @@ This is used by 'gt done --phase-complete' to register for gate wake notificatio
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			FatalError("gate not found: %s", gateID)
 		}
 
 		if issue.IssueType != "gate" {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+			FatalError("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
 		// Check if waiter is already registered
@@ -260,30 +204,11 @@ This is used by 'gt done --phase-complete' to register for gate wake notificatio
 		newWaiters := append(issue.Waiters, waiter)
 
 		// Update the gate
-		if daemonClient != nil {
-			// Use GateWait RPC which handles waiters correctly (bypasses allowedUpdateFields)
-			gateWaitArgs := &rpc.GateWaitArgs{
-				ID:      gateID,
-				Waiters: []string{waiter}, // GateWait handles deduplication internally
-			}
-			resp, uerr := daemonClient.GateWait(gateWaitArgs)
-			if uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", uerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-		} else {
-			updates := map[string]interface{}{
-				"waiters": newWaiters,
-			}
-			if err := store.UpdateIssue(ctx, gateID, updates, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Error updating gate: %v\n", err)
-				os.Exit(1)
-			}
-			markDirtyAndScheduleFlush()
+		updates := map[string]interface{}{
+			"waiters": newWaiters,
+		}
+		if err := store.UpdateIssue(ctx, gateID, updates, actor); err != nil {
+			FatalError("updating gate: %v", err)
 		}
 
 		fmt.Printf("%s Added waiter to gate %s: %s\n", ui.RenderPass("✓"), gateID, waiter)
@@ -306,33 +231,13 @@ This is similar to 'bd show' but validates that the issue is a gate.`,
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			FatalError("gate not found: %s", gateID)
 		}
 
 		if issue.IssueType != "gate" {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+			FatalError("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
 		if jsonOutput {
@@ -387,56 +292,18 @@ Use --reason to provide context for why the gate was resolved.`,
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			FatalError("gate not found: %s", gateID)
 		}
 
 		if issue.IssueType != "gate" {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+			FatalError("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
 		// Close the gate
-		if daemonClient != nil {
-			closeArgs := &rpc.CloseArgs{
-				ID:     gateID,
-				Reason: reason,
-			}
-			resp, cerr := daemonClient.CloseIssue(closeArgs)
-			if cerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", cerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-		} else {
-			if err := store.CloseIssue(ctx, gateID, reason, actor, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "Error closing gate: %v\n", err)
-				os.Exit(1)
-			}
-			markDirtyAndScheduleFlush()
+		if err := store.CloseIssue(ctx, gateID, reason, actor, ""); err != nil {
+			FatalError("closing gate: %v", err)
 		}
 
 		fmt.Printf("%s Gate resolved: %s\n", ui.RenderPass("✓"), gateID)
@@ -504,27 +371,9 @@ Examples:
 		var gates []*types.Issue
 		var err error
 
-		if daemonClient != nil {
-			listArgs := &rpc.ListArgs{
-				IssueType:     "gate",
-				ExcludeStatus: []string{"closed"},
-				Limit:         limit,
-			}
-			resp, rerr := daemonClient.List(listArgs)
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if uerr := json.Unmarshal(resp.Data, &gates); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-		} else {
-			gates, err = store.SearchIssues(ctx, "", filter)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		gates, err = store.SearchIssues(ctx, "", filter)
+		if err != nil {
+			FatalError("%v", err)
 		}
 
 		// Filter by type if specified
@@ -890,62 +739,32 @@ func checkBeadGate(ctx context.Context, awaitID string) (bool, string) {
 		return false, fmt.Sprintf("rig %q not found: %v", rigName, err)
 	}
 
-	// Load config to get database path
-	cfg, err := configfile.Load(targetBeadsDir)
-	if err != nil {
-		return false, fmt.Sprintf("failed to load config for rig %q: %v", rigName, err)
-	}
-
-	dbPath := cfg.DatabasePath(targetBeadsDir)
-
-	// Open the target database (read-only)
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	// Open the target database (read-only) using storage factory
+	// This supports both Dolt and legacy SQLite backends in the target rig.
+	targetStore, err := dolt.NewFromConfigWithOptions(ctx, targetBeadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return false, fmt.Sprintf("failed to open database for rig %q: %v", rigName, err)
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = targetStore.Close() }()
 
 	// Check if the target bead exists and is closed
-	var status string
-	err = db.QueryRowContext(ctx, `
-		SELECT status FROM issues WHERE id = ?
-	`, beadID).Scan(&status)
-
+	issue, err := targetStore.GetIssue(ctx, beadID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return false, fmt.Sprintf("bead %s not found in rig %s", beadID, rigName)
-		}
-		return false, fmt.Sprintf("database query failed: %v", err)
+		return false, fmt.Sprintf("bead %s not found in rig %s: %v", beadID, rigName, err)
 	}
 
-	if status == string(types.StatusClosed) {
+	if issue.Status == types.StatusClosed {
 		return true, fmt.Sprintf("target bead %s is closed", beadID)
 	}
 
-	return false, fmt.Sprintf("target bead %s status is %q (waiting for closed)", beadID, status)
+	return false, fmt.Sprintf("target bead %s status is %q (waiting for closed)", beadID, string(issue.Status))
 }
 
 // closeGate closes a gate issue with the given reason
 func closeGate(_ interface{}, gateID, reason string) error {
-	if daemonClient != nil {
-		closeArgs := &rpc.CloseArgs{
-			ID:     gateID,
-			Reason: reason,
-		}
-		resp, err := daemonClient.CloseIssue(closeArgs)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("%s", resp.Error)
-		}
-		return nil
-	}
-
 	if err := store.CloseIssue(rootCtx, gateID, reason, actor, ""); err != nil {
 		return err
 	}
-	markDirtyAndScheduleFlush()
 	return nil
 }
 

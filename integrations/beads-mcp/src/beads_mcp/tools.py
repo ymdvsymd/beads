@@ -19,6 +19,7 @@ from .models import (
     AddDependencyParams,
     BlockedIssue,
     BlockedParams,
+    ClaimIssueParams,
     CloseIssueParams,
     CreateIssueParams,
     DependencyType,
@@ -394,7 +395,7 @@ async def beads_ready_work(
 async def beads_list_issues(
     status: Annotated[IssueStatus | None, "Filter by status (open, in_progress, blocked, deferred, closed, or custom)"] = None,
     priority: Annotated[int | None, "Filter by priority (0-4, 0=highest)"] = None,
-    issue_type: Annotated[IssueType | None, "Filter by type (bug, feature, task, epic, chore, or custom)"] = None,
+    issue_type: Annotated[IssueType | None, "Filter by type (bug, feature, task, epic, chore, decision, or custom)"] = None,
     assignee: Annotated[str | None, "Filter by assignee"] = None,
     labels: Annotated[list[str] | None, "Filter by labels (AND: must have ALL)"] = None,
     labels_any: Annotated[list[str] | None, "Filter by labels (OR: must have at least one)"] = None,
@@ -438,7 +439,7 @@ async def beads_create_issue(
     acceptance: Annotated[str | None, "Acceptance criteria"] = None,
     external_ref: Annotated[str | None, "External reference (e.g., gh-9, jira-ABC)"] = None,
     priority: Annotated[int, "Priority (0-4, 0=highest)"] = 2,
-    issue_type: Annotated[IssueType, "Type: bug, feature, task, epic, chore, or custom"] = DEFAULT_ISSUE_TYPE,
+    issue_type: Annotated[IssueType, "Type: bug, feature, task, epic, chore, decision, or custom"] = DEFAULT_ISSUE_TYPE,
     assignee: Annotated[str | None, "Assignee username"] = None,
     labels: Annotated[list[str] | None, "List of labels"] = None,
     id: Annotated[str | None, "Explicit issue ID (e.g., bd-42)"] = None,
@@ -487,8 +488,6 @@ async def beads_update_issue(
 ) -> Issue | list[Issue]:
     """Update an existing issue.
 
-    Claim work by setting status to 'in_progress'.
-    
     Note: Setting status to 'closed' or 'open' will automatically route to
     beads_close_issue() or beads_reopen_issue() respectively to ensure
     proper approval workflows are followed.
@@ -519,6 +518,19 @@ async def beads_update_issue(
         external_ref=external_ref,
     )
     return await client.update(params)
+
+
+async def beads_claim_issue(
+    issue_id: Annotated[str, "Issue ID (e.g., bd-1)"],
+) -> Issue:
+    """Atomically claim an issue for work.
+
+    Uses `bd update <id> --claim` semantics: sets assignee + in_progress in one
+    compare-and-swap operation and fails if already claimed.
+    """
+    client = await _get_client()
+    params = ClaimIssueParams(issue_id=issue_id)
+    return await client.claim(params)
 
 
 async def beads_close_issue(

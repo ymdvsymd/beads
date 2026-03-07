@@ -8,33 +8,25 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // YamlOnlyKeys are configuration keys that must be stored in config.yaml
-// rather than the SQLite database. These are "startup" settings that are
+// rather than the database. These are "startup" settings that are
 // read before the database is opened.
 //
 // This fixes GH#536: users were confused when `bd config set no-db true`
 // appeared to succeed but had no effect (because no-db is read from yaml
-// at startup, not from SQLite).
+// at startup, not from the database).
 var YamlOnlyKeys = map[string]bool{
 	// Bootstrap flags (affect how bd starts)
-	"no-db":             true,
-	"no-daemon":         true,
-	"no-auto-flush":     true,
-	"no-auto-import":    true,
-	"json":              true,
-	"auto-start-daemon": true,
+	"no-db": true,
+	"json":  true,
 
 	// Database and identity
 	"db":       true,
 	"actor":    true,
 	"identity": true,
-
-	// Timing settings
-	"flush-debounce":       true,
-	"lock-timeout":         true,
-	"remote-sync-interval": true,
 
 	// Git settings
 	"git.author":      true,
@@ -43,14 +35,8 @@ var YamlOnlyKeys = map[string]bool{
 	"no-git-ops":      true, // Disable git ops in bd prime session close protocol (GH#593)
 
 	// Sync settings
-	"sync-branch": true,
-	"sync.branch": true,
+	"sync.git-remote":                          true,
 	"sync.require_confirmation_on_mass_delete": true,
-
-	// Daemon settings (GH#871: team-wide auto-sync config)
-	"daemon.auto_commit": true,
-	"daemon.auto_push":   true,
-	"daemon.auto_pull":   true,
 
 	// Routing settings
 	"routing.mode":        true,
@@ -68,10 +54,19 @@ var YamlOnlyKeys = map[string]bool{
 
 	// Hierarchy settings (GH#995)
 	"hierarchy.max-depth": true,
+
+	// Backup settings (must be in yaml so GetValueSource can detect overrides)
+	"backup.enabled":  true,
+	"backup.interval": true,
+	"backup.git-push": true,
+	"backup.git-repo": true,
+
+	// Dolt server settings
+	"dolt.idle-timeout": true, // Idle auto-stop timeout (default "30m", "0" disables)
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
-// rather than the SQLite database.
+// rather than the Dolt database.
 func IsYamlOnlyKey(key string) bool {
 	// Check exact match
 	if YamlOnlyKeys[key] {
@@ -79,7 +74,7 @@ func IsYamlOnlyKey(key string) bool {
 	}
 
 	// Check prefix matches for nested keys
-	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "daemon.", "hierarchy."}
+	prefixes := []string{"routing.", "sync.", "git.", "directory.", "repos.", "external_projects.", "validation.", "hierarchy.", "ai.", "backup.", "dolt.", "federation."}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -91,9 +86,7 @@ func IsYamlOnlyKey(key string) bool {
 
 // keyAliases maps alternative key names to their canonical yaml form.
 // This ensures consistency when users use different formats (dot vs hyphen).
-var keyAliases = map[string]string{
-	"sync.branch": "sync-branch",
-}
+var keyAliases = map[string]string{}
 
 // normalizeYamlKey converts a key to its canonical yaml format.
 // Some keys have aliases (e.g., sync.branch -> sync-branch) to handle
@@ -297,12 +290,12 @@ func validateYamlConfigValue(key, value string) error {
 		if depth < 1 {
 			return fmt.Errorf("hierarchy.max-depth must be at least 1, got %d", depth)
 		}
-	case "sync-branch", "sync.branch":
-		// GH#1166: Validate sync branch name at config time
-		// Note: Cannot import syncbranch due to import cycle, so inline the validation.
-		// This mirrors syncbranch.ValidateSyncBranchName() logic.
-		if value == "main" || value == "master" {
-			return fmt.Errorf("cannot use '%s' as sync branch: git worktrees prevent checking out the same branch in multiple locations. Use a dedicated branch like 'beads-sync' instead", value)
+	case "dolt.idle-timeout":
+		// "0" disables, otherwise must be a valid Go duration
+		if value != "0" {
+			if _, err := time.ParseDuration(value); err != nil {
+				return fmt.Errorf("dolt.idle-timeout must be a duration (e.g. \"30m\", \"1h\") or \"0\" to disable, got %q", value)
+			}
 		}
 	}
 	return nil

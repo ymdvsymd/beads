@@ -4,7 +4,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,8 +11,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/validation"
@@ -41,8 +39,6 @@ type IssueTemplate struct {
 	Labels             []string
 	Dependencies       []string
 }
-
-
 
 // parseStringList extracts a list of strings from content, splitting by comma or whitespace.
 // This is a generic helper used by parseLabels and parseDependencies.
@@ -227,8 +223,8 @@ func (s *markdownParseState) handleContentLine(line string) {
 		return
 	}
 
-	// First lines after title (before any section) become description
-	if s.currentIssue.Description == "" && line != "" {
+	// Lines after title (before any section) become description
+	if line != "" {
 		if s.currentIssue.Description != "" {
 			s.currentIssue.Description += "\n"
 		}
@@ -312,25 +308,17 @@ func createIssuesFromMarkdown(_ *cobra.Command, filepath string) {
 	// Parse markdown file first (doesn't require store access)
 	templates, err := parseMarkdownFile(filepath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing markdown file: %v\n", err)
-		os.Exit(1)
+		FatalError("parsing markdown file: %v", err)
 	}
 
 	if len(templates) == 0 {
-		fmt.Fprintf(os.Stderr, "No issues found in markdown file\n")
-		os.Exit(1)
+		FatalError("no issues found in markdown file")
 	}
 
-	// If daemon is running, use RPC batch create (GH#719)
-	if daemonClient != nil {
-		createIssuesFromMarkdownViaDaemon(templates, filepath)
-		return
-	}
-
-	// Direct mode: ensure globals are initialized
+	// Ensure globals are initialized
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: database not initialized\n")
-		os.Exit(1)
+		FatalErrorWithHint("database not initialized",
+			"run 'bd init' to create a database")
 	}
 	if actor == "" {
 		actor = "bd" // Default actor if not set
@@ -338,182 +326,73 @@ func createIssuesFromMarkdown(_ *cobra.Command, filepath string) {
 
 	ctx := rootCtx
 	createdIssues := []*types.Issue{}
-	failedIssues := []string{}
 
-	// Create each issue
-	for _, template := range templates {
-		issue := &types.Issue{
-			Title:              template.Title,
-			Description:        template.Description,
-			Design:             template.Design,
-			AcceptanceCriteria: template.AcceptanceCriteria,
-			Status:             types.StatusOpen,
-			Priority:           template.Priority,
-			IssueType:          template.IssueType,
-			Assignee:           template.Assignee,
-		}
-
-		if err := store.CreateIssue(ctx, issue, actor); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating issue '%s': %v\n", template.Title, err)
-			failedIssues = append(failedIssues, template.Title)
-			continue
-		}
-
-		// Add labels
-		for _, label := range template.Labels {
-			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to add label %s to %s: %v\n", label, issue.ID, err)
-			}
-		}
-
-		// Add dependencies
-		for _, depSpec := range template.Dependencies {
-			depSpec = strings.TrimSpace(depSpec)
-			if depSpec == "" {
-				continue
+	// Create all issues, labels, and dependencies in a single transaction
+	commitMsg := fmt.Sprintf("bd: create %d issue(s) from %s", len(templates), filepath)
+	txErr := transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
+		for _, template := range templates {
+			issue := &types.Issue{
+				Title:              template.Title,
+				Description:        template.Description,
+				Design:             template.Design,
+				AcceptanceCriteria: template.AcceptanceCriteria,
+				Status:             types.StatusOpen,
+				Priority:           template.Priority,
+				IssueType:          template.IssueType,
+				Assignee:           template.Assignee,
 			}
 
-			var depType types.DependencyType
-			var dependsOnID string
+			if err := tx.CreateIssue(ctx, issue, actor); err != nil {
+				return fmt.Errorf("creating issue '%s': %w", template.Title, err)
+			}
 
-			// Parse format: "type:id" or just "id" (defaults to "blocks")
-			if strings.Contains(depSpec, ":") {
-				parts := strings.SplitN(depSpec, ":", 2)
-				if len(parts) != 2 {
-					fmt.Fprintf(os.Stderr, "Warning: invalid dependency format '%s' for %s\n", depSpec, issue.ID)
+			for _, label := range template.Labels {
+				if err := tx.AddLabel(ctx, issue.ID, label, actor); err != nil {
+					return fmt.Errorf("adding label %s to %s: %w", label, issue.ID, err)
+				}
+			}
+
+			for _, depSpec := range template.Dependencies {
+				depSpec = strings.TrimSpace(depSpec)
+				if depSpec == "" {
 					continue
 				}
-				depType = types.DependencyType(strings.TrimSpace(parts[0]))
-				dependsOnID = strings.TrimSpace(parts[1])
-			} else {
-				depType = types.DepBlocks
-				dependsOnID = depSpec
+
+				var depType types.DependencyType
+				var dependsOnID string
+
+				if strings.Contains(depSpec, ":") {
+					parts := strings.SplitN(depSpec, ":", 2)
+					if len(parts) != 2 {
+						return fmt.Errorf("invalid dependency format '%s' for %s", depSpec, issue.ID)
+					}
+					depType = types.DependencyType(strings.TrimSpace(parts[0]))
+					dependsOnID = strings.TrimSpace(parts[1])
+				} else {
+					depType = types.DepBlocks
+					dependsOnID = depSpec
+				}
+
+				if !depType.IsValid() {
+					return fmt.Errorf("invalid dependency type '%s' for %s", depType, issue.ID)
+				}
+
+				dep := &types.Dependency{
+					IssueID:     issue.ID,
+					DependsOnID: dependsOnID,
+					Type:        depType,
+				}
+				if err := tx.AddDependency(ctx, dep, actor); err != nil {
+					return fmt.Errorf("adding dependency %s -> %s: %w", issue.ID, dependsOnID, err)
+				}
 			}
 
-			if !depType.IsValid() {
-				fmt.Fprintf(os.Stderr, "Warning: invalid dependency type '%s' for %s\n", depType, issue.ID)
-				continue
-			}
-
-			dep := &types.Dependency{
-				IssueID:     issue.ID,
-				DependsOnID: dependsOnID,
-				Type:        depType,
-			}
-			if err := store.AddDependency(ctx, dep, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to add dependency %s -> %s: %v\n", issue.ID, dependsOnID, err)
-			}
+			createdIssues = append(createdIssues, issue)
 		}
-
-		createdIssues = append(createdIssues, issue)
-	}
-
-	// Schedule auto-flush
-	if len(createdIssues) > 0 {
-		markDirtyAndScheduleFlush()
-	}
-
-	// Report failures if any
-	if len(failedIssues) > 0 {
-		fmt.Fprintf(os.Stderr, "\n%s Failed to create %d issues:\n", ui.RenderFail("✗"), len(failedIssues))
-		for _, title := range failedIssues {
-			fmt.Fprintf(os.Stderr, "  - %s\n", title)
-		}
-	}
-
-	if jsonOutput {
-		outputJSON(createdIssues)
-	} else {
-		fmt.Printf("%s Created %d issues from %s:\n", ui.RenderPass("✓"), len(createdIssues), filepath)
-		for _, issue := range createdIssues {
-			fmt.Printf("  %s: %s [P%d, %s]\n", issue.ID, issue.Title, issue.Priority, issue.IssueType)
-		}
-	}
-}
-
-// createIssuesFromMarkdownViaDaemon creates issues via daemon RPC batch operation
-func createIssuesFromMarkdownViaDaemon(templates []*IssueTemplate, filepath string) {
-	createdIssues := []*types.Issue{}
-	failedIssues := []string{}
-
-	// Build batch operations for all issues
-	operations := make([]rpc.BatchOperation, 0, len(templates))
-	for _, template := range templates {
-		createArgs := &rpc.CreateArgs{
-			Title:              template.Title,
-			Description:        template.Description,
-			Design:             template.Design,
-			AcceptanceCriteria: template.AcceptanceCriteria,
-			IssueType:          string(template.IssueType),
-			Priority:           template.Priority,
-			Assignee:           template.Assignee,
-			Labels:             template.Labels,
-			Dependencies:       template.Dependencies,
-		}
-
-		argsJSON, err := json.Marshal(createArgs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling args for '%s': %v\n", template.Title, err)
-			failedIssues = append(failedIssues, template.Title)
-			continue
-		}
-
-		operations = append(operations, rpc.BatchOperation{
-			Operation: "create",
-			Args:      argsJSON,
-		})
-	}
-
-	// Execute batch
-	batchArgs := &rpc.BatchArgs{Operations: operations}
-	resp, err := daemonClient.Batch(batchArgs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error executing batch create: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Parse batch response
-	var batchResp rpc.BatchResponse
-	if err := json.Unmarshal(resp.Data, &batchResp); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing batch response: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Process results
-	for i, result := range batchResp.Results {
-		if i >= len(templates) {
-			break
-		}
-		template := templates[i]
-
-		if !result.Success {
-			fmt.Fprintf(os.Stderr, "Error creating issue '%s': %s\n", template.Title, result.Error)
-			failedIssues = append(failedIssues, template.Title)
-			continue
-		}
-
-		var issue types.Issue
-		if err := json.Unmarshal(result.Data, &issue); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: created issue '%s' but failed to parse response: %v\n", template.Title, err)
-			// Still count as success since the issue was created
-			createdIssues = append(createdIssues, &types.Issue{Title: template.Title})
-			continue
-		}
-
-		// Run create hook for each issue
-		if hookRunner != nil {
-			hookRunner.Run(hooks.EventCreate, &issue)
-		}
-
-		createdIssues = append(createdIssues, &issue)
-	}
-
-	// Report failures if any
-	if len(failedIssues) > 0 {
-		fmt.Fprintf(os.Stderr, "\n%s Failed to create %d issues:\n", ui.RenderFail("✗"), len(failedIssues))
-		for _, title := range failedIssues {
-			fmt.Fprintf(os.Stderr, "  - %s\n", title)
-		}
+		return nil
+	})
+	if txErr != nil {
+		FatalError("creating issues from markdown: %v", txErr)
 	}
 
 	if jsonOutput {

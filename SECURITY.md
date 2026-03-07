@@ -18,9 +18,7 @@ We will respond within 48 hours and work with you to address the issue.
 
 ### Database Security
 
-bd stores issue data locally in:
-- SQLite databases (`.beads/*.db`) - local only, gitignored
-- JSONL files (`.beads/issues.jsonl`) - committed to git
+bd stores issue data locally in a Dolt database (`.beads/dolt/`), which is gitignored.
 
 **Important**:
 - Do not store sensitive information (passwords, API keys, secrets) in issue descriptions or metadata
@@ -31,8 +29,30 @@ bd stores issue data locally in:
 
 - bd uses standard git operations (no custom protocols)
 - Export/import operations read and write local files only
-- No network communication except through git itself
+- No network communication except through git and the Dolt dependency (see Network & Privacy below)
 - Git hooks (if used) run with your local user permissions
+
+### Network & Privacy
+
+Beads is local-first — the beads codebase itself contains no telemetry,
+analytics, or outbound network calls.
+
+However, the **Dolt** database engine (a beads dependency) collects usage
+metrics by default, contacting `doltremoteapi.dolthub.com` even when no
+remotes are configured.
+
+To disable Dolt metrics collection, use either method:
+
+```sh
+# Method 1: Dolt config (persistent)
+dolt config --global --add metrics.disabled true
+
+# Method 2: Environment variable (per-session or export in shell profile)
+export DOLT_DISABLE_EVENT_FLUSH=1
+```
+
+To verify, block `doltremoteapi.dolthub.com` in your firewall or DNS — beads
+continues working normally with no degradation.
 
 ### Command Injection Protection
 
@@ -45,7 +65,7 @@ bd uses parameterized SQL queries to prevent SQL injection. However:
 
 bd has minimal dependencies:
 - Go standard library
-- SQLite (via modernc.org/sqlite - pure Go implementation)
+- Dolt (version-controlled SQL database)
 - Cobra CLI framework
 
 All dependencies are regularly updated. Run `go mod verify` to check integrity.
@@ -64,7 +84,7 @@ Once version 1.0 is released, we will support the latest major version and one p
 ## Best Practices
 
 1. **Don't commit secrets** - Never put API keys, passwords, or credentials in issue descriptions
-2. **Review before export** - Check `.beads/issues.jsonl` before committing sensitive project details
+2. **Review before sharing** - Check issue content before sharing project details
 3. **Use private repos** - If your issues contain proprietary information, use private git repositories
 4. **Validate git hooks** - If using automated export/import hooks, review them for safety
 5. **Regular updates** - Keep bd updated to the latest version: `go install github.com/steveyegge/beads/cmd/bd@latest`
@@ -72,7 +92,7 @@ Once version 1.0 is released, we will support the latest major version and one p
 ## Known Limitations
 
 - bd is designed for **development/internal use**, not production secret management
-- Issue data is stored in plain text (both SQLite and JSONL)
+- Issue data is stored in plain text in the Dolt database
 - No built-in encryption or access control (relies on filesystem permissions)
 - No audit logging beyond git history
 

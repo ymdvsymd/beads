@@ -11,7 +11,7 @@ var quickstartCmd = &cobra.Command{
 	Use:     "quickstart",
 	GroupID: "setup",
 	Short:   "Quick start guide for bd",
-	Long:  `Display a quick start guide showing common bd workflows and patterns.`,
+	Long:    `Display a quick start guide showing common bd workflows and patterns.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("\n%s\n\n", ui.RenderBold("bd - Dependency-Aware Issue Tracker"))
 		fmt.Printf("Issues chained together like beads.\n\n")
@@ -52,7 +52,7 @@ var quickstartCmd = &cobra.Command{
 		fmt.Printf("            Perfect for agents to claim next work!\n\n")
 
 		fmt.Printf("%s\n", ui.RenderBold("UPDATING ISSUES"))
-		fmt.Printf("  %s\n", ui.RenderAccent("bd update bd-1 --status in_progress"))
+		fmt.Printf("  %s\n", ui.RenderAccent("bd update bd-1 --claim"))
 		fmt.Printf("  %s\n", ui.RenderAccent("bd update bd-1 --priority 0"))
 		fmt.Printf("  %s\n\n", ui.RenderAccent("bd update bd-1 --assignee bob"))
 
@@ -83,11 +83,9 @@ var quickstartCmd = &cobra.Command{
 
 		fmt.Printf("%s\n", ui.RenderBold("GIT WORKFLOW (AUTO-SYNC)"))
 		fmt.Printf("  bd automatically keeps git in sync:\n")
-		fmt.Printf("    • %s Export to JSONL after CRUD operations (5s debounce)\n", ui.RenderPass("✓"))
-		fmt.Printf("    • %s Import from JSONL when newer than DB (after %s)\n", ui.RenderPass("✓"), ui.RenderAccent("git pull"))
+		fmt.Printf("    • %s Database synced automatically via Dolt\n", ui.RenderPass("✓"))
 		fmt.Printf("    • %s Works seamlessly across machines and team members\n", ui.RenderPass("✓"))
-		fmt.Printf("    • No manual export/import needed!\n")
-		fmt.Printf("  Disable with: %s or %s\n\n", ui.RenderAccent("--no-auto-flush"), ui.RenderAccent("--no-auto-import"))
+		fmt.Printf("  Dolt handles sync natively — no manual export/import needed\n\n")
 
 		fmt.Printf("%s\n", ui.RenderPass("Ready to start!"))
 		fmt.Printf("Run %s to create your first issue.\n\n", ui.RenderAccent("bd create \"My first issue\""))

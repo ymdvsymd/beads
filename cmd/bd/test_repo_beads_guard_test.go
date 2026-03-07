@@ -5,15 +5,25 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
 )
 
+// beforeTestsHook is set by CGO-tagged test files to perform setup before tests run
+// (e.g., starting a shared test Dolt server). Returns a cleanup function.
+var beforeTestsHook func() func()
+
 // Guardrail: ensure the cmd/bd test suite does not touch the real repo .beads state.
 // Disable with BEADS_TEST_GUARD_DISABLE=1 (useful when running tests while actively using beads).
 func TestMain(m *testing.M) {
+	// Delegate to testMainInner so defers run before os.Exit.
+	os.Exit(testMainInner(m))
+}
+
+func testMainInner(m *testing.M) int {
 	origWD, _ := os.Getwd()
 
 	// Isolate config discovery from the repo's tracked `.beads/config.yaml`.
@@ -23,9 +33,20 @@ func TestMain(m *testing.M) {
 	tmp, err := os.MkdirTemp("", "beads-bd-tests-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
+
+	// Preserve Go build cache before changing HOME.
+	// On macOS, GOCACHE defaults to $HOME/Library/Caches/go-build.
+	// Changing HOME would cause tests that run `go build` (e.g., TestShow)
+	// to miss the cache and do a full CGO rebuild (~80s each).
+	if os.Getenv("GOCACHE") == "" {
+		if out, err := exec.Command("go", "env", "GOCACHE").Output(); err == nil {
+			_ = os.Setenv("GOCACHE", strings.TrimSpace(string(out)))
+		}
+	}
+
 	_ = os.Setenv("HOME", tmp)
 	_ = os.Setenv("USERPROFILE", tmp) // Windows compatibility
 	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg-config"))
@@ -37,6 +58,11 @@ func TestMain(m *testing.M) {
 	// Enable test mode that forces accessor functions to use legacy globals.
 	// This ensures backward compatibility with tests that manipulate globals directly.
 	enableTestModeGlobals()
+
+	// Set BEADS_TEST_MODE once for the entire test run (bd-cqjoi).
+	// Previously each test set/unset this env var via ensureTestMode(),
+	// which raced under t.Parallel().
+	_ = os.Setenv("BEADS_TEST_MODE", "1")
 
 	// Prevent daemon auto-start and ensure tests don't interact with any running daemon.
 	// This prevents false positives in the test guard when a background daemon touches
@@ -62,8 +88,17 @@ func TestMain(m *testing.M) {
 		}
 	}()
 
+	// BD_BRANCH is no longer used (all writers operate on main with transactions).
+
+	// Start shared test Dolt server if the hook is registered (CGO builds).
+	// This must happen after HOME is changed so dolt config goes to the temp dir.
+	if beforeTestsHook != nil {
+		cleanup := beforeTestsHook()
+		defer cleanup()
+	}
+
 	if os.Getenv("BEADS_TEST_GUARD_DISABLE") != "" {
-		os.Exit(m.Run())
+		return m.Run()
 	}
 
 	// Stop any running daemon for this repo to prevent false positives in the guard.
@@ -73,12 +108,12 @@ func TestMain(m *testing.M) {
 	if repoRoot != "" {
 		stopRepoDaemon(repoRoot)
 	} else {
-		os.Exit(m.Run())
+		return m.Run()
 	}
 
 	repoBeadsDir := filepath.Join(repoRoot, ".beads")
 	if _, err := os.Stat(repoBeadsDir); err != nil {
-		os.Exit(m.Run())
+		return m.Run()
 	}
 
 	watch := []string{
@@ -89,7 +124,7 @@ func TestMain(m *testing.M) {
 		"issues.jsonl",
 		"beads.jsonl",
 		"metadata.json",
-		"interactions.jsonl",
+		// interactions.jsonl excluded: legitimately created by init during tests
 		"deletions.jsonl",
 		"molecules.jsonl",
 		"daemon.lock",
@@ -108,7 +143,7 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	os.Exit(code)
+	return code
 }
 
 type fileSnap struct {
@@ -195,6 +230,12 @@ func stopRepoDaemon(repoRoot string) {
 	// Best-effort stop - ignore errors (daemon may not be running)
 	_ = cmd.Run()
 
-	// Give daemon time to shutdown gracefully
-	time.Sleep(500 * time.Millisecond)
+	// Wait for daemon socket to disappear (graceful shutdown).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

@@ -68,19 +68,17 @@ func TestFindDatabasePathInTree(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Create .beads directory with a database file
+	// Create .beads directory with a dolt database directory
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	err = os.MkdirAll(beadsDir, 0o750)
 	if err != nil {
 		t.Fatalf("Failed to create .beads dir: %v", err)
 	}
 
-	dbPath := filepath.Join(beadsDir, "test.db")
-	f, err := os.Create(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create db file: %v", err)
+	doltDir := filepath.Join(beadsDir, "dolt")
+	if err := os.MkdirAll(doltDir, 0o750); err != nil {
+		t.Fatalf("Failed to create dolt dir: %v", err)
 	}
-	f.Close()
 
 	// Set BEADS_DIR to our test .beads directory to override git repo detection
 	os.Setenv("BEADS_DIR", beadsDir)
@@ -98,9 +96,9 @@ func TestFindDatabasePathInTree(t *testing.T) {
 	result := FindDatabasePath()
 
 	// Resolve symlinks for both paths (macOS uses /private/var symlinked to /var)
-	expectedPath, err := filepath.EvalSymlinks(dbPath)
+	expectedPath, err := filepath.EvalSymlinks(doltDir)
 	if err != nil {
-		expectedPath = dbPath
+		expectedPath = doltDir
 	}
 	resultPath, err := filepath.EvalSymlinks(result)
 	if err != nil {
@@ -142,157 +140,6 @@ func TestFindDatabasePathNotFound(t *testing.T) {
 	_ = result
 }
 
-func TestFindJSONLPathWithExistingFile(t *testing.T) {
-	// Create temporary directory
-	tmpDir, err := os.MkdirTemp("", "beads-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Create a .jsonl file
-	jsonlPath := filepath.Join(tmpDir, "custom.jsonl")
-	f, err := os.Create(jsonlPath)
-	if err != nil {
-		t.Fatalf("Failed to create jsonl file: %v", err)
-	}
-	f.Close()
-
-	// Create a fake database path in the same directory
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// Should find the existing .jsonl file
-	result := FindJSONLPath(dbPath)
-	if result != jsonlPath {
-		t.Errorf("Expected '%s', got '%s'", jsonlPath, result)
-	}
-}
-
-func TestFindJSONLPathDefault(t *testing.T) {
-	// Create temporary directory
-	tmpDir, err := os.MkdirTemp("", "beads-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Create a fake database path (no .jsonl files exist)
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// bd-6xd: Should return default issues.jsonl (canonical name)
-	result := FindJSONLPath(dbPath)
-	expected := filepath.Join(tmpDir, "issues.jsonl")
-	if result != expected {
-		t.Errorf("Expected '%s', got '%s'", expected, result)
-	}
-}
-
-func TestFindJSONLPathEmpty(t *testing.T) {
-	// Empty database path should return empty string
-	result := FindJSONLPath("")
-	if result != "" {
-		t.Errorf("Expected empty string for empty db path, got '%s'", result)
-	}
-}
-
-func TestFindJSONLPathMultipleFiles(t *testing.T) {
-	// Create temporary directory
-	tmpDir, err := os.MkdirTemp("", "beads-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Create multiple .jsonl files
-	jsonlFiles := []string{"issues.jsonl", "backup.jsonl", "archive.jsonl"}
-	for _, filename := range jsonlFiles {
-		f, err := os.Create(filepath.Join(tmpDir, filename))
-		if err != nil {
-			t.Fatalf("Failed to create jsonl file: %v", err)
-		}
-		f.Close()
-	}
-
-	// Create a fake database path
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// Should return the first .jsonl file found (lexicographically sorted by Glob)
-	result := FindJSONLPath(dbPath)
-	// Verify it's one of the .jsonl files we created
-	found := false
-	for _, filename := range jsonlFiles {
-		if result == filepath.Join(tmpDir, filename) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("Expected one of the created .jsonl files, got '%s'", result)
-	}
-}
-
-// TestFindJSONLPathSkipsDeletions verifies that FindJSONLPath skips deletions.jsonl
-// and merge artifacts to prevent corruption (bd-tqo fix)
-func TestFindJSONLPathSkipsDeletions(t *testing.T) {
-	tests := []struct {
-		name     string
-		files    []string
-		expected string
-	}{
-		{
-			name:     "prefers issues.jsonl over deletions.jsonl",
-			files:    []string{"deletions.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "skips deletions.jsonl when only option",
-			files:    []string{"deletions.jsonl"},
-			expected: "issues.jsonl", // Falls back to default
-		},
-		{
-			name:     "skips merge artifacts",
-			files:    []string{"beads.base.jsonl", "beads.left.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "prefers issues over beads",
-			files:    []string{"beads.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "uses beads.jsonl as legacy fallback",
-			files:    []string{"beads.jsonl", "deletions.jsonl"},
-			expected: "beads.jsonl",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir, err := os.MkdirTemp("", "beads-jsonl-test-*")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.RemoveAll(tmpDir)
-
-			// Create test files
-			for _, file := range tt.files {
-				path := filepath.Join(tmpDir, file)
-				if err := os.WriteFile(path, []byte("{}"), 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			dbPath := filepath.Join(tmpDir, "test.db")
-			result := FindJSONLPath(dbPath)
-			expected := filepath.Join(tmpDir, tt.expected)
-
-			if result != expected {
-				t.Errorf("FindJSONLPath() = %q, want %q", result, expected)
-			}
-		})
-	}
-}
-
 // TestHasBeadsProjectFiles verifies that hasBeadsProjectFiles correctly
 // distinguishes between project directories and daemon-only directories (bd-420)
 func TestHasBeadsProjectFiles(t *testing.T) {
@@ -314,11 +161,6 @@ func TestHasBeadsProjectFiles(t *testing.T) {
 		{
 			name:     "has database",
 			files:    []string{"beads.db"},
-			expected: true,
-		},
-		{
-			name:     "has issues.jsonl",
-			files:    []string{"issues.jsonl"},
 			expected: true,
 		},
 		{
@@ -715,13 +557,13 @@ func TestFindDatabasePathWithRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create target .beads directory with actual database
+	// Create target .beads directory with actual dolt database
 	targetDir := filepath.Join(tmpDir, "actual", ".beads")
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	targetDB := filepath.Join(targetDir, "beads.db")
-	if err := os.WriteFile(targetDB, []byte{}, 0644); err != nil {
+	targetDolt := filepath.Join(targetDir, "dolt")
+	if err := os.MkdirAll(targetDolt, 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -740,10 +582,10 @@ func TestFindDatabasePathWithRedirect(t *testing.T) {
 
 	// Resolve symlinks for comparison
 	resultResolved, _ := filepath.EvalSymlinks(result)
-	targetDBResolved, _ := filepath.EvalSymlinks(targetDB)
+	targetDoltResolved, _ := filepath.EvalSymlinks(targetDolt)
 
-	if resultResolved != targetDBResolved {
-		t.Errorf("FindDatabasePath() = %q, want %q (via redirect)", result, targetDB)
+	if resultResolved != targetDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want %q (via redirect)", result, targetDolt)
 	}
 }
 
@@ -778,7 +620,7 @@ func TestFindBeadsDirWithRedirect(t *testing.T) {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(targetDir, "issues.jsonl"), []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(targetDir, "metadata.json"), []byte(`{"database":"dolt"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1049,27 +891,365 @@ func TestFindBeadsDir_Worktree(t *testing.T) {
 	t.Chdir(worktreeDir)
 	git.ResetCaches() // Reset after chdir for caching tests
 
-	// FindBeadsDir should prioritize the main repo's .beads for worktrees (bd-de6)
+	// FindBeadsDir should find the worktree's own .beads when it has project files (GH#2190)
 	result := FindBeadsDir()
 
 	// Resolve symlinks for comparison
 	resultResolved, _ := filepath.EvalSymlinks(result)
 	worktreeBeadsDirResolved, _ := filepath.EvalSymlinks(worktreeBeadsDir)
-	mainBeadsDirResolved, _ := filepath.EvalSymlinks(mainBeadsDir)
 
-	if resultResolved != mainBeadsDirResolved {
-		t.Errorf("FindBeadsDir() = %q, want main repo .beads %q (prioritized for worktrees)", result, mainBeadsDir)
+	if resultResolved != worktreeBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = %q, want worktree .beads %q (separate-DB mode)", result, worktreeBeadsDir)
+	}
+}
+
+// TestFindBeadsDir_WorktreeRedirectOverride tests that when a worktree has its
+// own .beads/redirect, it takes priority over the main repo's .beads directory.
+// This enables per-worktree topic selection via timvisher_EXP_bd_topics set.
+func TestFindBeadsDir_WorktreeRedirectOverride(t *testing.T) {
+	// Save original state
+	originalEnv := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalEnv != "" {
+			os.Setenv("BEADS_DIR", originalEnv)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+
+	// Create temporary directory for our test
+	tmpDir, err := os.MkdirTemp("", "beads-worktree-redirect-override-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize main git repository with .beads containing project files
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0755); err != nil {
+		t.Fatal(err)
 	}
 
-	// Verify we're NOT finding the worktree's .beads (should fall back only if main repo has no .beads)
-	if resultResolved == worktreeBeadsDirResolved {
-		t.Errorf("FindBeadsDir() returned worktree .beads %q instead of main repo .beads %q - prioritization not working!", worktreeBeadsDir, mainBeadsDir)
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+
+	// Create .beads in main repo with project files (would normally win)
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial commit
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit failed: %v", err)
+	}
+
+	// Create an external topic .beads directory (the redirect target)
+	topicBeadsDir := filepath.Join(tmpDir, "topics", "my-topic", ".beads")
+	if err := os.MkdirAll(topicBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(topicBeadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_database":"beads_my_topic"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a worktree
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd = exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add failed: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// Create .beads/redirect in the worktree pointing to the external topic
+	worktreeBeadsDir := filepath.Join(worktreeDir, ".beads")
+	if err := os.MkdirAll(worktreeBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve symlinks for the redirect target (macOS /private/var)
+	topicBeadsDirResolved, _ := filepath.EvalSymlinks(topicBeadsDir)
+	if err := os.WriteFile(filepath.Join(worktreeBeadsDir, "redirect"), []byte(topicBeadsDirResolved+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change to worktree
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	// FindBeadsDir should follow the worktree redirect, NOT use main repo's .beads
+	result := FindBeadsDir()
+
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	mainBeadsDirResolved, _ := filepath.EvalSymlinks(mainBeadsDir)
+
+	if resultResolved == mainBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = main repo .beads %q, want topic .beads %q (worktree redirect should override)", result, topicBeadsDirResolved)
+	}
+
+	if resultResolved != topicBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = %q, want topic .beads %q (via worktree redirect)", result, topicBeadsDirResolved)
+	}
+}
+
+// TestFindDatabasePath_WorktreeRedirectOverride tests that findDatabaseInTree
+// follows a worktree's .beads/redirect before falling back to the main repo.
+// This is the database-discovery counterpart of TestFindBeadsDir_WorktreeRedirectOverride.
+func TestFindDatabasePath_WorktreeRedirectOverride(t *testing.T) {
+	originalEnv := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalEnv != "" {
+			os.Setenv("BEADS_DIR", originalEnv)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+
+	tmpDir, err := os.MkdirTemp("", "beads-db-worktree-redirect-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize main git repo with a .beads database
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+
+	// Main repo has a dolt database (would normally win)
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
+	if err := os.MkdirAll(mainDoltDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit failed: %v", err)
+	}
+
+	// Create external topic .beads with its own dolt database
+	topicBeadsDir := filepath.Join(tmpDir, "topics", "my-topic", ".beads")
+	topicDoltDir := filepath.Join(topicBeadsDir, "dolt")
+	if err := os.MkdirAll(topicDoltDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a worktree
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd = exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add failed: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// Create .beads/redirect in the worktree pointing to the topic
+	worktreeBeadsDir := filepath.Join(worktreeDir, ".beads")
+	if err := os.MkdirAll(worktreeBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	topicBeadsDirResolved, _ := filepath.EvalSymlinks(topicBeadsDir)
+	if err := os.WriteFile(filepath.Join(worktreeBeadsDir, "redirect"), []byte(topicBeadsDirResolved+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	result := FindDatabasePath()
+
+	mainDoltResolved, _ := filepath.EvalSymlinks(mainDoltDir)
+	topicDoltResolved, _ := filepath.EvalSymlinks(topicDoltDir)
+
+	if result == "" {
+		t.Fatal("FindDatabasePath() returned empty, want topic dolt path")
+	}
+
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	if resultResolved == mainDoltResolved {
+		t.Errorf("FindDatabasePath() = main repo dolt %q, want topic dolt %q (worktree redirect should override)", result, topicDoltResolved)
+	}
+	if resultResolved != topicDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want topic dolt %q (via worktree redirect)", result, topicDoltResolved)
+	}
+}
+
+// TestFindBeadsDir_SiblingWorktree tests that FindBeadsDir does not escape past
+// the worktree boundary when the worktree is a sibling of the main repo (not a
+// child). This is the regression test for GH#1653.
+func TestFindBeadsDir_SiblingWorktree(t *testing.T) {
+	// Save original state
+	originalEnv := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalEnv != "" {
+			os.Setenv("BEADS_DIR", originalEnv)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+
+	// Create temporary directory for our test
+	tmpDir, err := os.MkdirTemp("", "beads-sibling-worktree-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Resolve symlinks (macOS /var -> /private/var)
+	tmpDir, err = filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Structure: tmpDir/main-repo  (git repo with .beads/)
+	//            tmpDir/sibling-wt (worktree, sibling of main-repo)
+	//            tmpDir/.beads/    (UNRELATED beads dir that should NOT be found)
+
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+
+	// Create .beads in main repo
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial commit
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit failed: %v", err)
+	}
+
+	// Create sibling worktree (NOT a child of main-repo)
+	siblingDir := filepath.Join(tmpDir, "sibling-wt")
+	cmd = exec.Command("git", "worktree", "add", siblingDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add failed: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", siblingDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// Remove worktree's .beads/ (came from checkout) so it must fall back to main repo
+	// This simulates the real-world case where .beads is in .gitignore
+	_ = os.RemoveAll(filepath.Join(siblingDir, ".beads"))
+
+	// Create an UNRELATED .beads/ in the parent directory (tmpDir)
+	// Before the fix, the walk would escape past worktreeRoot and find this
+	unrelatedBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(unrelatedBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unrelatedBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change to the sibling worktree
+	t.Chdir(siblingDir)
+	git.ResetCaches()
+
+	result := FindBeadsDir()
+
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	mainBeadsDirResolved, _ := filepath.EvalSymlinks(mainBeadsDir)
+	unrelatedResolved, _ := filepath.EvalSymlinks(unrelatedBeadsDir)
+
+	// Should find main repo's .beads (via the mainRepoRoot check in step 2)
+	if resultResolved != mainBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = %q, want main repo .beads %q", result, mainBeadsDir)
+	}
+
+	// Must NOT find the unrelated parent .beads
+	if resultResolved == unrelatedResolved {
+		t.Errorf("FindBeadsDir() escaped worktree boundary and found unrelated %q", unrelatedBeadsDir)
 	}
 }
 
 // TestFindDatabasePath_Worktree tests that FindDatabasePath correctly finds the
-// shared database in the main repository when accessed from a git worktree. This is the
-// key test for bd-745 - worktrees should share the same .beads database.
+// shared database in the main repository when a worktree does NOT have its own
+// .beads directory. This is the key test for bd-745 - worktrees should share
+// the same .beads database when the worktree has no separate-DB init.
 func TestFindDatabasePath_Worktree(t *testing.T) {
 	// Save original state
 	originalEnvDir := os.Getenv("BEADS_DIR")
@@ -1116,13 +1296,13 @@ func TestFindDatabasePath_Worktree(t *testing.T) {
 	cmd.Dir = mainRepoDir
 	_ = cmd.Run()
 
-	// Create .beads directory in main repo with database
+	// Create .beads directory in main repo with dolt database
 	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
 	if err := os.MkdirAll(mainBeadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	mainDBPath := filepath.Join(mainBeadsDir, "beads.db")
-	if err := os.WriteFile(mainDBPath, []byte{}, 0644); err != nil {
+	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
+	if err := os.MkdirAll(mainDoltDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1152,6 +1332,10 @@ func TestFindDatabasePath_Worktree(t *testing.T) {
 		_ = cmd.Run()
 	}()
 
+	// Remove worktree's .beads/ (came from checkout) so it falls back to main repo
+	// This simulates the real-world case where .beads is in .gitignore
+	_ = os.RemoveAll(filepath.Join(worktreeDir, ".beads"))
+
 	// Change to worktree subdirectory
 	worktreeSubDir := filepath.Join(worktreeDir, "sub", "nested")
 	if err := os.MkdirAll(worktreeSubDir, 0755); err != nil {
@@ -1165,10 +1349,122 @@ func TestFindDatabasePath_Worktree(t *testing.T) {
 
 	// Resolve symlinks for comparison
 	resultResolved, _ := filepath.EvalSymlinks(result)
-	mainDBPathResolved, _ := filepath.EvalSymlinks(mainDBPath)
+	mainDoltResolved, _ := filepath.EvalSymlinks(mainDoltDir)
 
-	if resultResolved != mainDBPathResolved {
-		t.Errorf("FindDatabasePath() = %q, want main repo shared db %q", result, mainDBPath)
+	if resultResolved != mainDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want main repo shared db %q", result, mainDoltDir)
+	}
+}
+
+// TestFindDatabasePath_WorktreeSeparateDB tests that FindDatabasePath correctly
+// finds the worktree's own .beads database when the worktree has been bd-init'd
+// with its own separate database (no redirect file). This is the fix for GH#2190.
+func TestFindDatabasePath_WorktreeSeparateDB(t *testing.T) {
+	originalEnvDir := os.Getenv("BEADS_DIR")
+	originalEnvDB := os.Getenv("BEADS_DB")
+	defer func() {
+		if originalEnvDir != "" {
+			os.Setenv("BEADS_DIR", originalEnvDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		if originalEnvDB != "" {
+			os.Setenv("BEADS_DB", originalEnvDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+	os.Unsetenv("BEADS_DB")
+
+	tmpDir, err := os.MkdirTemp("", "beads-worktree-separatedb-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize main git repository with its own .beads
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+
+	// Main repo .beads with dolt database
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(mainBeadsDir, "dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial commit (don't commit .beads - it's normally in .gitignore)
+	if err := os.WriteFile(filepath.Join(mainRepoDir, ".gitignore"), []byte(".beads/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit failed: %v", err)
+	}
+
+	// Create a worktree
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd = exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add failed: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// Simulate "bd init" in the worktree: create .beads with its own dolt database
+	worktreeBeadsDir := filepath.Join(worktreeDir, ".beads")
+	worktreeDoltDir := filepath.Join(worktreeBeadsDir, "dolt")
+	if err := os.MkdirAll(worktreeDoltDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeBeadsDir, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_database":"beads_worktree"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change to worktree
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	// FindDatabasePath should find the worktree's own database, NOT the main repo's
+	result := FindDatabasePath()
+
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	worktreeDoltResolved, _ := filepath.EvalSymlinks(worktreeDoltDir)
+	mainDoltResolved, _ := filepath.EvalSymlinks(filepath.Join(mainBeadsDir, "dolt"))
+
+	if resultResolved == mainDoltResolved {
+		t.Errorf("FindDatabasePath() = main repo db %q, want worktree db %q (separate-DB mode)", result, worktreeDoltDir)
+	}
+
+	if resultResolved != worktreeDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want worktree db %q (separate-DB mode)", result, worktreeDoltDir)
 	}
 }
 
@@ -1221,13 +1517,13 @@ func TestFindDatabasePath_WorktreeNoLocalDB(t *testing.T) {
 	cmd.Dir = mainRepoDir
 	_ = cmd.Run()
 
-	// Create .beads directory in main repo with database
+	// Create .beads directory in main repo with dolt database
 	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
 	if err := os.MkdirAll(mainBeadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	mainDBPath := filepath.Join(mainBeadsDir, "beads.db")
-	if err := os.WriteFile(mainDBPath, []byte{}, 0644); err != nil {
+	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
+	if err := os.MkdirAll(mainDoltDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1273,9 +1569,9 @@ func TestFindDatabasePath_WorktreeNoLocalDB(t *testing.T) {
 
 	// Resolve symlinks for comparison
 	resultResolved, _ := filepath.EvalSymlinks(result)
-	mainDBPathResolved, _ := filepath.EvalSymlinks(mainDBPath)
+	mainDoltResolved, _ := filepath.EvalSymlinks(mainDoltDir)
 
-	if resultResolved != mainDBPathResolved {
-		t.Errorf("FindDatabasePath() = %q, want main repo shared db %q", result, mainDBPath)
+	if resultResolved != mainDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want main repo shared db %q", result, mainDoltDir)
 	}
 }

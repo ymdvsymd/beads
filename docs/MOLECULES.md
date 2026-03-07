@@ -56,7 +56,7 @@ bd dep add <B-id> <A-id>   # B depends on A (B needs A)
 
 An agent works through a molecule by:
 1. Getting ready work (`bd ready`)
-2. Claiming it (`bd update <id> --status in_progress`)
+2. Claiming it (`bd update <id> --claim`)
 3. Doing the work
 4. Closing it (`bd close <id>`)
 5. Repeat until molecule is done
@@ -231,6 +231,7 @@ bd mol wisp list        # Check for orphans
 bd mol squash <id>      # Create digest
 bd mol burn <id>        # Or discard
 bd mol wisp gc          # Garbage collect old wisps
+bd mol wisp gc --closed --force  # Purge all closed wisps
 ```
 
 ## Layer Cake Architecture
@@ -246,7 +247,7 @@ Molecules (bond, squash, burn)            ← workflow operations
     ↓
 Epics (parent-child, dependencies)        ← DATA PLANE (the core)
     ↓
-Issues (JSONL, git-backed)                ← STORAGE
+Issues (Dolt, version-controlled)          ← STORAGE
 ```
 
 **Most users only need the bottom two layers.** Protos and formulas are for reusable patterns and complex composition.
@@ -258,7 +259,7 @@ Issues (JSONL, git-backed)                ← STORAGE
 ```bash
 bd ready                         # What's ready to work
 bd blocked                       # What's blocked
-bd update <id> --status in_progress
+bd update <id> --claim
 bd close <id>
 ```
 

@@ -90,11 +90,18 @@ update_file "README.md" "Alpha (v$CURRENT_VERSION)" "Alpha (v$NEW_VERSION)"
 echo "  • default.nix"
 update_file "default.nix" "version = \"$CURRENT_VERSION\";" "version = \"$NEW_VERSION\";"
 
-# 7. Hook templates
-echo "  • cmd/bd/templates/hooks/*"
-for hook in pre-commit post-merge pre-push post-checkout; do
-    update_file "cmd/bd/templates/hooks/$hook" "# bd-hooks-version: $CURRENT_VERSION" "# bd-hooks-version: $NEW_VERSION"
-done
+# 7. Hook templates — now generated dynamically by cmd/bd/hooks.go using the
+# Version constant from version.go. No template files to update.
+# (Previously updated cmd/bd/templates/hooks/* which no longer exist.)
+
+# 8. Windows PE resource metadata
+echo "  • cmd/bd/winres/winres.json"
+update_file "cmd/bd/winres/winres.json" "\"file_version\": \"$CURRENT_VERSION\"" "\"file_version\": \"$NEW_VERSION\""
+update_file "cmd/bd/winres/winres.json" "\"product_version\": \"$CURRENT_VERSION\"" "\"product_version\": \"$NEW_VERSION\""
+update_file "cmd/bd/winres/winres.json" "\"FileVersion\": \"$CURRENT_VERSION\"" "\"FileVersion\": \"$NEW_VERSION\""
+update_file "cmd/bd/winres/winres.json" "\"ProductVersion\": \"$CURRENT_VERSION\"" "\"ProductVersion\": \"$NEW_VERSION\""
+echo "  • cmd/bd/winres/manifest.xml"
+update_file "cmd/bd/winres/manifest.xml" "version=\"$CURRENT_VERSION.0\"" "version=\"$NEW_VERSION.0\""
 
 echo ""
 echo -e "${GREEN}✓ Versions updated to $NEW_VERSION${NC}"

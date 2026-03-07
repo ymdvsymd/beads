@@ -1,9 +1,11 @@
-//go:build cgo
-
 package dolt
 
+// currentSchemaVersion is bumped whenever the schema or migrations change.
+// initSchemaOnDB checks this against the stored version and skips re-initialization
+// when they match, avoiding ~20 DDL statements per bd invocation.
+const currentSchemaVersion = 6
+
 // schema defines the MySQL-compatible database schema for Dolt.
-// This mirrors the SQLite schema but uses MySQL syntax.
 const schema = `
 -- Issues table
 CREATE TABLE IF NOT EXISTS issues (
@@ -26,17 +28,16 @@ CREATE TABLE IF NOT EXISTS issues (
     closed_at DATETIME,
     closed_by_session VARCHAR(255) DEFAULT '',
     external_ref VARCHAR(255),
+    spec_id VARCHAR(1024),
     compaction_level INT DEFAULT 0,
     compacted_at DATETIME,
     compacted_at_commit VARCHAR(64),
     original_size INT,
-    deleted_at DATETIME,
-    deleted_by VARCHAR(255) DEFAULT '',
-    delete_reason TEXT DEFAULT '',
-    original_type VARCHAR(32) DEFAULT '',
     -- Messaging fields
     sender VARCHAR(255) DEFAULT '',
     ephemeral TINYINT(1) DEFAULT 0,
+    -- Wisp classification for TTL-based compaction (gt-9br)
+    wisp_type VARCHAR(32) DEFAULT '',
     -- Pinned field
     pinned TINYINT(1) DEFAULT 0,
     -- Template field
@@ -82,10 +83,12 @@ CREATE TABLE IF NOT EXISTS issues (
     INDEX idx_issues_issue_type (issue_type),
     INDEX idx_issues_assignee (assignee),
     INDEX idx_issues_created_at (created_at),
+    INDEX idx_issues_spec_id (spec_id),
     INDEX idx_issues_external_ref (external_ref)
 );
 
 -- Dependencies table (edge schema)
+-- Note: No FK on depends_on_id to allow external references (external:<rig>:<id>).
 CREATE TABLE IF NOT EXISTS dependencies (
     issue_id VARCHAR(255) NOT NULL,
     depends_on_id VARCHAR(255) NOT NULL,
@@ -99,8 +102,7 @@ CREATE TABLE IF NOT EXISTS dependencies (
     INDEX idx_dependencies_depends_on (depends_on_id),
     INDEX idx_dependencies_depends_on_type (depends_on_id, type),
     INDEX idx_dependencies_thread (thread_id),
-    CONSTRAINT fk_dep_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
-    CONSTRAINT fk_dep_depends_on FOREIGN KEY (depends_on_id) REFERENCES issues(id) ON DELETE CASCADE
+    CONSTRAINT fk_dep_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
 
 -- Labels table
@@ -150,23 +152,6 @@ CREATE TABLE IF NOT EXISTS metadata (
     ` + "`key`" + ` VARCHAR(255) PRIMARY KEY,
     value TEXT NOT NULL
 );
-
--- Dirty issues table (for incremental export)
-CREATE TABLE IF NOT EXISTS dirty_issues (
-    issue_id VARCHAR(255) PRIMARY KEY,
-    marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_dirty_issues_marked_at (marked_at),
-    CONSTRAINT fk_dirty_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-);
-
--- Export hashes table
-CREATE TABLE IF NOT EXISTS export_hashes (
-    issue_id VARCHAR(255) PRIMARY KEY,
-    content_hash VARCHAR(64) NOT NULL,
-    exported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_export_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-);
-
 -- Child counters table
 CREATE TABLE IF NOT EXISTS child_counters (
     parent_id VARCHAR(255) PRIMARY KEY,
@@ -217,6 +202,12 @@ CREATE TABLE IF NOT EXISTS routes (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
+-- Issue counter table (for issue_id_mode=counter sequential IDs, GH#2002)
+CREATE TABLE IF NOT EXISTS issue_counter (
+    prefix VARCHAR(255) PRIMARY KEY,
+    last_id INT NOT NULL DEFAULT 0
+);
+
 -- Interactions table (agent audit log)
 CREATE TABLE IF NOT EXISTS interactions (
     id VARCHAR(32) PRIMARY KEY,
@@ -264,15 +255,19 @@ INSERT IGNORE INTO config (` + "`key`" + `, value) VALUES
     ('compact_tier2_days', '90'),
     ('compact_tier2_dep_levels', '5'),
     ('compact_tier2_commits', '100'),
-    ('compact_model', 'claude-3-5-haiku-20241022'),
     ('compact_batch_size', '50'),
     ('compact_parallel_workers', '5'),
     ('auto_compact_enabled', 'false');
 `
 
 // readyIssuesView is a MySQL-compatible view for ready work
-// Note: Dolt supports recursive CTEs like SQLite.
-// Uses EXISTS subquery instead of JOIN to avoid Dolt mergeJoinIter panic.
+// Note: Dolt supports recursive CTEs.
+// Uses LEFT JOIN instead of NOT EXISTS to avoid Dolt mergeJoinIter panic.
+// See: https://github.com/dolthub/go-mysql-server/issues/3413
+//
+// Active status checks use NOT IN ('closed', 'pinned') rather than listing
+// active statuses explicitly — this ensures custom statuses (configured via
+// status.custom) are automatically included. (bd-1x0)
 const readyIssuesView = `
 CREATE OR REPLACE VIEW ready_issues AS
 WITH RECURSIVE
@@ -283,7 +278,7 @@ WITH RECURSIVE
       AND EXISTS (
         SELECT 1 FROM issues blocker
         WHERE blocker.id = d.depends_on_id
-          AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+          AND blocker.status NOT IN ('closed', 'pinned')
       )
   ),
   blocked_transitively AS (
@@ -298,10 +293,18 @@ WITH RECURSIVE
   )
 SELECT i.*
 FROM issues i
+LEFT JOIN blocked_transitively bt ON bt.issue_id = i.id
 WHERE i.status = 'open'
   AND (i.ephemeral = 0 OR i.ephemeral IS NULL)
+  AND bt.issue_id IS NULL
+  AND (i.defer_until IS NULL OR i.defer_until <= NOW())
   AND NOT EXISTS (
-    SELECT 1 FROM blocked_transitively WHERE issue_id = i.id
+    SELECT 1 FROM dependencies d_parent
+    JOIN issues parent ON parent.id = d_parent.depends_on_id
+    WHERE d_parent.issue_id = i.id
+      AND d_parent.type = 'parent-child'
+      AND parent.defer_until IS NOT NULL
+      AND parent.defer_until > NOW()
   );
 `
 
@@ -318,11 +321,11 @@ SELECT
        AND EXISTS (
          SELECT 1 FROM issues blocker
          WHERE blocker.id = d.depends_on_id
-           AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+           AND blocker.status NOT IN ('closed', 'pinned')
        )
     ) as blocked_by_count
 FROM issues i
-WHERE i.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+WHERE i.status NOT IN ('closed', 'pinned')
   AND EXISTS (
     SELECT 1 FROM dependencies d
     WHERE d.issue_id = i.id
@@ -330,7 +333,7 @@ WHERE i.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
       AND EXISTS (
         SELECT 1 FROM issues blocker
         WHERE blocker.id = d.depends_on_id
-          AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+          AND blocker.status NOT IN ('closed', 'pinned')
       )
   );
 `

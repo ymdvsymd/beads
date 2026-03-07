@@ -55,16 +55,16 @@ check_version "npm-package/package.json" \
     "$(jq -r '.version' npm-package/package.json 2>/dev/null)" \
     "npm package.json"
 
-check_version "cmd/bd/templates/hooks/pre-commit" \
-    "$(grep '# bd-hooks-version:' cmd/bd/templates/hooks/pre-commit 2>/dev/null | sed 's/.*: //')" \
-    "Hook templates"
+# Hook templates are now generated dynamically by cmd/bd/hooks.go using the
+# Version constant from version.go, so no separate file check is needed.
+# (Previously checked cmd/bd/templates/hooks/pre-commit which no longer exists.)
 
 echo ""
 
 if [ $MISMATCH -eq 1 ]; then
     echo -e "${RED}❌ Version mismatch detected!${NC}"
     echo ""
-    echo "Run: scripts/bump-version.sh $CANONICAL"
+    echo "Run: scripts/update-versions.sh $CANONICAL"
     echo "Or manually update the mismatched files."
     exit 1
 else

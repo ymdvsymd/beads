@@ -9,18 +9,7 @@ import (
 
 func TestCheckBeadsRole_NotConfigured(t *testing.T) {
 	// Create a temp directory with git init but no beads.role config
-	tmpDir, err := os.MkdirTemp("", "beads-role-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Initialize git repo
-	cmd := exec.Command("git", "init")
-	cmd.Dir = tmpDir
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
+	tmpDir := newGitRepo(t)
 
 	// Check role - should return warning since not configured
 	check := CheckBeadsRole(tmpDir)
@@ -31,27 +20,16 @@ func TestCheckBeadsRole_NotConfigured(t *testing.T) {
 	if check.Name != "Role Configuration" {
 		t.Errorf("expected name 'Role Configuration', got %q", check.Name)
 	}
-	if check.Fix != "bd init" {
-		t.Errorf("expected fix 'bd init', got %q", check.Fix)
+	if check.Fix != "bd config set beads.role maintainer" {
+		t.Errorf("expected fix 'bd config set beads.role maintainer', got %q", check.Fix)
 	}
 }
 
 func TestCheckBeadsRole_Maintainer(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "beads-role-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Initialize git repo
-	cmd := exec.Command("git", "init")
-	cmd.Dir = tmpDir
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
+	tmpDir := newGitRepo(t)
 
 	// Set beads.role to maintainer
-	cmd = exec.Command("git", "config", "beads.role", "maintainer")
+	cmd := exec.Command("git", "config", "beads.role", "maintainer")
 	cmd.Dir = tmpDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("git config failed: %v", err)
@@ -68,21 +46,10 @@ func TestCheckBeadsRole_Maintainer(t *testing.T) {
 }
 
 func TestCheckBeadsRole_Contributor(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "beads-role-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Initialize git repo
-	cmd := exec.Command("git", "init")
-	cmd.Dir = tmpDir
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
+	tmpDir := newGitRepo(t)
 
 	// Set beads.role to contributor
-	cmd = exec.Command("git", "config", "beads.role", "contributor")
+	cmd := exec.Command("git", "config", "beads.role", "contributor")
 	cmd.Dir = tmpDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("git config failed: %v", err)
@@ -99,21 +66,10 @@ func TestCheckBeadsRole_Contributor(t *testing.T) {
 }
 
 func TestCheckBeadsRole_InvalidValue(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "beads-role-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Initialize git repo
-	cmd := exec.Command("git", "init")
-	cmd.Dir = tmpDir
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git init failed: %v", err)
-	}
+	tmpDir := newGitRepo(t)
 
 	// Set beads.role to an invalid value
-	cmd = exec.Command("git", "config", "beads.role", "admin")
+	cmd := exec.Command("git", "config", "beads.role", "admin")
 	cmd.Dir = tmpDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("git config failed: %v", err)
@@ -139,18 +95,22 @@ func TestCheckBeadsRole_NotGitRepo(t *testing.T) {
 	// Don't initialize git - just a plain directory
 	check := CheckBeadsRole(tmpDir)
 
-	// Should return warning since git config will fail
-	if check.Status != StatusWarning {
-		t.Errorf("expected status %s, got %s", StatusWarning, check.Status)
+	// Should return OK/N/A since we're not in a git repo — the role may
+	// be correctly configured in a worktree (e.g., rig roots use .repo.git).
+	if check.Status != StatusOK {
+		t.Errorf("expected status %s, got %s", StatusOK, check.Status)
+	}
+	if check.Message != "N/A (not a git repository)" {
+		t.Errorf("expected message 'N/A (not a git repository)', got %q", check.Message)
 	}
 }
 
 func TestCheckBeadsRole_NonexistentPath(t *testing.T) {
-	// Test with a path that doesn't exist
+	// Test with a path that doesn't exist — git will report "not a git repository"
 	check := CheckBeadsRole(filepath.Join(os.TempDir(), "nonexistent-beads-test-dir"))
 
-	// Should return warning since git config will fail
-	if check.Status != StatusWarning {
-		t.Errorf("expected status %s, got %s", StatusWarning, check.Status)
+	// Should return OK/N/A since the path is not a git repository
+	if check.Status != StatusOK {
+		t.Errorf("expected status %s, got %s", StatusOK, check.Status)
 	}
 }

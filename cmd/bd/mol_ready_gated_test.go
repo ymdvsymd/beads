@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -8,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // setupGatedTestDB creates a temporary file-based test database
-func setupGatedTestDB(t *testing.T) (*sqlite.SQLiteStorage, func()) {
+func setupGatedTestDB(t *testing.T) (*dolt.DoltStore, func()) {
 	t.Helper()
 	tmpDir, err := os.MkdirTemp("", "bd-test-gated-*")
 	if err != nil {
@@ -21,10 +23,10 @@ func setupGatedTestDB(t *testing.T) (*sqlite.SQLiteStorage, func()) {
 	}
 
 	testDB := filepath.Join(tmpDir, "test.db")
-	store, err := sqlite.New(context.Background(), testDB)
+	store, err := dolt.New(context.Background(), &dolt.Config{Path: testDB})
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 
 	// Set issue_prefix (required for beads)
@@ -443,4 +445,3 @@ func TestFindGateReadyMolecules_MultipleGates(t *testing.T) {
 		t.Errorf("Expected 2 gate-ready molecules, got %d", len(molecules))
 	}
 }
-

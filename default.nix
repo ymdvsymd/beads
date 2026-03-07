@@ -1,20 +1,38 @@
-{ pkgs, self }:
-pkgs.buildGoModule {
+{
+  lib,
+  self,
+  buildGoModule,
+  git,
+  ...
+}:
+buildGoModule {
   pname = "beads";
-  version = "0.49.3";
+  version = "0.59.0";
 
   src = self;
 
   # Point to the main Go package
   subPackages = [ "cmd/bd" ];
   doCheck = false;
+
   # Go module dependencies hash - if build fails with hash mismatch, update with the "got:" value
-  vendorHash = "sha256-YU+bRLVlWtHzJ1QPzcKJ70f+ynp8lMoIeFlm+29BNPE=";
+  vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+  # Relax go.mod version for Nix: nixpkgs Go may lag behind the latest
+  # patch release, and GOTOOLCHAIN=auto can't download in the Nix sandbox.
+  postPatch = ''
+    goVer="$(go env GOVERSION | sed 's/^go//')"
+    sed -i "s/^go .*/go $goVer/" go.mod
+  '';
+
+  # Allow patch-level toolchain upgrades when a dependency's minimum Go patch
+  # version is newer than nixpkgs' bundled patch version.
+  env.GOTOOLCHAIN = "auto";
 
   # Git is required for tests
-  nativeBuildInputs = [ pkgs.git ];
+  nativeBuildInputs = [ git ];
 
-  meta = with pkgs.lib; {
+  meta = with lib; {
     description = "beads (bd) - An issue tracker designed for AI-supervised coding workflows";
     homepage = "https://github.com/steveyegge/beads";
     license = licenses.mit;

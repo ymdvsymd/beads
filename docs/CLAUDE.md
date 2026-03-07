@@ -13,43 +13,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Three-Layer Design
 
 1. **Storage Layer** (`internal/storage/`)
-   - Interface-based design in `storage.go`
-   - SQLite implementation in `storage/sqlite/`
-   - Memory backend in `storage/memory/` for testing
-   - Extensions can add custom tables via `UnderlyingDB()` (see EXTENDING.md)
+   - **Dolt** in `storage/dolt/` — version-controlled SQL database with cell-level merge
+   - Common types and interfaces in `storage.go`
 
 2. **RPC Layer** (`internal/rpc/`)
    - Client/server architecture using Unix domain sockets (Windows named pipes)
    - Protocol defined in `protocol.go`
    - Server split into focused files: `server_core.go`, `server_issues_epics.go`, `server_labels_deps_comments.go`, etc.
-   - Per-workspace daemons communicate via `.beads/bd.sock`
+   - Used by Dolt server mode for multi-writer access
 
 3. **CLI Layer** (`cmd/bd/`)
    - Cobra-based commands (one file per command: `create.go`, `list.go`, etc.)
-   - Commands try daemon RPC first, fall back to direct database access
+   - Direct database access (embedded mode for standalone, server mode for Gas Town)
    - All commands support `--json` for programmatic use
    - Main entry point in `main.go`
 
-### Distributed Database Pattern
+### Storage Architecture
 
-The "magic" is in the auto-sync between SQLite and JSONL:
+Beads uses **Dolt** as its storage backend — a version-controlled SQL database:
 
 ```
-SQLite DB (.beads/beads.db, gitignored)
-    ↕ auto-sync (5s debounce)
-JSONL (.beads/issues.jsonl, git-tracked)
-    ↕ git push/pull
-Remote JSONL (shared across machines)
+Dolt DB (.beads/dolt/)
+    ↕ Dolt commits (automatic per write)
+    ↕ Dolt push/pull (native sync)
+Remote (Dolt remotes: DoltHub, S3, GCS, etc.)
 ```
 
-- **Write path**: CLI → SQLite → JSONL export → git commit
-- **Read path**: git pull → JSONL import → SQLite → CLI
+- **Write path**: CLI → Dolt → auto-commit to Dolt history
+- **Read path**: Direct SQL queries against Dolt
+- **Sync**: Dolt handles versioning and sync natively; `bd import`/`bd export` available for migration
 - **Hash-based IDs**: Automatic collision prevention (v0.20+)
 
 Core implementation:
-- Export: `cmd/bd/export.go`, `cmd/bd/autoflush.go`
-- Import: `cmd/bd/import.go`, `cmd/bd/autoimport.go`
-- Collision detection: `internal/importer/importer.go`
+- Dolt storage: `internal/storage/dolt/`
+- Export: `cmd/bd/export.go`
+- Import: `cmd/bd/import.go`
+- Sync: `cmd/bd/sync_helpers.go`, `cmd/bd/sync_git.go`
 
 ### Key Data Types
 
@@ -60,20 +59,13 @@ See `internal/types/types.go`:
 - `Comment`: Threaded discussions
 - `Event`: Full audit trail
 
-### Daemon Architecture
-
-Each workspace gets its own daemon process:
-- Auto-starts on first command (unless disabled)
-- Handles auto-sync, batching, and background operations
-- Socket at `.beads/bd.sock` (or `.beads/bd.pipe` on Windows)
-- Version checking prevents mismatches after upgrades
-- Manage with `bd daemons` command (see AGENTS.md)
-
 ## Common Development Commands
 
 ```bash
-# Build and test
-go build -o bd ./cmd/bd
+# Build and install bd to ~/.local/bin (canonical location)
+make install
+
+# Test
 go test ./...
 go test -coverprofile=coverage.out ./...
 
@@ -83,25 +75,27 @@ golangci-lint run ./...
 # Version management
 ./scripts/bump-version.sh 0.9.3 --commit
 
-# Local testing
-./bd init --prefix test
-./bd create "Test issue" -p 1
-./bd ready
+# Verify installed binary
+bd init --prefix test
+bd create "Test issue" -p 1
+bd ready
 ```
+
+> **Do NOT** use `go build -o bd` or `go install` directly — they create
+> stale binaries that shadow `~/.local/bin/bd`. Always use `make install`.
 
 ## Testing Philosophy
 
 - Unit tests live next to implementation (`*_test.go`)
-- Integration tests use real SQLite databases (`:memory:` or temp files)
+- Integration tests use real Dolt databases (via server in temp dirs)
 - Script-based tests in `cmd/bd/testdata/*.txt` (see `scripttest_test.go`)
 - RPC layer has extensive isolation and edge case coverage
 
 ## Important Notes
 
 - **Always read AGENTS.md first** - it has the complete workflow
-- Use `bd --no-daemon` in git worktrees (see AGENTS.md for why)
-- Install git hooks for zero-lag sync: `./examples/git-hooks/install.sh`
-- Run `bd sync` at end of agent sessions to force immediate flush/commit/push
+- Install git hooks: `bd hooks install`
+- Use `bd dolt push` / `bd dolt pull` for remote sync
 - Check for duplicates proactively: `bd duplicates --auto-merge`
 - Use `--json` flags for all programmatic use
 

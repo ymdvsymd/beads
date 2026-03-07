@@ -205,242 +205,123 @@ func TestCheckLegacyBeadsSlashCommands(t *testing.T) {
 	}
 }
 
-func TestCheckLegacyJSONLFilename(t *testing.T) {
+func TestCheckLegacyMCPToolReferences(t *testing.T) {
 	tests := []struct {
 		name           string
-		files          []string
-		gastownMode    bool
+		fileContent    map[string]string // filename -> content
 		expectedStatus string
 		expectWarning  bool
 	}{
 		{
-			name:           "no JSONL files",
-			files:          []string{},
-			gastownMode:    false,
+			name:           "no documentation files",
+			fileContent:    map[string]string{},
 			expectedStatus: "ok",
 			expectWarning:  false,
 		},
 		{
-			name:           "single issues.jsonl",
-			files:          []string{"issues.jsonl"},
-			gastownMode:    false,
+			name: "clean documentation without MCP references",
+			fileContent: map[string]string{
+				"AGENTS.md": "# Agents\n\nUse bd ready to see ready issues.",
+			},
 			expectedStatus: "ok",
 			expectWarning:  false,
 		},
 		{
-			name:           "single beads.jsonl is ok",
-			files:          []string{"beads.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "custom name is ok",
-			files:          []string{"my-issues.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "multiple JSONL files warning",
-			files:          []string{"beads.jsonl", "issues.jsonl"},
-			gastownMode:    false,
+			name: "old MCP tool reference in AGENTS.md",
+			fileContent: map[string]string{
+				"AGENTS.md": "# Agents\n\nUse mcp__beads_beads__list to list issues.",
+			},
 			expectedStatus: "warning",
 			expectWarning:  true,
 		},
 		{
-			name:           "routes.jsonl with gastown flag",
-			files:          []string{"issues.jsonl", "routes.jsonl"},
-			gastownMode:    true,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "routes.jsonl without gastown flag",
-			files:          []string{"issues.jsonl", "routes.jsonl"},
-			gastownMode:    false,
+			name: "plugin MCP tool reference in CLAUDE.md",
+			fileContent: map[string]string{
+				"CLAUDE.md": "# Claude\n\nCall mcp__plugin_beads_beads__show to see an issue.",
+			},
 			expectedStatus: "warning",
 			expectWarning:  true,
 		},
 		{
-			name:           "backup files ignored",
-			files:          []string{"issues.jsonl", "issues.jsonl.backup", "BACKUP_issues.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "multiple real files with backups",
-			files:          []string{"issues.jsonl", "beads.jsonl", "issues.jsonl.backup"},
-			gastownMode:    false,
+			name: "Junie-style MCP tool reference",
+			fileContent: map[string]string{
+				"AGENTS.md": "# Agents\n\nUse mcp_beads_ready to see ready issues.",
+			},
 			expectedStatus: "warning",
 			expectWarning:  true,
 		},
 		{
-			name:           "deletions.jsonl ignored as system file",
-			files:          []string{"beads.jsonl", "deletions.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
+			name: "MCP reference in .claude/CLAUDE.md",
+			fileContent: map[string]string{
+				".claude/CLAUDE.md": "Call mcp__beads_beads__create to create issues.",
+			},
+			expectedStatus: "warning",
+			expectWarning:  true,
 		},
 		{
-			name:           "merge artifacts ignored",
-			files:          []string{"issues.jsonl", "issues.base.jsonl", "issues.left.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
+			name: "MCP reference in claude.local.md",
+			fileContent: map[string]string{
+				"claude.local.md": "Use mcp__beads_beads__ready to find work.",
+			},
+			expectedStatus: "warning",
+			expectWarning:  true,
 		},
 		{
-			name:           "merge artifacts with right variant ignored",
-			files:          []string{"issues.jsonl", "issues.right.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
+			name: "MCP reference in .claude/claude.local.md",
+			fileContent: map[string]string{
+				".claude/claude.local.md": "Call mcp__plugin_beads_beads__list for issues.",
+			},
+			expectedStatus: "warning",
+			expectWarning:  true,
 		},
 		{
-			name:           "beads merge artifacts ignored (bd-ov1)",
-			files:          []string{"issues.jsonl", "beads.base.jsonl", "beads.left.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "interactions.jsonl ignored as system file (GH#709)",
-			files:          []string{"issues.jsonl", "interactions.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "molecules.jsonl ignored as system file",
-			files:          []string{"issues.jsonl", "molecules.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "sync_base.jsonl ignored as system file (GH#1021)",
-			files:          []string{"issues.jsonl", "sync_base.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "all system files ignored together",
-			files:          []string{"issues.jsonl", "deletions.jsonl", "interactions.jsonl", "molecules.jsonl", "sync_base.jsonl"},
-			gastownMode:    false,
-			expectedStatus: "ok",
-			expectWarning:  false,
+			name: "multiple files with MCP references",
+			fileContent: map[string]string{
+				"AGENTS.md": "Use mcp__beads_beads__list",
+				"CLAUDE.md": "Call mcp__plugin_beads_beads__show",
+			},
+			expectedStatus: "warning",
+			expectWarning:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
 
 			// Create test files
-			for _, file := range tt.files {
-				filePath := filepath.Join(beadsDir, file)
-				if err := os.WriteFile(filePath, []byte("{}"), 0644); err != nil {
+			for filename, content := range tt.fileContent {
+				filePath := filepath.Join(tmpDir, filename)
+				dir := filepath.Dir(filePath)
+				if dir != tmpDir {
+					if err := os.MkdirAll(dir, 0750); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			check := CheckLegacyJSONLFilename(tmpDir, tt.gastownMode)
+			check := CheckLegacyMCPToolReferences(tmpDir)
 
 			if check.Status != tt.expectedStatus {
 				t.Errorf("Expected status %s, got %s", tt.expectedStatus, check.Status)
 			}
 
-			if tt.expectWarning && check.Fix == "" {
-				t.Error("Expected fix message for warning, got empty string")
-			}
-		})
-	}
-}
-
-func TestCheckLegacyJSONLConfig(t *testing.T) {
-	tests := []struct {
-		name           string
-		configJSONL    string   // what metadata.json says
-		existingFiles  []string // which files actually exist
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name:           "no config (defaults)",
-			configJSONL:    "",
-			existingFiles:  []string{},
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "using canonical issues.jsonl",
-			configJSONL:    "issues.jsonl",
-			existingFiles:  []string{"issues.jsonl"},
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "using custom name",
-			configJSONL:    "my-project.jsonl",
-			existingFiles:  []string{"my-project.jsonl"},
-			expectedStatus: "ok",
-			expectWarning:  false,
-		},
-		{
-			name:           "using legacy beads.jsonl",
-			configJSONL:    "beads.jsonl",
-			existingFiles:  []string{"beads.jsonl"},
-			expectedStatus: "warning",
-			expectWarning:  true,
-		},
-		{
-			name:           "config says beads.jsonl but issues.jsonl exists",
-			configJSONL:    "beads.jsonl",
-			existingFiles:  []string{"issues.jsonl"},
-			expectedStatus: "warning",
-			expectWarning:  true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create test files
-			for _, file := range tt.existingFiles {
-				filePath := filepath.Join(beadsDir, file)
-				if err := os.WriteFile(filePath, []byte(`{"id":"test"}`), 0644); err != nil {
-					t.Fatal(err)
+			if tt.expectWarning {
+				if check.Fix == "" {
+					t.Error("Expected fix message for warning, got empty string")
 				}
-			}
-
-			// Create metadata.json if configJSONL is set
-			if tt.configJSONL != "" {
-				metadataPath := filepath.Join(beadsDir, "metadata.json")
-				content := `{"database":"beads.db","jsonl_export":"` + tt.configJSONL + `"}`
-				if err := os.WriteFile(metadataPath, []byte(content), 0644); err != nil {
-					t.Fatal(err)
+				if !strings.Contains(check.Fix, "bd setup claude") {
+					t.Error("Expected fix message to mention 'bd setup claude'")
 				}
-			}
-
-			check := CheckLegacyJSONLConfig(tmpDir)
-
-			if check.Status != tt.expectedStatus {
-				t.Errorf("Expected status %s, got %s (message: %s)", tt.expectedStatus, check.Status, check.Message)
-			}
-
-			if tt.expectWarning && check.Fix == "" {
-				t.Error("Expected fix message for warning, got empty string")
+				if !strings.Contains(check.Fix, "token") {
+					t.Error("Expected fix message to mention token savings")
+				}
+				if !strings.Contains(check.Fix, "bd list") {
+					t.Error("Expected fix message to show CLI command equivalents")
+				}
 			}
 		})
 	}
@@ -455,7 +336,7 @@ func TestCheckDatabaseConfig_IgnoresSystemJSONLs(t *testing.T) {
 
 	// Configure issues.jsonl, but only create interactions.jsonl.
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
-	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`), 0644); err != nil {
+	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte(`{"id":"x"}`), 0644); err != nil {
@@ -465,27 +346,6 @@ func TestCheckDatabaseConfig_IgnoresSystemJSONLs(t *testing.T) {
 	check := CheckDatabaseConfig(tmpDir)
 	if check.Status != "ok" {
 		t.Fatalf("expected ok, got %s: %s\n%s", check.Status, check.Message, check.Detail)
-	}
-}
-
-func TestCheckDatabaseConfig_SystemJSONLExportIsError(t *testing.T) {
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.Mkdir(beadsDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-
-	metadataPath := filepath.Join(beadsDir, "metadata.json")
-	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db","jsonl_export":"interactions.jsonl"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "interactions.jsonl"), []byte(`{"id":"x"}`), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	check := CheckDatabaseConfig(tmpDir)
-	if check.Status != "error" {
-		t.Fatalf("expected error, got %s: %s", check.Status, check.Message)
 	}
 }
 
@@ -573,10 +433,10 @@ func TestCheckFreshClone(t *testing.T) {
 				file.Close()
 			}
 
-			// Create database if needed
+			// Create database if needed (Dolt backend uses .beads/dolt/ directory)
 			if tt.hasDatabase {
-				dbPath := filepath.Join(beadsDir, "beads.db")
-				if err := os.WriteFile(dbPath, []byte("fake db"), 0644); err != nil {
+				doltDir := filepath.Join(beadsDir, "dolt")
+				if err := os.MkdirAll(doltDir, 0755); err != nil {
 					t.Fatal(err)
 				}
 			}

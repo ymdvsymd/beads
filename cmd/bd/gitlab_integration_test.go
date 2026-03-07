@@ -1,5 +1,5 @@
-//go:build integration
-// +build integration
+//go:build cgo && integration
+// +build cgo,integration
 
 // Package main provides the bd CLI commands.
 package main
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/gitlab"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -92,9 +92,9 @@ func TestGitLabSyncRoundtrip(t *testing.T) {
 
 	// Create in-memory store
 	ctx := context.Background()
-	testStore, err := sqlite.New(ctx, ":memory:")
+	testStore, err := dolt.New(ctx, &dolt.Config{Path: ":memory:"})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer testStore.Close()
 
@@ -346,9 +346,9 @@ func TestIncrementalSync(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	testStore, err := sqlite.New(ctx, ":memory:")
+	testStore, err := dolt.New(ctx, &dolt.Config{Path: ":memory:"})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer testStore.Close()
 

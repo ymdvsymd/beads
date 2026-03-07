@@ -1,13 +1,15 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -15,6 +17,7 @@ import (
 
 var closeCmd = &cobra.Command{
 	Use:     "close [id...]",
+	Aliases: []string{"done"},
 	GroupID: "issues",
 	Short:   "Close one or more issues",
 	Long: `Close one or more issues.
@@ -42,6 +45,18 @@ create, update, show, or close operation).`,
 			// Check -m alias (git commit convention)
 			reason, _ = cmd.Flags().GetString("message")
 		}
+		if reason == "" {
+			// Check --comment alias (desire-path from hq-ftpg)
+			reason, _ = cmd.Flags().GetString("comment")
+		}
+
+		// Desire-path: "bd done <id> <message>" treats last positional arg as reason
+		// when no reason flag was explicitly provided (hq-pe8ce)
+		if reason == "" && cmd.CalledAs() == "done" && len(args) >= 2 {
+			reason = args[len(args)-1]
+			args = args[:len(args)-1]
+		}
+
 		if reason == "" {
 			reason = "Closed"
 		}
@@ -71,179 +86,17 @@ create, update, show, or close operation).`,
 		// Resolve partial IDs first, handling cross-rig routing
 		var resolvedIDs []string
 		var routedArgs []string // IDs that need cross-repo routing (bypass daemon)
-		if daemonClient != nil {
-			for _, id := range args {
-				// Check if this ID needs routing to a different beads directory
-				if needsRouting(id) {
-					routedArgs = append(routedArgs, id)
-					continue
-				}
-				resolveArgs := &rpc.ResolveIDArgs{ID: id}
-				resp, err := daemonClient.ResolveID(resolveArgs)
+		// Direct mode - check routing for each ID
+		for _, id := range args {
+			if needsRouting(id) {
+				routedArgs = append(routedArgs, id)
+			} else {
+				resolved, err := utils.ResolvePartialID(ctx, store, id)
 				if err != nil {
 					FatalErrorRespectJSON("resolving ID %s: %v", id, err)
 				}
-				var resolvedID string
-				if err := json.Unmarshal(resp.Data, &resolvedID); err != nil {
-					FatalErrorRespectJSON("unmarshaling resolved ID: %v", err)
-				}
-				resolvedIDs = append(resolvedIDs, resolvedID)
+				resolvedIDs = append(resolvedIDs, resolved)
 			}
-		} else {
-			// Direct mode - check routing for each ID
-			for _, id := range args {
-				if needsRouting(id) {
-					routedArgs = append(routedArgs, id)
-				} else {
-					resolved, err := utils.ResolvePartialID(ctx, store, id)
-					if err != nil {
-						FatalErrorRespectJSON("resolving ID %s: %v", id, err)
-					}
-					resolvedIDs = append(resolvedIDs, resolved)
-				}
-			}
-		}
-
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			closedIssues := []*types.Issue{}
-			for _, id := range resolvedIDs {
-				// Get issue for template and pinned checks
-				showArgs := &rpc.ShowArgs{ID: id}
-				showResp, showErr := daemonClient.Show(showArgs)
-				if showErr == nil {
-					var issue types.Issue
-					if json.Unmarshal(showResp.Data, &issue) == nil {
-						if err := validateIssueClosable(id, &issue, force); err != nil {
-							fmt.Fprintf(os.Stderr, "%s\n", err)
-							continue
-						}
-					}
-				}
-
-				closeArgs := &rpc.CloseArgs{
-					ID:          id,
-					Reason:      reason,
-					Session:     session,
-					SuggestNext: suggestNext,
-					Force:       force,
-				}
-				resp, err := daemonClient.CloseIssue(closeArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
-					continue
-				}
-
-				// Handle response based on whether SuggestNext was requested
-				if suggestNext {
-					var result rpc.CloseResult
-					if err := json.Unmarshal(resp.Data, &result); err == nil {
-						if result.Closed != nil {
-							// Run close hook
-							if hookRunner != nil {
-								hookRunner.Run(hooks.EventClose, result.Closed)
-							}
-							if jsonOutput {
-								closedIssues = append(closedIssues, result.Closed)
-							}
-						}
-						if !jsonOutput {
-							fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), id, reason)
-							// Display newly unblocked issues
-							if len(result.Unblocked) > 0 {
-								fmt.Printf("\nNewly unblocked:\n")
-								for _, issue := range result.Unblocked {
-									fmt.Printf("  • %s %q (P%d)\n", issue.ID, issue.Title, issue.Priority)
-								}
-							}
-						}
-					}
-				} else {
-					var issue types.Issue
-					if err := json.Unmarshal(resp.Data, &issue); err == nil {
-						// Run close hook
-						if hookRunner != nil {
-							hookRunner.Run(hooks.EventClose, &issue)
-						}
-						if jsonOutput {
-							closedIssues = append(closedIssues, &issue)
-						}
-					}
-					if !jsonOutput {
-						fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), id, reason)
-					}
-				}
-			}
-
-			// Handle routed IDs via direct mode (cross-rig)
-			for _, id := range routedArgs {
-				result, err := resolveAndGetIssueWithRouting(ctx, store, id)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
-					continue
-				}
-				if result == nil || result.Issue == nil {
-					if result != nil {
-						result.Close()
-					}
-					fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
-					continue
-				}
-
-				if err := validateIssueClosable(result.ResolvedID, result.Issue, force); err != nil {
-					result.Close()
-					fmt.Fprintf(os.Stderr, "%s\n", err)
-					continue
-				}
-
-				// Check if issue has open blockers (GH#962)
-				if !force {
-					blocked, blockers, err := result.Store.IsBlocked(ctx, result.ResolvedID)
-					if err != nil {
-						result.Close()
-						fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
-						continue
-					}
-					if blocked && len(blockers) > 0 {
-						result.Close()
-						fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
-						continue
-					}
-				}
-
-				if err := result.Store.CloseIssue(ctx, result.ResolvedID, reason, actor, session); err != nil {
-					result.Close()
-					fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
-					continue
-				}
-
-				// Get updated issue for hook
-				closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
-				if closedIssue != nil && hookRunner != nil {
-					hookRunner.Run(hooks.EventClose, closedIssue)
-				}
-
-				if jsonOutput {
-					if closedIssue != nil {
-						closedIssues = append(closedIssues, closedIssue)
-					}
-				} else {
-					fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), result.ResolvedID, reason)
-				}
-				result.Close()
-			}
-
-			// Handle --continue flag in daemon mode
-			// Note: --continue requires direct database access to walk parent-child chain
-			if continueFlag && len(closedIssues) > 0 {
-				fmt.Fprintf(os.Stderr, "\nNote: --continue requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon close %s --continue\n", resolvedIDs[0])
-			}
-
-			if jsonOutput && len(closedIssues) > 0 {
-				outputJSON(closedIssues)
-			}
-			return
 		}
 
 		// Direct mode
@@ -252,12 +105,20 @@ create, update, show, or close operation).`,
 
 		// Handle local IDs
 		for _, id := range resolvedIDs {
-			// Get issue for checks
+			// Get issue for checks (nil issue is handled by validateIssueClosable)
 			issue, _ := store.GetIssue(ctx, id)
 
 			if err := validateIssueClosable(id, issue, force); err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				continue
+			}
+
+			// Check gate satisfaction for machine-checkable gates (GH#1467)
+			if !force {
+				if err := checkGateSatisfaction(issue); err != nil {
+					fmt.Fprintf(os.Stderr, "cannot close %s: %s\n", id, err)
+					continue
+				}
 			}
 
 			// Check if issue has open blockers (GH#962)
@@ -280,7 +141,10 @@ create, update, show, or close operation).`,
 
 			closedCount++
 
-			// Run close hook
+			// Auto-close parent molecule if all steps are now complete
+			autoCloseCompletedMolecule(ctx, store, id, actor, session)
+
+			// Run close hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := store.GetIssue(ctx, id)
 			if closedIssue != nil && hookRunner != nil {
 				hookRunner.Run(hooks.EventClose, closedIssue)
@@ -291,7 +155,7 @@ create, update, show, or close operation).`,
 					closedIssues = append(closedIssues, closedIssue)
 				}
 			} else {
-				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), id, reason)
+				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(id, issueTitleOrEmpty(issue)), reason)
 			}
 		}
 
@@ -314,6 +178,15 @@ create, update, show, or close operation).`,
 				result.Close()
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				continue
+			}
+
+			// Check gate satisfaction for machine-checkable gates (GH#1467)
+			if !force {
+				if err := checkGateSatisfaction(result.Issue); err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "cannot close %s: %s\n", id, err)
+					continue
+				}
 			}
 
 			// Check if issue has open blockers (GH#962)
@@ -339,7 +212,10 @@ create, update, show, or close operation).`,
 
 			closedCount++
 
-			// Get updated issue for hook
+			// Auto-close parent molecule if all steps are now complete
+			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
+
+			// Get updated issue for hook (best effort: hook runs only if re-fetch succeeds)
 			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
 			if closedIssue != nil && hookRunner != nil {
 				hookRunner.Run(hooks.EventClose, closedIssue)
@@ -350,7 +226,7 @@ create, update, show, or close operation).`,
 					closedIssues = append(closedIssues, closedIssue)
 				}
 			} else {
-				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), result.ResolvedID, reason)
+				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(result.ResolvedID, result.Issue.Title), reason)
 			}
 			result.Close()
 		}
@@ -368,14 +244,9 @@ create, update, show, or close operation).`,
 				}
 				fmt.Printf("\nNewly unblocked:\n")
 				for _, issue := range unblocked {
-					fmt.Printf("  • %s %q (P%d)\n", issue.ID, issue.Title, issue.Priority)
+					fmt.Printf("  • %s (P%d)\n", formatFeedbackID(issue.ID, issue.Title), issue.Priority)
 				}
 			}
-		}
-
-		// Schedule auto-flush if any issues were closed
-		if len(args) > 0 {
-			markDirtyAndScheduleFlush()
 		}
 
 		// Handle --continue flag
@@ -400,6 +271,13 @@ create, update, show, or close operation).`,
 		if jsonOutput && len(closedIssues) > 0 {
 			outputJSON(closedIssues)
 		}
+
+		// Exit non-zero if no issues were actually closed (close guard
+		// and other soft failures should surface as non-zero exit codes for scripting)
+		totalAttempted := len(resolvedIDs) + len(routedArgs)
+		if totalAttempted > 0 && closedCount == 0 {
+			os.Exit(1)
+		}
 	},
 }
 
@@ -409,11 +287,112 @@ func init() {
 	_ = closeCmd.Flags().MarkHidden("resolution") // Hidden alias for agent/CLI ergonomics
 	closeCmd.Flags().StringP("message", "m", "", "Alias for --reason (git commit convention)")
 	_ = closeCmd.Flags().MarkHidden("message") // Hidden alias for agent/CLI ergonomics
-	closeCmd.Flags().BoolP("force", "f", false, "Force close pinned issues")
+	closeCmd.Flags().String("comment", "", "Alias for --reason")
+	_ = closeCmd.Flags().MarkHidden("comment") // Hidden alias for agent/CLI ergonomics
+	closeCmd.Flags().BoolP("force", "f", false, "Force close pinned issues or unsatisfied gates")
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
 	closeCmd.Flags().Bool("suggest-next", false, "Show newly unblocked issues after closing")
 	closeCmd.Flags().String("session", "", "Claude Code session ID (or set CLAUDE_SESSION_ID env var)")
 	closeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(closeCmd)
+}
+
+// isMachineCheckableGate returns true if the issue is a gate with a machine-checkable await type.
+func isMachineCheckableGate(issue *types.Issue) bool {
+	if issue == nil || issue.IssueType != "gate" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
+		return true
+	case strings.HasPrefix(issue.AwaitType, "gh:run"):
+		return true
+	case issue.AwaitType == "timer":
+		return true
+	case issue.AwaitType == "bead":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkGateSatisfaction checks whether a gate issue's condition is satisfied.
+// Returns nil if the gate is satisfied (or not a machine-checkable gate), or an error describing why it cannot be closed.
+func checkGateSatisfaction(issue *types.Issue) error {
+	if !isMachineCheckableGate(issue) {
+		return nil
+	}
+
+	var resolved bool
+	var escalated bool
+	var reason string
+	var err error
+
+	switch {
+	case strings.HasPrefix(issue.AwaitType, "gh:run"):
+		resolved, escalated, reason, err = checkGHRun(issue)
+	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
+		resolved, escalated, reason, err = checkGHPR(issue)
+	case issue.AwaitType == "timer":
+		resolved, escalated, reason, err = checkTimer(issue, time.Now())
+	case issue.AwaitType == "bead":
+		resolved, reason = checkBeadGate(rootCtx, issue.AwaitID)
+		if resolved {
+			return nil
+		}
+		return fmt.Errorf("gate condition not satisfied: %s (use --force to override)", reason)
+	}
+
+	if err != nil {
+		// If we can't check the condition, allow close with a warning
+		fmt.Fprintf(os.Stderr, "Warning: could not evaluate gate condition: %v\n", err)
+		return nil
+	}
+
+	if resolved {
+		return nil
+	}
+
+	if escalated {
+		return fmt.Errorf("gate condition not satisfied: %s (use --force to override)", reason)
+	}
+
+	return fmt.Errorf("gate condition not satisfied: %s (use --force to override)", reason)
+}
+
+// autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
+// and if so, auto-closes the molecule root. This prevents stale wisps that are
+// complete but never explicitly closed (e.g., deacon patrol wisps).
+func autoCloseCompletedMolecule(ctx context.Context, s *dolt.DoltStore, closedStepID, actorName, session string) {
+	moleculeID := findParentMolecule(ctx, s, closedStepID)
+	if moleculeID == "" {
+		return // Not part of a molecule
+	}
+
+	// Check if molecule root is already closed
+	root, err := s.GetIssue(ctx, moleculeID)
+	if err != nil || root == nil || root.Status == types.StatusClosed {
+		return
+	}
+
+	// Load progress to check completion
+	progress, err := getMoleculeProgress(ctx, s, moleculeID)
+	if err != nil {
+		return // Best effort — don't fail the close
+	}
+
+	if progress.Completed < progress.Total {
+		return // Not all steps complete yet
+	}
+
+	// All steps complete — auto-close the molecule root
+	if err := s.CloseIssue(ctx, moleculeID, "all steps complete", actorName, session); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not auto-close completed molecule %s: %v\n", moleculeID, err)
+		return
+	}
+
+	if !jsonOutput {
+		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
+	}
 }

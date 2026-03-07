@@ -19,6 +19,12 @@ func registerCommonIssueFlags(cmd *cobra.Command) {
 	cmd.Flags().String("body-file", "", "Read description from file (use - for stdin)")
 	cmd.Flags().String("description-file", "", "Alias for --body-file")
 	_ = cmd.Flags().MarkHidden("description-file") // Hidden alias
+	cmd.Flags().Bool("stdin", false, "Read description from stdin (alias for --body-file -)")
+	cmd.MarkFlagsMutuallyExclusive("stdin", "body-file")
+	cmd.MarkFlagsMutuallyExclusive("stdin", "description-file")
+	cmd.MarkFlagsMutuallyExclusive("stdin", "description")
+	cmd.MarkFlagsMutuallyExclusive("stdin", "body")
+	cmd.MarkFlagsMutuallyExclusive("stdin", "message")
 	cmd.Flags().String("design", "", "Design notes")
 	cmd.Flags().String("acceptance", "", "Acceptance criteria")
 	cmd.Flags().String("notes", "", "Additional notes")
@@ -32,6 +38,15 @@ func registerCommonIssueFlags(cmd *cobra.Command) {
 // contains apostrophes or other characters that are hard to escape in shell).
 // Returns the value and whether any flag was explicitly changed.
 func getDescriptionFlag(cmd *cobra.Command) (string, bool) {
+	// --stdin is an alias for --body-file -
+	if stdinFlag, _ := cmd.Flags().GetBool("stdin"); stdinFlag {
+		content, err := readBodyFile("-")
+		if err != nil {
+			FatalError("reading from stdin: %v", err)
+		}
+		return content, true
+	}
+
 	bodyFileChanged := cmd.Flags().Changed("body-file")
 	descFileChanged := cmd.Flags().Changed("description-file")
 	descChanged := cmd.Flags().Changed("description")
@@ -43,8 +58,7 @@ func getDescriptionFlag(cmd *cobra.Command) (string, bool) {
 		bodyFile, _ := cmd.Flags().GetString("body-file")
 		descFile, _ := cmd.Flags().GetString("description-file")
 		if bodyFile != descFile {
-			fmt.Fprintf(os.Stderr, "Error: cannot specify both --body-file and --description-file with different values\n")
-			os.Exit(1)
+			FatalError("cannot specify both --body-file and --description-file with different values")
 		}
 	}
 
@@ -59,14 +73,12 @@ func getDescriptionFlag(cmd *cobra.Command) (string, bool) {
 
 		// Error if both file and string flags are specified
 		if descChanged || bodyChanged || messageChanged {
-			fmt.Fprintf(os.Stderr, "Error: cannot specify both --body-file and --description/--body/--message\n")
-			os.Exit(1)
+			FatalError("cannot specify both --body-file and --description/--body/--message")
 		}
 
 		content, err := readBodyFile(filePath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading body file: %v\n", err)
-			os.Exit(1)
+			FatalError("reading body file: %v", err)
 		}
 		return content, true
 	}
@@ -105,8 +117,7 @@ func getDescriptionFlag(cmd *cobra.Command) (string, bool) {
 		}
 		content, err := readBodyFile("-")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading from stdin: %v\n", err)
-			os.Exit(1)
+			FatalError("reading from stdin: %v", err)
 		}
 		return content, true
 	}

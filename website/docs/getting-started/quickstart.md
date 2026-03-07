@@ -13,11 +13,8 @@ Get up and running with Beads in 2 minutes.
 First time in a repository:
 
 ```bash
-# Basic setup
+# Basic setup (uses Dolt backend)
 bd init
-
-# Dolt backend (version-controlled SQL database)
-bd init --backend dolt
 
 # For AI agents (non-interactive)
 bd init --quiet
@@ -37,16 +34,10 @@ The wizard will:
 - Import existing issues from git (if any)
 - Prompt to install git hooks (recommended)
 - Prompt to configure git merge driver (recommended)
-- Auto-start daemon for sync (SQLite backend only)
 
 Notes:
-- SQLite backend stores data in `.beads/beads.db`.
-- Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
-- Dolt backend runs **single-process-only**; daemon mode is disabled.
-
-Notes:
-- SQLite backend stores data in `.beads/beads.db`.
-- Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
+- Dolt stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
+- The Dolt server handles database access (`bd dolt start/stop`).
 
 ## Your First Issues
 
@@ -131,7 +122,7 @@ Only bd-1 is ready because bd-2 and bd-3 are blocked!
 
 ```bash
 # Start working on bd-1
-bd update bd-1 --status in_progress
+bd update bd-1 --claim
 
 # Complete it
 bd close bd-1 --reason "Database setup complete"
@@ -154,9 +145,7 @@ bd stats
 
 ## Database Location
 
-By default, the database is in `.beads/beads.db` (gitignored).
-
-The JSONL file `.beads/issues.jsonl` is git-tracked and syncs automatically.
+By default, the Dolt database is in `.beads/dolt/` (gitignored). Sync is handled via Dolt-native replication.
 
 ## Next Steps
 

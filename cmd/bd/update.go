@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
-	"github.com/steveyegge/beads/internal/util"
+	"github.com/steveyegge/beads/internal/utils"
 	"github.com/steveyegge/beads/internal/validation"
 )
 
@@ -41,6 +43,20 @@ create, update, show, or close operation).`,
 
 		if cmd.Flags().Changed("status") {
 			status, _ := cmd.Flags().GetString("status")
+			var customStatuses []string
+			if store != nil {
+				cs, err := store.GetCustomStatuses(rootCtx)
+				if err != nil {
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "%s Failed to get custom statuses: %v\n", ui.RenderWarn("!"), err)
+					}
+				} else {
+					customStatuses = cs
+				}
+			}
+			if !types.Status(status).IsValidWithCustom(customStatuses) {
+				FatalErrorRespectJSON("invalid status %q (built-in: open, in_progress, blocked, deferred, closed, pinned, hooked; or configure custom statuses via 'bd config set status.custom')", status)
+			}
 			updates["status"] = status
 
 			// If status is being set to closed, include session if provided
@@ -64,6 +80,10 @@ create, update, show, or close operation).`,
 		}
 		if cmd.Flags().Changed("title") {
 			title, _ := cmd.Flags().GetString("title")
+			title = strings.TrimSpace(title)
+			if title == "" {
+				FatalErrorRespectJSON("title cannot be empty")
+			}
 			updates["title"] = title
 		}
 		if cmd.Flags().Changed("assignee") {
@@ -102,6 +122,10 @@ create, update, show, or close operation).`,
 			externalRef, _ := cmd.Flags().GetString("external-ref")
 			updates["external_ref"] = externalRef
 		}
+		if cmd.Flags().Changed("spec-id") {
+			specID, _ := cmd.Flags().GetString("spec-id")
+			updates["spec_id"] = specID
+		}
 		if cmd.Flags().Changed("estimate") {
 			estimate, _ := cmd.Flags().GetInt("estimate")
 			if estimate < 0 {
@@ -112,15 +136,26 @@ create, update, show, or close operation).`,
 		if cmd.Flags().Changed("type") {
 			issueType, _ := cmd.Flags().GetString("type")
 			// Normalize aliases (e.g., "enhancement" -> "feature") before validating
-			issueType = util.NormalizeIssueType(issueType)
+			issueType = utils.NormalizeIssueType(issueType)
 			var customTypes []string
 			if store != nil {
-				if ct, err := store.GetCustomTypes(cmd.Context()); err == nil {
+				ct, err := store.GetCustomTypes(cmd.Context())
+				if err != nil {
+					// Log DB error but continue with YAML fallback (GH#1499 bd-2ll)
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "%s Failed to get custom types from DB: %v (falling back to config.yaml)\n",
+							ui.RenderWarn("!"), err)
+					}
+				} else {
 					customTypes = ct
 				}
 			}
+			// Fallback to config.yaml when store returns no custom types.
+			if len(customTypes) == 0 {
+				customTypes = config.GetCustomTypesFromYAML()
+			}
 			if !types.IssueType(issueType).IsValidWithCustom(customTypes) {
-				validTypes := "bug, feature, task, epic, chore"
+				validTypes := "bug, feature, task, epic, chore, decision"
 				if len(customTypes) > 0 {
 					validTypes += ", " + joinStrings(customTypes, ", ")
 				}
@@ -195,6 +230,39 @@ create, update, show, or close operation).`,
 		if persistentChanged {
 			updates["wisp"] = false
 		}
+		// Metadata flag (GH#1413)
+		if cmd.Flags().Changed("metadata") {
+			metadataValue, _ := cmd.Flags().GetString("metadata")
+			var metadataJSON string
+			if strings.HasPrefix(metadataValue, "@") {
+				// Read JSON from file
+				filePath := metadataValue[1:]
+				// #nosec G304 -- user explicitly provides file path via @file.json syntax
+				data, err := os.ReadFile(filePath)
+				if err != nil {
+					FatalErrorRespectJSON("failed to read metadata file %s: %v", filePath, err)
+				}
+				metadataJSON = string(data)
+			} else {
+				metadataJSON = metadataValue
+			}
+			// Validate JSON
+			if !json.Valid([]byte(metadataJSON)) {
+				FatalErrorRespectJSON("invalid JSON in --metadata: must be valid JSON")
+			}
+			updates["metadata"] = json.RawMessage(metadataJSON)
+		}
+
+		// Incremental metadata edits (GH#1406)
+		setMetadataFlags, _ := cmd.Flags().GetStringArray("set-metadata")
+		unsetMetadataFlags, _ := cmd.Flags().GetStringArray("unset-metadata")
+		if (len(setMetadataFlags) > 0 || len(unsetMetadataFlags) > 0) && cmd.Flags().Changed("metadata") {
+			FatalErrorRespectJSON("cannot combine --metadata with --set-metadata or --unset-metadata")
+		}
+		if len(setMetadataFlags) > 0 || len(unsetMetadataFlags) > 0 {
+			updates["_set_metadata"] = setMetadataFlags
+			updates["_unset_metadata"] = unsetMetadataFlags
+		}
 
 		// Get claim flag
 		claimFlag, _ := cmd.Flags().GetBool("claim")
@@ -206,277 +274,6 @@ create, update, show, or close operation).`,
 
 		ctx := rootCtx
 
-		// Resolve partial IDs first, checking for cross-rig routing
-		var resolvedIDs []string
-		var routedArgs []string // IDs that need cross-repo routing (bypass daemon)
-		if daemonClient != nil {
-			// In daemon mode, resolve via RPC - but check routing first
-			for _, id := range args {
-				// Check if this ID needs routing to a different beads directory
-				if needsRouting(id) {
-					routedArgs = append(routedArgs, id)
-					continue
-				}
-				resolveArgs := &rpc.ResolveIDArgs{ID: id}
-				resp, err := daemonClient.ResolveID(resolveArgs)
-				if err != nil {
-					FatalErrorRespectJSON("resolving ID %s: %v", id, err)
-				}
-				var resolvedID string
-				if err := json.Unmarshal(resp.Data, &resolvedID); err != nil {
-					FatalErrorRespectJSON("unmarshaling resolved ID: %v", err)
-				}
-				resolvedIDs = append(resolvedIDs, resolvedID)
-			}
-		}
-		// Note: Direct mode (no daemon) uses resolveAndGetIssueWithRouting in the loop below
-
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			updatedIssues := []*types.Issue{}
-			var firstUpdatedID string // Track first successful update for last-touched
-			for _, id := range resolvedIDs {
-				updateArgs := &rpc.UpdateArgs{ID: id}
-
-				// Map updates to RPC args
-				if status, ok := updates["status"].(string); ok {
-					updateArgs.Status = &status
-				}
-				if priority, ok := updates["priority"].(int); ok {
-					updateArgs.Priority = &priority
-				}
-				if title, ok := updates["title"].(string); ok {
-					updateArgs.Title = &title
-				}
-				if assignee, ok := updates["assignee"].(string); ok {
-					updateArgs.Assignee = &assignee
-				}
-				if description, ok := updates["description"].(string); ok {
-					updateArgs.Description = &description
-				}
-				if design, ok := updates["design"].(string); ok {
-					updateArgs.Design = &design
-				}
-				if notes, ok := updates["notes"].(string); ok {
-					updateArgs.Notes = &notes
-				}
-				if appendNotes, ok := updates["append_notes"].(string); ok {
-					// Fetch existing issue to get current notes
-					showArgs := &rpc.ShowArgs{ID: id}
-					resp, err := daemonClient.Show(showArgs)
-					if err == nil {
-						var existingIssue types.Issue
-						if err := json.Unmarshal(resp.Data, &existingIssue); err == nil {
-							combined := existingIssue.Notes
-							if combined != "" {
-								combined += "\n"
-							}
-							combined += appendNotes
-							updateArgs.Notes = &combined
-						}
-					}
-				}
-				if acceptanceCriteria, ok := updates["acceptance_criteria"].(string); ok {
-					updateArgs.AcceptanceCriteria = &acceptanceCriteria
-				}
-				if externalRef, ok := updates["external_ref"].(string); ok {
-					updateArgs.ExternalRef = &externalRef
-				}
-				if estimate, ok := updates["estimated_minutes"].(int); ok {
-					updateArgs.EstimatedMinutes = &estimate
-				}
-				if issueType, ok := updates["issue_type"].(string); ok {
-					updateArgs.IssueType = &issueType
-				}
-				if addLabels, ok := updates["add_labels"].([]string); ok {
-					updateArgs.AddLabels = addLabels
-				}
-				if removeLabels, ok := updates["remove_labels"].([]string); ok {
-					updateArgs.RemoveLabels = removeLabels
-				}
-				if setLabels, ok := updates["set_labels"].([]string); ok {
-					updateArgs.SetLabels = setLabels
-				}
-				if issueType, ok := updates["issue_type"].(string); ok {
-					updateArgs.IssueType = &issueType
-				}
-				if parent, ok := updates["parent"].(string); ok {
-					updateArgs.Parent = &parent
-				}
-				// Gate fields (bd-z6kw)
-				if awaitID, ok := updates["await_id"].(string); ok {
-					updateArgs.AwaitID = &awaitID
-				}
-				// Time-based scheduling (GH#820)
-				if dueAt, ok := updates["due_at"].(time.Time); ok {
-					s := dueAt.Format(time.RFC3339)
-					updateArgs.DueAt = &s
-				} else if updates["due_at"] == nil && cmd.Flags().Changed("due") {
-					// Explicit clear
-					empty := ""
-					updateArgs.DueAt = &empty
-				}
-				if deferUntil, ok := updates["defer_until"].(time.Time); ok {
-					s := deferUntil.Format(time.RFC3339)
-					updateArgs.DeferUntil = &s
-				} else if updates["defer_until"] == nil && cmd.Flags().Changed("defer") {
-					// Explicit clear
-					empty := ""
-					updateArgs.DeferUntil = &empty
-				}
-				// Ephemeral/persistent
-				if wisp, ok := updates["wisp"].(bool); ok {
-					updateArgs.Ephemeral = &wisp
-				}
-
-				// Set claim flag for atomic claim operation
-				updateArgs.Claim = claimFlag
-
-				resp, err := daemonClient.Update(updateArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
-					continue
-				}
-
-				var issue types.Issue
-				if err := json.Unmarshal(resp.Data, &issue); err == nil {
-					// Run update hook
-					if hookRunner != nil {
-						hookRunner.Run(hooks.EventUpdate, &issue)
-					}
-					if jsonOutput {
-						updatedIssues = append(updatedIssues, &issue)
-					}
-				}
-				if !jsonOutput {
-					fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), id)
-				}
-
-				// Track first successful update for last-touched
-				if firstUpdatedID == "" {
-					firstUpdatedID = id
-				}
-			}
-
-			// Handle routed IDs via direct mode (bypass daemon)
-			for _, id := range routedArgs {
-				result, err := resolveAndGetIssueWithRouting(ctx, store, id)
-				if err != nil {
-					if result != nil {
-						result.Close()
-					}
-					fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
-					continue
-				}
-				if result == nil || result.Issue == nil {
-					if result != nil {
-						result.Close()
-					}
-					fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
-					continue
-				}
-				issue := result.Issue
-				issueStore := result.Store
-
-				if err := validateIssueUpdatable(id, issue); err != nil {
-					fmt.Fprintf(os.Stderr, "%s\n", err)
-					result.Close()
-					continue
-				}
-
-				// Handle claim operation atomically
-				if claimFlag {
-					if issue.Assignee != "" {
-						fmt.Fprintf(os.Stderr, "Error claiming %s: already claimed by %s\n", id, issue.Assignee)
-						result.Close()
-						continue
-					}
-					claimUpdates := map[string]interface{}{
-						"assignee": actor,
-						"status":   "in_progress",
-					}
-					if err := issueStore.UpdateIssue(ctx, result.ResolvedID, claimUpdates, actor); err != nil {
-						fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
-						result.Close()
-						continue
-					}
-				}
-
-				// Apply regular field updates if any
-				regularUpdates := make(map[string]interface{})
-				for k, v := range updates {
-					if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
-						regularUpdates[k] = v
-					}
-				}
-				// Handle append_notes: combine existing notes with new content
-				if appendNotes, ok := updates["append_notes"].(string); ok {
-					combined := issue.Notes
-					if combined != "" {
-						combined += "\n"
-					}
-					combined += appendNotes
-					regularUpdates["notes"] = combined
-				}
-				if len(regularUpdates) > 0 {
-					if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
-						fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
-						result.Close()
-						continue
-					}
-				}
-
-				// Handle label operations
-				var setLabels, addLabels, removeLabels []string
-				if v, ok := updates["set_labels"].([]string); ok {
-					setLabels = v
-				}
-				if v, ok := updates["add_labels"].([]string); ok {
-					addLabels = v
-				}
-				if v, ok := updates["remove_labels"].([]string); ok {
-					removeLabels = v
-				}
-				if len(setLabels) > 0 || len(addLabels) > 0 || len(removeLabels) > 0 {
-					if err := applyLabelUpdates(ctx, issueStore, result.ResolvedID, actor, setLabels, addLabels, removeLabels); err != nil {
-						fmt.Fprintf(os.Stderr, "Error updating labels for %s: %v\n", id, err)
-						result.Close()
-						continue
-					}
-				}
-
-				// Run update hook
-				updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
-				if updatedIssue != nil && hookRunner != nil {
-					hookRunner.Run(hooks.EventUpdate, updatedIssue)
-				}
-
-				if jsonOutput {
-					if updatedIssue != nil {
-						updatedIssues = append(updatedIssues, updatedIssue)
-					}
-				} else {
-					fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), result.ResolvedID)
-				}
-
-				if firstUpdatedID == "" {
-					firstUpdatedID = result.ResolvedID
-				}
-				result.Close()
-			}
-
-			if jsonOutput && len(updatedIssues) > 0 {
-				outputJSON(updatedIssues)
-			}
-
-			// Set last touched after all updates complete
-			if firstUpdatedID != "" {
-				SetLastTouchedID(firstUpdatedID)
-			}
-			return
-		}
-
-		// Direct mode - use routed resolution for cross-repo lookups
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
 		for _, id := range args {
@@ -505,20 +302,9 @@ create, update, show, or close operation).`,
 				continue
 			}
 
-			// Handle claim operation atomically
+			// Handle claim operation atomically using compare-and-swap semantics
 			if claimFlag {
-				// Check if already claimed (has non-empty assignee)
-				if issue.Assignee != "" {
-					fmt.Fprintf(os.Stderr, "Error claiming %s: already claimed by %s\n", id, issue.Assignee)
-					result.Close()
-					continue
-				}
-				// Atomically set assignee and status
-				claimUpdates := map[string]interface{}{
-					"assignee": actor,
-					"status":   "in_progress",
-				}
-				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, claimUpdates, actor); err != nil {
+				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
 					result.Close()
 					continue
@@ -528,9 +314,20 @@ create, update, show, or close operation).`,
 			// Apply regular field updates if any
 			regularUpdates := make(map[string]interface{})
 			for k, v := range updates {
-				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
+				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" &&
+					k != "_set_metadata" && k != "_unset_metadata" {
 					regularUpdates[k] = v
 				}
+			}
+
+			// Handle incremental metadata edits (GH#1406)
+			if setMeta, ok := updates["_set_metadata"].([]string); ok {
+				unsetMeta, _ := updates["_unset_metadata"].([]string)
+				merged, err := applyMetadataEdits(issue.Metadata, setMeta, unsetMeta)
+				if err != nil {
+					FatalErrorRespectJSON("metadata edit failed for %s: %v", id, err)
+				}
+				regularUpdates["metadata"] = merged
 			}
 			// Handle append_notes: combine existing notes with new content
 			if appendNotes, ok := updates["append_notes"].(string); ok {
@@ -617,9 +414,14 @@ create, update, show, or close operation).`,
 			}
 
 			// Run update hook
-			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
+			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID) // Best effort: nil issue handled by subsequent nil check
 			if updatedIssue != nil && hookRunner != nil {
 				hookRunner.Run(hooks.EventUpdate, updatedIssue)
+			}
+
+			updateTitle := ""
+			if updatedIssue != nil {
+				updateTitle = updatedIssue.Title
 			}
 
 			if jsonOutput {
@@ -627,7 +429,7 @@ create, update, show, or close operation).`,
 					updatedIssues = append(updatedIssues, updatedIssue)
 				}
 			} else {
-				fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), result.ResolvedID)
+				fmt.Printf("%s Updated issue: %s\n", ui.RenderPass("✓"), formatFeedbackID(result.ResolvedID, updateTitle))
 			}
 
 			// Track first successful update for last-touched
@@ -642,23 +444,90 @@ create, update, show, or close operation).`,
 			SetLastTouchedID(firstUpdatedID)
 		}
 
-		// Schedule auto-flush if any issues were updated
-		if len(args) > 0 {
-			markDirtyAndScheduleFlush()
-		}
-
 		if jsonOutput && len(updatedIssues) > 0 {
 			outputJSON(updatedIssues)
 		}
+
+		// Exit non-zero if no issues were actually updated (claim failures
+		// and other soft errors should surface as non-zero exit codes for scripting)
+		if len(args) > 0 && firstUpdatedID == "" {
+			os.Exit(1)
+		}
 	},
+}
+
+// applyMetadataEdits applies --set-metadata and --unset-metadata edits to existing metadata.
+// Returns the merged JSON as json.RawMessage.
+func applyMetadataEdits(existing json.RawMessage, setFlags, unsetFlags []string) (json.RawMessage, error) {
+	// Parse existing metadata (or start with empty object)
+	data := make(map[string]json.RawMessage)
+	if len(existing) > 0 {
+		trimmed := strings.TrimSpace(string(existing))
+		if trimmed != "" && trimmed != "null" {
+			if err := json.Unmarshal(existing, &data); err != nil {
+				return nil, fmt.Errorf("existing metadata is not a JSON object: %w", err)
+			}
+		}
+	}
+
+	// Apply --set-metadata key=value pairs
+	for _, kv := range setFlags {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid --set-metadata: expected key=value, got %q", kv)
+		}
+		if err := storage.ValidateMetadataKey(k); err != nil {
+			return nil, err
+		}
+		// Store as JSON value: try to preserve type (number, bool, null)
+		data[k] = toJSONValue(v)
+	}
+
+	// Apply --unset-metadata keys
+	for _, k := range unsetFlags {
+		if err := storage.ValidateMetadataKey(k); err != nil {
+			return nil, err
+		}
+		delete(data, k)
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	return json.RawMessage(result), nil
+}
+
+// toJSONValue converts a string value to its most appropriate JSON representation.
+// Recognizes numbers, booleans, and null; everything else becomes a JSON string.
+func toJSONValue(s string) json.RawMessage {
+	// Check for null
+	if s == "null" {
+		return json.RawMessage("null")
+	}
+	// Check for booleans
+	if s == "true" || s == "false" {
+		return json.RawMessage(s)
+	}
+	// Check for numbers (integer or float)
+	if _, err := fmt.Sscanf(s, "%f", new(float64)); err == nil {
+		// Verify it round-trips cleanly (not NaN, Inf, etc.)
+		if json.Valid([]byte(s)) {
+			return json.RawMessage(s)
+		}
+	}
+	// Default to JSON string
+	b, _ := json.Marshal(s)
+	return json.RawMessage(b)
 }
 
 func init() {
 	updateCmd.Flags().StringP("status", "s", "", "New status")
 	registerPriorityFlag(updateCmd, "")
 	updateCmd.Flags().String("title", "", "New title")
-	updateCmd.Flags().StringP("type", "t", "", "New type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role|rig|convoy|event|slot)")
+	updateCmd.Flags().StringP("type", "t", "", "New type (bug|feature|task|epic|chore|decision); custom types require types.custom config")
 	registerCommonIssueFlags(updateCmd)
+	updateCmd.Flags().String("spec-id", "", "Link to specification document")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")
 	_ = updateCmd.Flags().MarkHidden("acceptance-criteria") // Only fails if flag missing (caught in tests)
 	updateCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
@@ -684,6 +553,11 @@ func init() {
 	// Ephemeral/persistent flags
 	updateCmd.Flags().Bool("ephemeral", false, "Mark issue as ephemeral (wisp) - not exported to JSONL")
 	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
+	// Metadata flag (GH#1413)
+	updateCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
+	// Incremental metadata edits (GH#1406)
+	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
+	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

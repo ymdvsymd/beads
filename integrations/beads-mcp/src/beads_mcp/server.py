@@ -41,6 +41,7 @@ from beads_mcp.models import (
 from beads_mcp.tools import (
     beads_add_dependency,
     beads_blocked,
+    beads_claim_issue,
     beads_close_issue,
     beads_create_issue,
     beads_detect_pollution,
@@ -70,7 +71,6 @@ logging.basicConfig(
 T = TypeVar("T")
 
 # Global state for cleanup
-_daemon_clients: list[Any] = []
 _cleanup_done = False
 
 # Persistent workspace context (survives across MCP tool calls)
@@ -131,28 +131,16 @@ IMPORTANT: Call context(workspace_root='...') to set your workspace before any w
 
 def cleanup() -> None:
     """Clean up resources on exit.
-    
-    Closes daemon connections and removes temp files.
+
     Safe to call multiple times.
     """
     global _cleanup_done
-    
+
     if _cleanup_done:
         return
-    
+
     _cleanup_done = True
     logger.info("Cleaning up beads-mcp resources...")
-    
-    # Close all daemon client connections
-    for client in _daemon_clients:
-        try:
-            if hasattr(client, 'cleanup'):
-                client.cleanup()
-                logger.debug(f"Closed daemon client: {client}")
-        except Exception as e:
-            logger.warning(f"Error closing daemon client: {e}")
-    
-    _daemon_clients.clear()
     logger.info("Cleanup complete")
 
 
@@ -314,6 +302,7 @@ _TOOL_CATALOG = {
     "list": "List issues with filters (status, priority, type)",
     "show": "Show full details for a specific issue",
     "create": "Create a new issue (bug, feature, task, epic)",
+    "claim": "Atomically claim an issue for work (assignee + in_progress)",
     "update": "Update issue status, priority, or assignee",
     "close": "Close/complete an issue",
     "reopen": "Reopen closed issues",
@@ -385,7 +374,7 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             "parameters": {
                 "status": "open|in_progress|blocked|deferred|closed or custom (optional)",
                 "priority": "int 0-4 (optional)",
-                "issue_type": "bug|feature|task|epic|chore or custom (optional)",
+                "issue_type": "bug|feature|task|epic|chore|decision or custom (optional)",
                 "assignee": "str (optional)",
                 "labels": "list[str] (optional) - AND filter: must have ALL labels",
                 "labels_any": "list[str] (optional) - OR filter: must have at least one",
@@ -421,7 +410,7 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "title": "str (required)",
                 "description": "str (default '')",
                 "priority": "int 0-4 (default 2)",
-                "issue_type": "bug|feature|task|epic|chore or custom (default task)",
+                "issue_type": "bug|feature|task|epic|chore|decision or custom (default task)",
                 "assignee": "str (optional)",
                 "labels": "list[str] (optional)",
                 "deps": "list[str] (optional) - dependency IDs",
@@ -430,6 +419,17 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             },
             "returns": "OperationResult {id, action} or full Issue if brief=False",
             "example": "create(title='Fix auth bug', priority=1, issue_type='bug')"
+        },
+        "claim": {
+            "name": "claim",
+            "description": "Atomically claim an issue for work",
+            "parameters": {
+                "issue_id": "str (required)",
+                "brief": "bool (default true) - Return OperationResult instead of full Issue",
+                "workspace_root": "str (optional)"
+            },
+            "returns": "OperationResult {id, action='claimed'} or full Issue if brief=False",
+            "example": "claim(issue_id='bd-a1b2')"
         },
         "update": {
             "name": "update",
@@ -445,7 +445,7 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "workspace_root": "str (optional)"
             },
             "returns": "OperationResult {id, action} or full Issue if brief=False",
-            "example": "update(issue_id='bd-a1b2', status='in_progress')"
+            "example": "update(issue_id='bd-a1b2', status='blocked')"
         },
         "close": {
             "name": "close",
@@ -766,7 +766,7 @@ def _truncate_description(issue: Issue, max_length: int) -> Issue:
     return issue
 
 
-@mcp.tool(name="ready", description="Find tasks that have no blockers and are ready to be worked on. Returns minimal format for context efficiency.", output_schema=None)
+@mcp.tool(name="ready", description="Find tasks that have no blockers and are ready to be worked on. Returns minimal format for context efficiency.")
 @with_workspace
 async def ready_work(
     limit: int = 10,
@@ -840,7 +840,6 @@ async def ready_work(
 @mcp.tool(
     name="list",
     description="List all issues with optional filters. When status='blocked', returns BlockedIssue with blocked_by info.",
-    output_schema=None,
 )
 @with_workspace
 async def list_issues(
@@ -863,7 +862,7 @@ async def list_issues(
     Args:
         status: Filter by status (open, in_progress, blocked, closed)
         priority: Filter by priority level (0-4)
-        issue_type: Filter by type (bug, feature, task, epic, chore)
+        issue_type: Filter by type (bug, feature, task, epic, chore, decision)
         assignee: Filter by assignee
         labels: Filter by labels (AND: must have ALL specified labels)
         labels_any: Filter by labels (OR: must have at least one)
@@ -921,7 +920,6 @@ async def list_issues(
 @mcp.tool(
     name="show",
     description="Show detailed information about a specific issue including dependencies and dependents.",
-    output_schema=None,
 )
 @with_workspace
 async def show_issue(
@@ -966,9 +964,8 @@ async def show_issue(
 
 @mcp.tool(
     name="create",
-    description="""Create a new issue (bug, feature, task, epic, or chore) with optional design,
+    description="""Create a new issue (bug, feature, task, epic, chore, or decision) with optional design,
 acceptance criteria, and dependencies.""",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1012,10 +1009,33 @@ async def create_issue(
 
 
 @mcp.tool(
+    name="claim",
+    description="Atomically claim an issue for work (assignee + in_progress in one CAS-style operation).",
+)
+@with_workspace
+@require_context
+async def claim_issue(
+    issue_id: str,
+    workspace_root: str | None = None,
+    brief: bool = True,
+) -> Issue | OperationResult | None:
+    """Atomically claim an issue for work.
+
+    Args:
+        brief: If True (default), return minimal OperationResult; if False, return full Issue
+    """
+    issue = await beads_claim_issue(issue_id=issue_id)
+    if issue is None:
+        return None
+    if brief:
+        return OperationResult(id=issue.id, action="claimed")
+    return issue
+
+
+@mcp.tool(
     name="update",
     description="""Update an existing issue's status, priority, assignee, description, design notes,
-or acceptance criteria. Use this to claim work (set status=in_progress).""",
-    output_schema=None,
+or acceptance criteria. For atomic start-work semantics, prefer claim(issue_id).""",
 )
 @with_workspace
 @require_context
@@ -1070,7 +1090,6 @@ async def update_issue(
 @mcp.tool(
     name="close",
     description="Close (complete) an issue. Mark work as done when you've finished implementing/fixing it.",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1096,7 +1115,6 @@ async def close_issue(
 @mcp.tool(
     name="reopen",
     description="Reopen one or more closed issues. Sets status to 'open' and clears closed_at timestamp.",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1152,7 +1170,6 @@ async def stats(workspace_root: str | None = None) -> Stats:
 @mcp.tool(
     name="blocked",
     description="Get blocked issues showing what dependencies are blocking them from being worked on.",
-    output_schema=None,
 )
 @with_workspace
 async def blocked(

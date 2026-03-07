@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/cmd/bd/doctor"
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -26,54 +25,44 @@ func runCheckHealth(path string) {
 		return
 	}
 
-	// Get database path once (centralized path resolution)
-	dbPath := getCheckHealthDBPath(beadsDir)
-
-	// Check if database exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		// No database - only check hooks
+	// Load config for Dolt server connection info
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		// Can't load config - only check hooks
 		if issue := doctor.CheckHooksQuick(Version); issue != "" {
 			printCheckHealthHint([]string{issue})
 		}
 		return
 	}
 
-	// Open database once for all checks (single DB connection)
-	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
-	if err != nil {
-		// Can't open DB - only check hooks
-		if issue := doctor.CheckHooksQuick(Version); issue != "" {
-			printCheckHealthHint([]string{issue})
-		}
-		return
-	}
-	defer db.Close()
+	// Try connecting to Dolt server for config/version checks
+	host := cfg.GetDoltServerHost()
+	port := cfg.GetDoltServerPort()
+	database := cfg.GetDoltDatabase()
 
-	// Check if hints.doctor is disabled in config
-	if hintsDisabledDB(db) {
-		return
-	}
-
-	// Run lightweight checks
 	var issues []string
 
-	// Check 1: Database version mismatch (CLI vs database bd_version)
-	if issue := checkVersionMismatchDB(db); issue != "" {
-		issues = append(issues, issue)
+	dsn := fmt.Sprintf("%s@tcp(%s:%d)/%s?timeout=2s",
+		cfg.GetDoltServerUser(), host, port, database)
+	db, err := sql.Open("mysql", dsn)
+	if err == nil {
+		defer db.Close()
+		// Quick ping to verify server is reachable
+		if pingErr := db.Ping(); pingErr == nil {
+			// Check if hints.doctor is disabled in config
+			if hintsDisabledDB(db) {
+				return
+			}
+			// Check version mismatch
+			if issue := checkVersionMismatchDB(db); issue != "" {
+				issues = append(issues, issue)
+			}
+		}
+		// If ping fails, server not running — skip DB checks silently
 	}
 
-	// Check 2: Sync branch not configured (now reads from config.yaml, not DB)
-	if issue := doctor.CheckSyncBranchQuick(); issue != "" {
-		issues = append(issues, issue)
-	}
-
-	// Check 3: Outdated git hooks
+	// Check outdated git hooks
 	if issue := doctor.CheckHooksQuick(Version); issue != "" {
-		issues = append(issues, issue)
-	}
-
-	// Check 3: Sync-branch hook compatibility (issue #532)
-	if issue := doctor.CheckSyncBranchHookQuick(path); issue != "" {
 		issues = append(issues, issue)
 	}
 
@@ -95,8 +84,7 @@ func runDeepValidation(path string) {
 	if jsonOutput {
 		jsonBytes, err := doctor.DeepValidationResultJSON(result)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		fmt.Println(string(jsonBytes))
 	} else {
@@ -113,7 +101,10 @@ func runServerHealth(path string) {
 	result := doctor.RunServerHealthChecks(path)
 
 	if jsonOutput {
-		jsonBytes, _ := json.Marshal(result)
+		jsonBytes, err := json.Marshal(result)
+		if err != nil {
+			FatalError("failed to marshal health check result: %v", err)
+		}
 		fmt.Println(string(jsonBytes))
 	} else {
 		fmt.Println("Dolt Server Mode Health Check")
@@ -203,15 +194,6 @@ func printCheckHealthHint(issues []string) {
 	fmt.Fprintf(os.Stderr, "   Run 'bd doctor' for details, or 'bd doctor --fix' to auto-repair\n")
 	fmt.Fprintf(os.Stderr, "   (Suppress with: bd config set %s false)\n", ConfigKeyHintsDoctor)
 	os.Exit(1)
-}
-
-// getCheckHealthDBPath returns the database path for check-health operations.
-// This centralizes the path resolution logic.
-func getCheckHealthDBPath(beadsDir string) string {
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		return cfg.DatabasePath(beadsDir)
-	}
-	return filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 }
 
 // hintsDisabledDB checks if hints.doctor is set to "false" using an existing DB connection.

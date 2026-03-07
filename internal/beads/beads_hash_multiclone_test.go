@@ -18,7 +18,20 @@ import (
 
 var testBDBinary string
 
+// testDoltPort is the port of the isolated test Dolt server (0 = not running).
+var testDoltPort int
+
 func TestMain(m *testing.M) {
+	os.Setenv("BEADS_TEST_MODE", "1")
+
+	// Start an isolated Dolt server so integration tests don't hit production.
+	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+	} else {
+		defer testutil.TerminateDoltContainer()
+		testDoltPort = testutil.DoltContainerPortInt()
+	}
+
 	// Build bd binary once for all tests
 	binName := "bd"
 	if runtime.GOOS == "windows" {
@@ -30,13 +43,13 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "Failed to create temp dir for bd binary: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmpDir)
 
 	// Find module root directory (where go.mod lives)
 	modRootCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
 	modRootOut, err := modRootCmd.Output()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to find module root: %v\n", err)
+		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
 	modRoot := strings.TrimSpace(string(modRootOut))
@@ -46,13 +59,19 @@ func TestMain(m *testing.M) {
 	cmd.Dir = modRoot // Build from module root where ./cmd/bd exists
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to build bd binary: %v\n%s\n", err, out)
+		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
 
 	// Optimize git for tests
 	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 
-	os.Exit(m.Run())
+	code := m.Run()
+
+	os.RemoveAll(tmpDir)
+	os.Unsetenv("BEADS_DOLT_PORT")
+	os.Unsetenv("BEADS_TEST_MODE")
+	os.Exit(code)
 }
 
 // getBDPath returns the test bd binary path

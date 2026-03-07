@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var errDaemonLocked = errors.New("daemon lock already held by another process")
+var errProcessLocked = errors.New("lock already held by another process")
 
 // flockExclusive acquires an exclusive non-blocking lock on the file using LockFileEx
 func flockExclusive(f *os.File) error {
@@ -24,14 +24,14 @@ func flockExclusive(f *os.File) error {
 	err := windows.LockFileEx(
 		windows.Handle(f.Fd()),
 		flags,
-		0,             // reserved
-		0xFFFFFFFF,    // number of bytes to lock (low)
-		0xFFFFFFFF,    // number of bytes to lock (high)
+		0,          // reserved
+		0xFFFFFFFF, // number of bytes to lock (low)
+		0xFFFFFFFF, // number of bytes to lock (high)
 		ol,
 	)
 
 	if err == windows.ERROR_LOCK_VIOLATION || err == syscall.EWOULDBLOCK {
-		return errDaemonLocked
+		return errProcessLocked
 	}
 
 	return err

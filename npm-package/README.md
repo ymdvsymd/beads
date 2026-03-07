@@ -27,8 +27,8 @@ Beads is an issue tracker designed specifically for AI coding agents. It provide
 - 🔗 **Dependency tracking** - Four dependency types (blocks, related, parent-child, discovered-from)
 - 📋 **Ready work detection** - Automatically finds issues with no open blockers
 - 🤖 **Agent-friendly** - `--json` flags for programmatic integration
-- 📦 **Git-versioned** - JSONL records stored in git, synced across machines
-- 🌍 **Distributed by design** - Share one logical database via git
+- 📦 **Version-controlled** - Dolt database with full history and branching
+- 🌍 **Distributed by design** - Share one logical database via Dolt remotes
 
 ## Quick Start
 
@@ -65,8 +65,8 @@ bd show bd-a1b2
 # List all issues
 bd list --json
 
-# Update status
-bd update bd-a1b2 --status in_progress
+# Start work
+bd update bd-a1b2 --claim
 
 # Add dependency
 bd dep add bd-f14c bd-a1b2

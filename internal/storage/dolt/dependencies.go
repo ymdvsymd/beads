@@ -1,49 +1,211 @@
-//go:build cgo
-
 package dolt
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// AddDependency adds a dependency between two issues
+// isCrossPrefixDep returns true if the two bead IDs have different prefixes,
+// meaning the target lives in a different rig's database.
+func isCrossPrefixDep(sourceID, targetID string) bool {
+	return types.ExtractPrefix(sourceID) != types.ExtractPrefix(targetID)
+}
+
+// AddDependency adds a dependency between two issues.
+// Uses an explicit transaction so writes persist when @@autocommit is OFF
+// (e.g. Dolt server started with --no-auto-commit).
 func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
+	// Route to wisp_dependencies if the issue is an active wisp
+	if s.isActiveWisp(ctx, dep.IssueID) {
+		return s.addWispDependency(ctx, dep, actor)
+	}
+
+	// Pre-transaction: check if target is a wisp (must be done before opening tx
+	// to avoid connection pool deadlock with embedded dolt — bd-w2w)
+	// Skip wisp check for cross-prefix references (target lives in another rig's database)
+	targetIsWisp := false
+	isCrossPrefix := isCrossPrefixDep(dep.IssueID, dep.DependsOnID)
+	if !strings.HasPrefix(dep.DependsOnID, "external:") && !isCrossPrefix {
+		targetIsWisp = s.isActiveWisp(ctx, dep.DependsOnID)
+	}
+
 	metadata := dep.Metadata
 	if metadata == "" {
 		metadata = "{}"
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Validate that the source issue exists (fetch issue_type for cross-type check)
+	var sourceType string
+	if err := tx.QueryRowContext(ctx, `SELECT issue_type FROM issues WHERE id = ?`, dep.IssueID).Scan(&sourceType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("issue %s not found", dep.IssueID)
+		}
+		return fmt.Errorf("failed to check issue existence: %w", err)
+	}
+
+	// Validate that the target issue exists (skip for external cross-rig references
+	// and cross-prefix references where the target lives in a different rig's database)
+	// Check wisps table if target is an active wisp (bd-w2w)
+	// Fetch issue_type for cross-type blocking check below.
+	var targetType string
+	if !strings.HasPrefix(dep.DependsOnID, "external:") && !isCrossPrefix {
+		targetTable := "issues"
+		if targetIsWisp {
+			targetTable = "wisps"
+		}
+		//nolint:gosec // G201: targetTable is hardcoded to "issues" or "wisps"
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT issue_type FROM %s WHERE id = ?`, targetTable), dep.DependsOnID).Scan(&targetType); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("issue %s not found", dep.DependsOnID)
+			}
+			return fmt.Errorf("failed to check target issue existence: %w", err)
+		}
+	}
+
+	// Cross-type blocking validation: tasks can only block tasks, epics can only
+	// block epics. Prevents nonsensical task<->epic blocking that causes deadlocks
+	// in ready work computation (GH#1495).
+	if dep.Type == types.DepBlocks && targetType != "" {
+		sourceIsEpic := sourceType == string(types.TypeEpic)
+		targetIsEpic := targetType == string(types.TypeEpic)
+		if sourceIsEpic != targetIsEpic {
+			if sourceIsEpic {
+				return fmt.Errorf("epics can only block other epics, not tasks")
+			}
+			return fmt.Errorf("tasks can only block other tasks, not epics")
+		}
+	}
+
+	// Cycle detection for blocking dependency types: check if adding this edge
+	// would create a cycle by seeing if depends_on_id can already reach issue_id.
+	// UNIONs both dependencies and wisp_dependencies to detect cross-table cycles
+	// (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)
+	if dep.Type == types.DepBlocks {
+		var reachable int
+		if err := tx.QueryRowContext(ctx, `
+			WITH RECURSIVE reachable AS (
+				SELECT ? AS node, 0 AS depth
+				UNION ALL
+				SELECT d.depends_on_id, r.depth + 1
+				FROM reachable r
+				JOIN (
+					SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'
+					UNION ALL
+					SELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'
+				) d ON d.issue_id = r.node
+				WHERE r.depth < 100
+			)
+			SELECT COUNT(*) FROM reachable WHERE node = ?
+		`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
+			return fmt.Errorf("failed to check for dependency cycle: %w", err)
+		}
+		if reachable > 0 {
+			return fmt.Errorf("adding dependency would create a cycle")
+		}
+	}
+
+	// Check for existing dependency between the same pair with a different type.
+	// Previously this was an upsert (ON DUPLICATE KEY UPDATE type = VALUES(type))
+	// which silently changed e.g. "blocks" to "caused-by", removing the blocking
+	// relationship without warning.
+	var existingType string
+	err = tx.QueryRowContext(ctx, `
+		SELECT type FROM dependencies WHERE issue_id = ? AND depends_on_id = ?
+	`, dep.IssueID, dep.DependsOnID).Scan(&existingType)
+	if err == nil {
+		// Row exists
+		if existingType == string(dep.Type) {
+			// Same type — idempotent; update metadata in case it changed
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE dependencies SET metadata = ? WHERE issue_id = ? AND depends_on_id = ?
+			`, metadata, dep.IssueID, dep.DependsOnID); err != nil {
+				return fmt.Errorf("failed to update dependency metadata: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("sql commit: %w", err)
+			}
+			// Record in Dolt version history (bd-2avi)
+			if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+				"dependency: update metadata "+dep.IssueID+" -> "+dep.DependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+				return fmt.Errorf("dolt commit: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
+			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check existing dependency: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
 		VALUES (?, ?, ?, NOW(), ?, ?, ?)
-		ON DUPLICATE KEY UPDATE type = VALUES(type), metadata = VALUES(metadata)
-	`, dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID)
-	if err != nil {
+	`, dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
 		return fmt.Errorf("failed to add dependency: %w", err)
+	}
+
+	s.invalidateBlockedIDsCache()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sql commit: %w", err)
+	}
+	// Record in Dolt version history (bd-2avi)
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		"dependency: add "+string(dep.Type)+" "+dep.IssueID+" -> "+dep.DependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
 	}
 	return nil
 }
 
-// RemoveDependency removes a dependency between two issues
+// RemoveDependency removes a dependency between two issues.
+// Uses an explicit transaction so writes persist when @@autocommit is OFF.
 func (s *DoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?
-	`, issueID, dependsOnID)
+	// Route to wisp_dependencies if the issue is an active wisp
+	if s.isActiveWisp(ctx, issueID) {
+		return s.removeWispDependency(ctx, issueID, dependsOnID)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?
+	`, issueID, dependsOnID); err != nil {
 		return fmt.Errorf("failed to remove dependency: %w", err)
+	}
+
+	s.invalidateBlockedIDsCache()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sql commit: %w", err)
+	}
+	// Record in Dolt version history (bd-2avi)
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		"dependency: remove "+issueID+" -> "+dependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
 	}
 	return nil
 }
 
 // GetDependencies retrieves issues that this issue depends on
 func (s *DoltStore) GetDependencies(ctx context.Context, issueID string) ([]*types.Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	if s.isActiveWisp(ctx, issueID) {
+		return s.getWispDependencies(ctx, issueID)
+	}
+
+	rows, err := s.queryContext(ctx, `
 		SELECT i.id FROM issues i
 		JOIN dependencies d ON i.id = d.depends_on_id
 		WHERE d.issue_id = ?
@@ -59,7 +221,11 @@ func (s *DoltStore) GetDependencies(ctx context.Context, issueID string) ([]*typ
 
 // GetDependents retrieves issues that depend on this issue
 func (s *DoltStore) GetDependents(ctx context.Context, issueID string) ([]*types.Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	if s.isActiveWisp(ctx, issueID) {
+		return s.getWispDependents(ctx, issueID)
+	}
+
+	rows, err := s.queryContext(ctx, `
 		SELECT i.id FROM issues i
 		JOIN dependencies d ON i.id = d.issue_id
 		WHERE d.depends_on_id = ?
@@ -75,7 +241,11 @@ func (s *DoltStore) GetDependents(ctx context.Context, issueID string) ([]*types
 
 // GetDependenciesWithMetadata returns dependencies with metadata
 func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	if s.isActiveWisp(ctx, issueID) {
+		return s.getWispDependenciesWithMetadata(ctx, issueID)
+	}
+
+	rows, err := s.queryContext(ctx, `
 		SELECT d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id
 		FROM dependencies d
 		WHERE d.issue_id = ?
@@ -96,16 +266,16 @@ func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID str
 		var metadata, threadID sql.NullString
 
 		if err := rows.Scan(&depID, &depType, &createdAt, &createdBy, &metadata, &threadID); err != nil {
-			_ = rows.Close()
+			_ = rows.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("failed to scan dependency: %w", err)
 		}
 		deps = append(deps, depMeta{depID: depID, depType: depType})
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
+		_ = rows.Close() // Best effort cleanup on error path
+		return nil, wrapQueryError("get dependencies with metadata: rows", err)
 	}
-	_ = rows.Close()
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
 
 	if len(deps) == 0 {
 		return nil, nil
@@ -118,7 +288,7 @@ func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID str
 	}
 	issues, err := s.GetIssuesByIDs(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get dependencies with metadata: fetch issues: %w", err)
 	}
 	issueMap := make(map[string]*types.Issue, len(issues))
 	for _, iss := range issues {
@@ -141,7 +311,11 @@ func (s *DoltStore) GetDependenciesWithMetadata(ctx context.Context, issueID str
 
 // GetDependentsWithMetadata returns dependents with metadata
 func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	if s.isActiveWisp(ctx, issueID) {
+		return s.getWispDependentsWithMetadata(ctx, issueID)
+	}
+
+	rows, err := s.queryContext(ctx, `
 		SELECT d.issue_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id
 		FROM dependencies d
 		WHERE d.depends_on_id = ?
@@ -162,16 +336,16 @@ func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID strin
 		var metadata, threadID sql.NullString
 
 		if err := rows.Scan(&depID, &depType, &createdAt, &createdBy, &metadata, &threadID); err != nil {
-			_ = rows.Close()
+			_ = rows.Close() // Best effort cleanup on error path
 			return nil, fmt.Errorf("failed to scan dependent: %w", err)
 		}
 		deps = append(deps, depMeta{depID: depID, depType: depType})
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
+		_ = rows.Close() // Best effort cleanup on error path
+		return nil, wrapQueryError("get dependents with metadata: rows", err)
 	}
-	_ = rows.Close()
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
 
 	if len(deps) == 0 {
 		return nil, nil
@@ -184,7 +358,7 @@ func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID strin
 	}
 	issues, err := s.GetIssuesByIDs(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get dependents with metadata: fetch issues: %w", err)
 	}
 	issueMap := make(map[string]*types.Issue, len(issues))
 	for _, iss := range issues {
@@ -207,7 +381,11 @@ func (s *DoltStore) GetDependentsWithMetadata(ctx context.Context, issueID strin
 
 // GetDependencyRecords returns raw dependency records for an issue
 func (s *DoltStore) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	if s.isActiveWisp(ctx, issueID) {
+		return s.getWispDependencyRecords(ctx, issueID)
+	}
+
+	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM dependencies
 		WHERE issue_id = ?
@@ -222,7 +400,7 @@ func (s *DoltStore) GetDependencyRecords(ctx context.Context, issueID string) ([
 
 // GetAllDependencyRecords returns all dependency records
 func (s *DoltStore) GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM dependencies
 		ORDER BY issue_id
@@ -236,7 +414,7 @@ func (s *DoltStore) GetAllDependencyRecords(ctx context.Context) (map[string][]*
 	for rows.Next() {
 		dep, err := scanDependencyRow(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get all dependency records: %w", err)
 		}
 		result[dep.IssueID] = append(result[dep.IssueID], dep)
 	}
@@ -249,37 +427,221 @@ func (s *DoltStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs 
 		return make(map[string][]*types.Dependency), nil
 	}
 
-	placeholders := make([]string, len(issueIDs))
-	args := make([]interface{}, len(issueIDs))
-	for i, id := range issueIDs {
-		placeholders[i] = "?"
-		args[i] = id
+	// Partition and merge from wisps and issues tables
+	ephIDs, doltIDs := s.partitionByWispStatus(ctx, issueIDs)
+	if len(ephIDs) > 0 {
+		result := make(map[string][]*types.Dependency)
+		for _, id := range ephIDs {
+			deps, err := s.getWispDependencyRecords(ctx, id)
+			if err != nil {
+				return nil, fmt.Errorf("get dependency records: wisp %s: %w", id, err)
+			}
+			if len(deps) > 0 {
+				result[id] = deps
+			}
+		}
+		if len(doltIDs) > 0 {
+			doltResult, err := s.getDependencyRecordsForIssuesDolt(ctx, doltIDs)
+			if err != nil {
+				return nil, fmt.Errorf("get dependency records: dolt: %w", err)
+			}
+			for k, v := range doltResult {
+				result[k] = v
+			}
+		}
+		return result, nil
 	}
-	inClause := strings.Join(placeholders, ",")
 
-	// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
-	query := fmt.Sprintf(`
-		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
-		FROM dependencies
-		WHERE issue_id IN (%s)
-		ORDER BY issue_id
-	`, inClause)
+	return s.getDependencyRecordsForIssuesDolt(ctx, issueIDs)
+}
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dependency records for issues: %w", err)
-	}
-	defer rows.Close()
-
+func (s *DoltStore) getDependencyRecordsForIssuesDolt(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
 	result := make(map[string][]*types.Dependency)
-	for rows.Next() {
-		dep, err := scanDependencyRow(rows)
+
+	// Batch IN clauses to avoid Dolt query-planner spikes with large ID sets.
+	for start := 0; start < len(issueIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(issueIDs) {
+			end = len(issueIDs)
+		}
+		batch := issueIDs[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
+		query := fmt.Sprintf(`
+			SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+			FROM dependencies
+			WHERE issue_id IN (%s)
+			ORDER BY issue_id
+		`, inClause)
+
+		rows, err := s.queryContext(ctx, query, args...)
 		if err != nil {
+			return nil, fmt.Errorf("failed to get dependency records for issues: %w", err)
+		}
+
+		for rows.Next() {
+			dep, err := scanDependencyRow(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("get dependency records for issues: %w", err)
+			}
+			result[dep.IssueID] = append(result[dep.IssueID], dep)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-		result[dep.IssueID] = append(result[dep.IssueID], dep)
+		_ = rows.Close()
 	}
-	return result, rows.Err()
+
+	return result, nil
+}
+
+// GetBlockingInfoForIssues returns blocking dependency records relevant to a set of issue IDs.
+// It fetches both directions:
+//   - Dependencies where issue_id is in the set ("this issue is blocked by X")
+//   - Dependencies where depends_on_id is in the set ("this issue blocks Y")
+//
+// Parent-child dependencies are separated into parentMap (childID -> parentID) so callers
+// can display them distinctly from blocking deps. (bd-hcxu)
+//
+// This replaces the expensive pattern of GetAllDependencyRecords + getClosedBlockerIDs
+// which loaded the entire dependency table and did N+1 issue lookups. (bd-7di)
+func (s *DoltStore) GetBlockingInfoForIssues(ctx context.Context, issueIDs []string) (
+	blockedByMap map[string][]string, // issueID -> list of IDs blocking it
+	blocksMap map[string][]string, // issueID -> list of IDs it blocks
+	parentMap map[string]string, // childID -> parentID (parent-child deps)
+	err error,
+) {
+	blockedByMap = make(map[string][]string)
+	blocksMap = make(map[string][]string)
+	parentMap = make(map[string]string)
+
+	if len(issueIDs) == 0 {
+		return blockedByMap, blocksMap, parentMap, nil
+	}
+
+	// Partition and merge wisp and dolt IDs
+	ephIDs, doltIDs := s.partitionByWispStatus(ctx, issueIDs)
+	if len(ephIDs) > 0 {
+		// For wisp IDs, query wisp_dependencies
+		for _, ephID := range ephIDs {
+			deps, depErr := s.getWispDependencyRecords(ctx, ephID)
+			if depErr != nil {
+				return nil, nil, nil, depErr
+			}
+			for _, dep := range deps {
+				if dep.Type == types.DepParentChild {
+					parentMap[ephID] = dep.DependsOnID
+				} else if dep.Type == types.DepBlocks {
+					blockedByMap[ephID] = append(blockedByMap[ephID], dep.DependsOnID)
+				}
+			}
+		}
+		if len(doltIDs) == 0 {
+			return blockedByMap, blocksMap, parentMap, nil
+		}
+		issueIDs = doltIDs
+	}
+
+	// Batch IN clauses to avoid Dolt query-planner spikes with large ID sets.
+	for start := 0; start < len(issueIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(issueIDs) {
+			end = len(issueIDs)
+		}
+		batch := issueIDs[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		// Query 1: Get "blocked by" relationships — deps where issue_id is in our set
+		// and the dependency type affects ready work (blocks, parent-child).
+		// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
+		blockedByQuery := fmt.Sprintf(`
+			SELECT d.issue_id, d.depends_on_id, d.type, COALESCE(i.status, '') AS blocker_status
+			FROM dependencies d
+			LEFT JOIN issues i ON i.id = d.depends_on_id
+			WHERE d.issue_id IN (%s) AND d.type IN ('blocks', 'parent-child')
+		`, inClause)
+
+		rows, qErr := s.queryContext(ctx, blockedByQuery, args...)
+		if qErr != nil {
+			return nil, nil, nil, fmt.Errorf("failed to get blocked-by info: %w", qErr)
+		}
+		for rows.Next() {
+			var issueID, blockerID, depType, blockerStatus string
+			if scanErr := rows.Scan(&issueID, &blockerID, &depType, &blockerStatus); scanErr != nil {
+				_ = rows.Close()
+				return nil, nil, nil, wrapScanError("get blocking info: scan blocked-by", scanErr)
+			}
+			// Skip closed blockers — the dependency record is preserved, but a
+			// closed blocker no longer blocks work.
+			if types.Status(blockerStatus) == types.StatusClosed {
+				continue
+			}
+			// Separate parent-child from blocking deps (bd-hcxu)
+			if depType == "parent-child" {
+				parentMap[issueID] = blockerID
+			} else {
+				blockedByMap[issueID] = append(blockedByMap[issueID], blockerID)
+			}
+		}
+		_ = rows.Close()
+		if rowErr := rows.Err(); rowErr != nil {
+			return nil, nil, nil, wrapQueryError("get blocking info: blocked-by rows", rowErr)
+		}
+
+		// Query 2: Get "blocks" relationships — deps where depends_on_id is in our set
+		// (shows what the displayed issues block).
+		// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
+		blocksQuery := fmt.Sprintf(`
+			SELECT d.depends_on_id, d.issue_id, d.type, COALESCE(i.status, '') AS blocker_status
+			FROM dependencies d
+			LEFT JOIN issues i ON i.id = d.depends_on_id
+			WHERE d.depends_on_id IN (%s) AND d.type IN ('blocks', 'parent-child')
+		`, inClause)
+
+		rows2, qErr2 := s.queryContext(ctx, blocksQuery, args...)
+		if qErr2 != nil {
+			return nil, nil, nil, fmt.Errorf("failed to get blocks info: %w", qErr2)
+		}
+		for rows2.Next() {
+			var blockerID, blockedID, depType, blockerStatus string
+			if scanErr := rows2.Scan(&blockerID, &blockedID, &depType, &blockerStatus); scanErr != nil {
+				_ = rows2.Close()
+				return nil, nil, nil, wrapScanError("get blocking info: scan blocks", scanErr)
+			}
+			// Skip if the blocker (our displayed issue) is closed
+			if types.Status(blockerStatus) == types.StatusClosed {
+				continue
+			}
+			// Skip parent-child in "blocks" map (those are structural, not blocking)
+			if depType == "parent-child" {
+				continue
+			}
+			blocksMap[blockerID] = append(blocksMap[blockerID], blockedID)
+		}
+		_ = rows2.Close()
+		if rowErr2 := rows2.Err(); rowErr2 != nil {
+			return nil, nil, nil, wrapQueryError("get blocking info: blocks rows", rowErr2)
+		}
+	}
+
+	return blockedByMap, blocksMap, parentMap, nil
 }
 
 // GetDependencyCounts returns dependency counts for multiple issues
@@ -288,69 +650,80 @@ func (s *DoltStore) GetDependencyCounts(ctx context.Context, issueIDs []string) 
 		return make(map[string]*types.DependencyCounts), nil
 	}
 
-	placeholders := make([]string, len(issueIDs))
-	args := make([]interface{}, len(issueIDs))
-	for i, id := range issueIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	inClause := strings.Join(placeholders, ",")
-
-	// Query for dependencies (blockers)
-	// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
-	depQuery := fmt.Sprintf(`
-		SELECT issue_id, COUNT(*) as cnt
-		FROM dependencies
-		WHERE issue_id IN (%s) AND type = 'blocks'
-		GROUP BY issue_id
-	`, inClause)
-
-	depRows, err := s.db.QueryContext(ctx, depQuery, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dependency counts: %w", err)
-	}
-	defer depRows.Close()
-
 	result := make(map[string]*types.DependencyCounts)
 	for _, id := range issueIDs {
 		result[id] = &types.DependencyCounts{}
 	}
 
-	for depRows.Next() {
-		var id string
-		var cnt int
-		if err := depRows.Scan(&id, &cnt); err != nil {
-			return nil, fmt.Errorf("failed to scan dep count: %w", err)
+	// Batch IN clauses to avoid Dolt query-planner spikes with large ID sets.
+	for start := 0; start < len(issueIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(issueIDs) {
+			end = len(issueIDs)
 		}
-		if c, ok := result[id]; ok {
-			c.DependencyCount = cnt
-		}
-	}
+		batch := issueIDs[start:end]
 
-	// Query for dependents (blocking)
-	// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
-	blockingQuery := fmt.Sprintf(`
-		SELECT depends_on_id, COUNT(*) as cnt
-		FROM dependencies
-		WHERE depends_on_id IN (%s) AND type = 'blocks'
-		GROUP BY depends_on_id
-	`, inClause)
-
-	blockingRows, err := s.db.QueryContext(ctx, blockingQuery, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get blocking counts: %w", err)
-	}
-	defer blockingRows.Close()
-
-	for blockingRows.Next() {
-		var id string
-		var cnt int
-		if err := blockingRows.Scan(&id, &cnt); err != nil {
-			return nil, fmt.Errorf("failed to scan blocking count: %w", err)
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
 		}
-		if c, ok := result[id]; ok {
-			c.DependentCount = cnt
+		inClause := strings.Join(placeholders, ",")
+
+		// Query for dependencies (blockers)
+		// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
+		depQuery := fmt.Sprintf(`
+			SELECT issue_id, COUNT(*) as cnt
+			FROM dependencies
+			WHERE issue_id IN (%s) AND type = 'blocks'
+			GROUP BY issue_id
+		`, inClause)
+
+		depRows, err := s.queryContext(ctx, depQuery, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get dependency counts: %w", err)
 		}
+
+		for depRows.Next() {
+			var id string
+			var cnt int
+			if err := depRows.Scan(&id, &cnt); err != nil {
+				_ = depRows.Close()
+				return nil, fmt.Errorf("failed to scan dep count: %w", err)
+			}
+			if c, ok := result[id]; ok {
+				c.DependencyCount = cnt
+			}
+		}
+		_ = depRows.Close()
+
+		// Query for dependents (blocking)
+		// nolint:gosec // G201: inClause contains only ? placeholders, actual values passed via args
+		blockingQuery := fmt.Sprintf(`
+			SELECT depends_on_id, COUNT(*) as cnt
+			FROM dependencies
+			WHERE depends_on_id IN (%s) AND type = 'blocks'
+			GROUP BY depends_on_id
+		`, inClause)
+
+		blockingRows, err := s.queryContext(ctx, blockingQuery, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get blocking counts: %w", err)
+		}
+
+		for blockingRows.Next() {
+			var id string
+			var cnt int
+			if err := blockingRows.Scan(&id, &cnt); err != nil {
+				_ = blockingRows.Close()
+				return nil, fmt.Errorf("failed to scan blocking count: %w", err)
+			}
+			if c, ok := result[id]; ok {
+				c.DependentCount = cnt
+			}
+		}
+		_ = blockingRows.Close()
 	}
 
 	return result, nil
@@ -358,53 +731,45 @@ func (s *DoltStore) GetDependencyCounts(ctx context.Context, issueIDs []string) 
 
 // GetDependencyTree returns a dependency tree for visualization
 func (s *DoltStore) GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error) {
+
 	// Simple implementation - can be optimized with CTE
 	visited := make(map[string]bool)
-	return s.buildDependencyTree(ctx, issueID, 0, maxDepth, reverse, visited)
+	return s.buildDependencyTree(ctx, issueID, 0, maxDepth, reverse, visited, "")
 }
 
-func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, depth, maxDepth int, reverse bool, visited map[string]bool) ([]*types.TreeNode, error) {
+func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, depth, maxDepth int, reverse bool, visited map[string]bool, parentID string) ([]*types.TreeNode, error) {
 	if depth >= maxDepth || visited[issueID] {
 		return nil, nil
 	}
 	visited[issueID] = true
 
 	issue, err := s.GetIssue(ctx, issueID)
-	if err != nil || issue == nil {
-		return nil, err
-	}
-
-	var childIDs []string
-	var query string
-	if reverse {
-		query = "SELECT issue_id FROM dependencies WHERE depends_on_id = ?"
-	} else {
-		query = "SELECT depends_on_id FROM dependencies WHERE issue_id = ?"
-	}
-
-	rows, err := s.db.QueryContext(ctx, query, issueID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		childIDs = append(childIDs, id)
+	// Use GetDependencies/GetDependents which handle wisp routing,
+	// instead of querying the dependencies table directly (GH#2145).
+	var related []*types.Issue
+	if reverse {
+		related, err = s.GetDependents(ctx, issueID)
+	} else {
+		related, err = s.GetDependencies(ctx, issueID)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	node := &types.TreeNode{
-		Issue: *issue,
-		Depth: depth,
+		Issue:    *issue,
+		Depth:    depth,
+		ParentID: parentID,
 	}
 
 	// TreeNode doesn't have Children field - return flat list
 	nodes := []*types.TreeNode{node}
-	for _, childID := range childIDs {
-		children, err := s.buildDependencyTree(ctx, childID, depth+1, maxDepth, reverse, visited)
+	for _, rel := range related {
+		children, err := s.buildDependencyTree(ctx, rel.ID, depth+1, maxDepth, reverse, visited, issueID)
 		if err != nil {
 			return nil, err
 		}
@@ -414,17 +779,32 @@ func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, dep
 	return nodes, nil
 }
 
-// DetectCycles finds circular dependencies
+// DetectCycles finds circular dependencies.
+// Queries both dependencies and wisp_dependencies tables to detect cross-table
+// cycles (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)
 func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) {
-	// Get all dependencies
+	// Get all permanent dependencies
 	deps, err := s.GetAllDependencyRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build adjacency list
+	// Get all wisp dependencies
+	wispDeps, err := s.getAllWispDependencyRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build adjacency list from both tables
 	graph := make(map[string][]string)
 	for issueID, records := range deps {
+		for _, dep := range records {
+			if dep.Type == types.DepBlocks {
+				graph[issueID] = append(graph[issueID], dep.DependsOnID)
+			}
+		}
+	}
+	for issueID, records := range wispDeps {
 		for _, dep := range records {
 			if dep.Type == types.DepBlocks {
 				graph[issueID] = append(graph[issueID], dep.DependsOnID)
@@ -462,7 +842,7 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) 
 					cyclePath := path[cycleStart:]
 					var cycleIssues []*types.Issue
 					for _, id := range cyclePath {
-						issue, _ := s.GetIssue(ctx, id)
+						issue, _ := s.GetIssue(ctx, id) // Best effort: nil issue handled by caller
 						if issue != nil {
 							cycleIssues = append(cycleIssues, issue)
 						}
@@ -488,58 +868,153 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) 
 	return cycles, nil
 }
 
-// IsBlocked checks if an issue has open blockers
+// IsBlocked checks if an issue has open blockers.
+// Uses computeBlockedIDs for authoritative blocked status, consistent with
+// GetReadyWork. This covers all blocking dependency types (blocks, waits-for)
+// with full gate evaluation semantics. (GH#1524)
 func (s *DoltStore) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.depends_on_id
+	// Use computeBlockedIDs as the single source of truth for blocked status.
+	// This ensures the close guard is consistent with ready work calculation.
+	_, err := s.computeBlockedIDs(ctx, true)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to compute blocked IDs: %w", err)
+	}
+
+	s.cacheMu.Lock()
+	isBlocked := s.blockedIDsCacheMap[issueID]
+	s.cacheMu.Unlock()
+
+	if !isBlocked {
+		return false, nil, nil
+	}
+
+	// Issue is blocked — gather blocker IDs for display.
+	// Query all blocking dependency types to stay consistent with
+	// computeBlockedIDs which considers blocks, waits-for, and
+	// conditional-blocks (GH-1524).
+	rows, err := s.queryContext(ctx, `
+		SELECT d.depends_on_id, d.type
 		FROM dependencies d
 		JOIN issues i ON d.depends_on_id = i.id
 		WHERE d.issue_id = ?
-		  AND d.type = 'blocks'
-		  AND i.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+		  AND d.type IN ('blocks', 'waits-for', 'conditional-blocks')
+		  AND i.status NOT IN ('closed', 'pinned')
 	`, issueID)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to check blockers: %w", err)
 	}
-	defer rows.Close()
 
 	var blockers []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return false, nil, err
+		var id, depType string
+		if err := rows.Scan(&id, &depType); err != nil {
+			_ = rows.Close()
+			return false, nil, wrapScanError("is blocked: scan blocker", err)
 		}
-		blockers = append(blockers, id)
+		if depType != "blocks" {
+			blockers = append(blockers, id+" ("+depType+")")
+		} else {
+			blockers = append(blockers, id)
+		}
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, nil, wrapQueryError("is blocked: blocker rows", err)
 	}
 
-	return len(blockers) > 0, blockers, rows.Err()
+	return true, blockers, nil
 }
 
-// GetNewlyUnblockedByClose finds issues that become unblocked when an issue is closed
+// GetNewlyUnblockedByClose finds issues that become unblocked when an issue is closed.
+//
+// Rewritten from a single query with nested JOIN + correlated NOT EXISTS to two
+// sequential queries to avoid Dolt query-planner issues with nested JOIN subqueries.
+// See bd-o23 / hq-g4nxe for the SQL audit that identified this pattern.
 func (s *DoltStore) GetNewlyUnblockedByClose(ctx context.Context, closedIssueID string) ([]*types.Issue, error) {
-	// Find issues that were blocked only by the closed issue
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT d.issue_id
+	// Step 1: Find open/blocked issues that depend on the closed issue.
+	candidateRows, err := s.queryContext(ctx, `
+		SELECT d.issue_id
 		FROM dependencies d
 		JOIN issues i ON d.issue_id = i.id
 		WHERE d.depends_on_id = ?
 		  AND d.type = 'blocks'
-		  AND i.status IN ('open', 'blocked')
-		  AND NOT EXISTS (
-			SELECT 1 FROM dependencies d2
+		  AND i.status NOT IN ('closed', 'pinned')
+	`, closedIssueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find blocked candidates: %w", err)
+	}
+
+	var candidateIDs []string
+	for candidateRows.Next() {
+		var id string
+		if err := candidateRows.Scan(&id); err != nil {
+			_ = candidateRows.Close()
+			return nil, fmt.Errorf("failed to scan candidate: %w", err)
+		}
+		candidateIDs = append(candidateIDs, id)
+	}
+	_ = candidateRows.Close()
+	if err := candidateRows.Err(); err != nil {
+		return nil, wrapQueryError("get newly unblocked: candidate rows", err)
+	}
+
+	if len(candidateIDs) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: Among candidates, find those that still have OTHER open blockers.
+	// Uses batched IN clauses (queryBatchSize) to avoid full table scans on Dolt.
+	stillBlocked := make(map[string]bool)
+	for start := 0; start < len(candidateIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(candidateIDs) {
+			end = len(candidateIDs)
+		}
+		batch := candidateIDs[start:end]
+		placeholders, args := doltBuildSQLInClause(batch)
+		// Append the closedIssueID to exclude it from "other blockers"
+		args = append(args, closedIssueID)
+
+		// nolint:gosec // G201: placeholders contains only ? markers, actual values passed via args
+		stillBlockedQuery := fmt.Sprintf(`
+			SELECT DISTINCT d2.issue_id
+			FROM dependencies d2
 			JOIN issues blocker ON d2.depends_on_id = blocker.id
-			WHERE d2.issue_id = d.issue_id
+			WHERE d2.issue_id IN (%s)
 			  AND d2.type = 'blocks'
 			  AND d2.depends_on_id != ?
-			  AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
-		  )
-	`, closedIssueID, closedIssueID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find newly unblocked: %w", err)
-	}
-	defer rows.Close()
+			  AND blocker.status NOT IN ('closed', 'pinned')
+		`, placeholders)
 
-	return s.scanIssueIDs(ctx, rows)
+		blockedRows, err := s.queryContext(ctx, stillBlockedQuery, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check remaining blockers: %w", err)
+		}
+
+		for blockedRows.Next() {
+			var id string
+			if err := blockedRows.Scan(&id); err != nil {
+				_ = blockedRows.Close()
+				return nil, fmt.Errorf("failed to scan still-blocked: %w", err)
+			}
+			stillBlocked[id] = true
+		}
+		_ = blockedRows.Close()
+	}
+
+	// Filter to only candidates with no remaining open blockers
+	var unblockedIDs []string
+	for _, id := range candidateIDs {
+		if !stillBlocked[id] {
+			unblockedIDs = append(unblockedIDs, id)
+		}
+	}
+
+	if len(unblockedIDs) == 0 {
+		return nil, nil
+	}
+
+	return s.GetIssuesByIDs(ctx, unblockedIDs)
 }
 
 // Helper functions
@@ -555,15 +1030,41 @@ func (s *DoltStore) scanIssueIDs(ctx context.Context, rows *sql.Rows) ([]*types.
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, wrapQueryError("scan issue IDs: rows", err)
 	}
+
+	// Close rows before the nested GetIssuesByIDs query.
+	// MySQL server mode (go-sql-driver/mysql) can't handle multiple active
+	// result sets on one connection - the first must be closed before starting
+	// a new query, otherwise "driver: bad connection" errors occur.
+	// Closing here is safe because sql.Rows.Close() is idempotent.
+	_ = rows.Close() // Redundant close for safety (rows already iterated)
 
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
 	// Fetch all issues in a single batch query
-	return s.GetIssuesByIDs(ctx, ids)
+	issues, err := s.GetIssuesByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("scan issue IDs: batch fetch: %w", err)
+	}
+
+	// Restore the caller's ORDER BY: GetIssuesByIDs uses WHERE id IN (...)
+	// which returns rows in arbitrary order, losing the sort from the original
+	// query (e.g., ORDER BY priority ASC, created_at DESC). Build an index
+	// and reorder to match the original id slice. (GH#1880)
+	issueByID := make(map[string]*types.Issue, len(issues))
+	for _, issue := range issues {
+		issueByID[issue.ID] = issue
+	}
+	ordered := make([]*types.Issue, 0, len(ids))
+	for _, id := range ids {
+		if issue, ok := issueByID[id]; ok {
+			ordered = append(ordered, issue)
+		}
+	}
+	return ordered, nil
 }
 
 // GetIssuesByIDs retrieves multiple issues by ID in a single query to avoid N+1 performance issues
@@ -572,214 +1073,74 @@ func (s *DoltStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.
 		return nil, nil
 	}
 
-	// Build IN clause
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-
-	// nolint:gosec // G201: placeholders contains only ? markers, actual values passed via args
-	query := fmt.Sprintf(`
-		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, owner, updated_at, closed_at, external_ref,
-		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template, crystallizes,
-		       await_type, await_id, timeout_ns, waiters,
-		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
-		       event_kind, actor, target, payload,
-		       due_at, defer_until,
-		       quality_score, work_type, source_system
-		FROM issues
-		WHERE id IN (%s)
-	`, strings.Join(placeholders, ","))
-
-	queryRows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get issues by IDs: %w", err)
-	}
-	defer queryRows.Close()
-
-	var issues []*types.Issue
-	for queryRows.Next() {
-		issue, err := scanIssueRow(queryRows)
+	// Partition IDs between wisps and issues tables
+	ephIDs, doltIDs := s.partitionByWispStatus(ctx, ids)
+	if len(ephIDs) > 0 {
+		var allIssues []*types.Issue
+		wispIssues, err := s.getWispsByIDs(ctx, ephIDs)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get wisp issues: %w", err)
 		}
-		issues = append(issues, issue)
+		allIssues = append(allIssues, wispIssues...)
+		if len(doltIDs) > 0 {
+			doltIssues, err := s.getIssuesByIDsDolt(ctx, doltIDs)
+			if err != nil {
+				return nil, fmt.Errorf("get issues by IDs: dolt: %w", err)
+			}
+			allIssues = append(allIssues, doltIssues...)
+		}
+		return allIssues, nil
 	}
 
-	return issues, queryRows.Err()
+	return s.getIssuesByIDsDolt(ctx, ids)
 }
 
-// scanIssueRow scans a single issue from a rows result
-func scanIssueRow(rows *sql.Rows) (*types.Issue, error) {
-	var issue types.Issue
-	var createdAtStr, updatedAtStr sql.NullString // TEXT columns - must parse manually
-	var closedAt, compactedAt, deletedAt, lastActivity, dueAt, deferUntil sql.NullTime
-	var estimatedMinutes, originalSize, timeoutNs sql.NullInt64
-	var assignee, externalRef, compactedAtCommit, owner sql.NullString
-	var contentHash, sourceRepo, closeReason, deletedBy, deleteReason, originalType sql.NullString
-	var workType, sourceSystem sql.NullString
-	var sender, molType, eventKind, actor, target, payload sql.NullString
-	var awaitType, awaitID, waiters sql.NullString
-	var hookBead, roleBead, agentState, roleType, rig sql.NullString
-	var ephemeral, pinned, isTemplate, crystallizes sql.NullInt64
-	var qualityScore sql.NullFloat64
+func (s *DoltStore) getIssuesByIDsDolt(ctx context.Context, ids []string) ([]*types.Issue, error) {
+	var issues []*types.Issue
 
-	if err := rows.Scan(
-		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
-		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
-		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt, &externalRef,
-		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
-		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &ephemeral, &pinned, &isTemplate, &crystallizes,
-		&awaitType, &awaitID, &timeoutNs, &waiters,
-		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
-		&eventKind, &actor, &target, &payload,
-		&dueAt, &deferUntil,
-		&qualityScore, &workType, &sourceSystem,
-	); err != nil {
-		return nil, fmt.Errorf("failed to scan issue row: %w", err)
-	}
+	// Batch IN clauses to avoid Dolt query-planner spikes with large ID sets.
+	for start := 0; start < len(ids); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
 
-	// Parse timestamp strings (TEXT columns require manual parsing)
-	if createdAtStr.Valid {
-		issue.CreatedAt = parseTimeString(createdAtStr.String)
-	}
-	if updatedAtStr.Valid {
-		issue.UpdatedAt = parseTimeString(updatedAtStr.String)
-	}
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
 
-	// Map nullable fields
-	if contentHash.Valid {
-		issue.ContentHash = contentHash.String
-	}
-	if closedAt.Valid {
-		issue.ClosedAt = &closedAt.Time
-	}
-	if estimatedMinutes.Valid {
-		mins := int(estimatedMinutes.Int64)
-		issue.EstimatedMinutes = &mins
-	}
-	if assignee.Valid {
-		issue.Assignee = assignee.String
-	}
-	if owner.Valid {
-		issue.Owner = owner.String
-	}
-	if externalRef.Valid {
-		issue.ExternalRef = &externalRef.String
-	}
-	if compactedAt.Valid {
-		issue.CompactedAt = &compactedAt.Time
-	}
-	if compactedAtCommit.Valid {
-		issue.CompactedAtCommit = &compactedAtCommit.String
-	}
-	if originalSize.Valid {
-		issue.OriginalSize = int(originalSize.Int64)
-	}
-	if sourceRepo.Valid {
-		issue.SourceRepo = sourceRepo.String
-	}
-	if closeReason.Valid {
-		issue.CloseReason = closeReason.String
-	}
-	if deletedAt.Valid {
-		issue.DeletedAt = &deletedAt.Time
-	}
-	if deletedBy.Valid {
-		issue.DeletedBy = deletedBy.String
-	}
-	if deleteReason.Valid {
-		issue.DeleteReason = deleteReason.String
-	}
-	if originalType.Valid {
-		issue.OriginalType = originalType.String
-	}
-	if sender.Valid {
-		issue.Sender = sender.String
-	}
-	if ephemeral.Valid && ephemeral.Int64 != 0 {
-		issue.Ephemeral = true
-	}
-	if pinned.Valid && pinned.Int64 != 0 {
-		issue.Pinned = true
-	}
-	if isTemplate.Valid && isTemplate.Int64 != 0 {
-		issue.IsTemplate = true
-	}
-	if crystallizes.Valid && crystallizes.Int64 != 0 {
-		issue.Crystallizes = true
-	}
-	if awaitType.Valid {
-		issue.AwaitType = awaitType.String
-	}
-	if awaitID.Valid {
-		issue.AwaitID = awaitID.String
-	}
-	if timeoutNs.Valid {
-		issue.Timeout = time.Duration(timeoutNs.Int64)
-	}
-	if waiters.Valid && waiters.String != "" {
-		issue.Waiters = parseJSONStringArray(waiters.String)
-	}
-	if hookBead.Valid {
-		issue.HookBead = hookBead.String
-	}
-	if roleBead.Valid {
-		issue.RoleBead = roleBead.String
-	}
-	if agentState.Valid {
-		issue.AgentState = types.AgentState(agentState.String)
-	}
-	if lastActivity.Valid {
-		issue.LastActivity = &lastActivity.Time
-	}
-	if roleType.Valid {
-		issue.RoleType = roleType.String
-	}
-	if rig.Valid {
-		issue.Rig = rig.String
-	}
-	if molType.Valid {
-		issue.MolType = types.MolType(molType.String)
-	}
-	if eventKind.Valid {
-		issue.EventKind = eventKind.String
-	}
-	if actor.Valid {
-		issue.Actor = actor.String
-	}
-	if target.Valid {
-		issue.Target = target.String
-	}
-	if payload.Valid {
-		issue.Payload = payload.String
-	}
-	if dueAt.Valid {
-		issue.DueAt = &dueAt.Time
-	}
-	if deferUntil.Valid {
-		issue.DeferUntil = &deferUntil.Time
-	}
-	if qualityScore.Valid {
-		qs := float32(qualityScore.Float64)
-		issue.QualityScore = &qs
-	}
-	if workType.Valid {
-		issue.WorkType = types.WorkType(workType.String)
-	}
-	if sourceSystem.Valid {
-		issue.SourceSystem = sourceSystem.String
+		// nolint:gosec // G201: placeholders contains only ? markers, actual values passed via args
+		query := fmt.Sprintf(`
+			SELECT `+issueSelectColumns+`
+			FROM issues
+			WHERE id IN (%s)
+		`, strings.Join(placeholders, ","))
+
+		queryRows, err := s.queryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get issues by IDs: %w", err)
+		}
+
+		for queryRows.Next() {
+			issue, err := scanIssueFrom(queryRows)
+			if err != nil {
+				_ = queryRows.Close()
+				return nil, wrapScanError("get issues by IDs: scan issue", err)
+			}
+			issues = append(issues, issue)
+		}
+		if err := queryRows.Err(); err != nil {
+			_ = queryRows.Close()
+			return nil, err
+		}
+		_ = queryRows.Close()
 	}
 
-	return &issue, nil
+	return issues, nil
 }
 
 func scanDependencyRows(rows *sql.Rows) ([]*types.Dependency, error) {
@@ -787,7 +1148,7 @@ func scanDependencyRows(rows *sql.Rows) ([]*types.Dependency, error) {
 	for rows.Next() {
 		dep, err := scanDependencyRow(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan dependency rows: %w", err)
 		}
 		deps = append(deps, dep)
 	}
@@ -805,6 +1166,9 @@ func scanDependencyRow(rows *sql.Rows) (*types.Dependency, error) {
 
 	if createdAt.Valid {
 		dep.CreatedAt = createdAt.Time
+	}
+	if metadata.Valid {
+		dep.Metadata = metadata.String
 	}
 	if threadID.Valid {
 		dep.ThreadID = threadID.String

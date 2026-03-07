@@ -1,14 +1,15 @@
 package main
+
 import (
-	"encoding/json"
 	"fmt"
 	"os"
+
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
+
 var reopenCmd = &cobra.Command{
 	Use:     "reopen [id...]",
 	GroupID: "issues",
@@ -21,78 +22,16 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 		reason, _ := cmd.Flags().GetString("reason")
 		// Use global jsonOutput set by PersistentPreRun
 		ctx := rootCtx
-		// Resolve partial IDs first
-		var resolvedIDs []string
-		if daemonClient != nil {
-			for _, id := range args {
-				resolveArgs := &rpc.ResolveIDArgs{ID: id}
-				resp, err := daemonClient.ResolveID(resolveArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error resolving ID %s: %v\n", id, err)
-					os.Exit(1)
-				}
-				var resolvedID string
-				if err := json.Unmarshal(resp.Data, &resolvedID); err != nil {
-					fmt.Fprintf(os.Stderr, "Error unmarshaling resolved ID: %v\n", err)
-					os.Exit(1)
-				}
-				resolvedIDs = append(resolvedIDs, resolvedID)
-			}
-		} else {
-			var err error
-			resolvedIDs, err = utils.ResolvePartialIDs(ctx, store, args)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		// Resolve partial IDs
+		_, err := utils.ResolvePartialIDs(ctx, store, args)
+		if err != nil {
+			FatalError("%v", err)
 		}
 		reopenedIssues := []*types.Issue{}
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			for _, id := range resolvedIDs {
-				openStatus := string(types.StatusOpen)
-				updateArgs := &rpc.UpdateArgs{
-					ID:     id,
-					Status: &openStatus,
-				}
-				resp, err := daemonClient.Update(updateArgs)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error reopening %s: %v\n", id, err)
-					continue
-				}
-				// Add reason as a comment if provided
-				if reason != "" {
-					commentArgs := &rpc.CommentAddArgs{
-						ID:     id,
-						Author: actor,
-						Text:   reason,
-					}
-					if _, err := daemonClient.AddComment(commentArgs); err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: failed to add comment to %s: %v\n", id, err)
-					}
-				}
-				if jsonOutput {
-					var issue types.Issue
-					if err := json.Unmarshal(resp.Data, &issue); err == nil {
-						reopenedIssues = append(reopenedIssues, &issue)
-					}
-				} else {
-					reasonMsg := ""
-					if reason != "" {
-						reasonMsg = ": " + reason
-					}
-					fmt.Printf("%s Reopened %s%s\n", ui.RenderAccent("↻"), id, reasonMsg)
-				}
-			}
-			if jsonOutput && len(reopenedIssues) > 0 {
-				outputJSON(reopenedIssues)
-			}
-			return
-		}
-		// Fall back to direct storage access
+		// Direct storage access
 		if store == nil {
-			fmt.Fprintln(os.Stderr, "Error: database not initialized")
-			os.Exit(1)
+			FatalErrorWithHint("database not initialized",
+				"run 'bd init' to create a database")
 		}
 		for _, id := range args {
 			fullID, err := utils.ResolvePartialID(ctx, store, id)
@@ -100,9 +39,23 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
 				continue
 			}
-			// UpdateIssue automatically clears closed_at when status changes from closed
+			// Skip if already open — avoid false "Reopened" message
+			issue, err := store.GetIssue(ctx, fullID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting %s: %v\n", fullID, err)
+				continue
+			}
+			if issue.Status == types.StatusOpen {
+				fmt.Fprintf(os.Stderr, "%s is already open\n", fullID)
+				continue
+			}
+			// UpdateIssue automatically clears closed_at when status changes from closed.
+			// Also clear defer_until so the issue appears in bd ready immediately.
+			// Without this, a deferred issue that was closed and reopened stays
+			// hidden from bd ready despite being "open".
 			updates := map[string]interface{}{
-				"status": string(types.StatusOpen),
+				"status":      string(types.StatusOpen),
+				"defer_until": nil,
 			}
 			if err := store.UpdateIssue(ctx, fullID, updates, actor); err != nil {
 				fmt.Fprintf(os.Stderr, "Error reopening %s: %v\n", fullID, err)
@@ -127,15 +80,12 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 				fmt.Printf("%s Reopened %s%s\n", ui.RenderAccent("↻"), fullID, reasonMsg)
 			}
 		}
-		// Schedule auto-flush if any issues were reopened
-		if len(args) > 0 {
-			markDirtyAndScheduleFlush()
-		}
 		if jsonOutput && len(reopenedIssues) > 0 {
 			outputJSON(reopenedIssues)
 		}
 	},
 }
+
 func init() {
 	reopenCmd.Flags().StringP("reason", "r", "", "Reason for reopening")
 	reopenCmd.ValidArgsFunction = issueIDCompletion

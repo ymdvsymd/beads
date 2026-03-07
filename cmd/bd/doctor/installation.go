@@ -1,19 +1,17 @@
 package doctor
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
-	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
-	"github.com/steveyegge/beads/internal/syncbranch"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // CheckInstallation verifies that .beads directory exists
@@ -39,55 +37,6 @@ func CheckInstallation(path string) DoctorCheck {
 	}
 }
 
-// CheckMultipleDatabases checks for multiple database files in .beads directory
-func CheckMultipleDatabases(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-
-	// Find all .db files (excluding backups and vc.db)
-	files, err := filepath.Glob(filepath.Join(beadsDir, "*.db"))
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Database Files",
-			Status:  StatusError,
-			Message: "Unable to check for multiple databases",
-		}
-	}
-
-	// Filter out backups and vc.db
-	var dbFiles []string
-	for _, f := range files {
-		base := filepath.Base(f)
-		if !strings.HasSuffix(base, ".backup.db") && base != "vc.db" {
-			dbFiles = append(dbFiles, base)
-		}
-	}
-
-	if len(dbFiles) == 0 {
-		return DoctorCheck{
-			Name:    "Database Files",
-			Status:  StatusOK,
-			Message: "No database files (JSONL-only mode)",
-		}
-	}
-
-	if len(dbFiles) == 1 {
-		return DoctorCheck{
-			Name:    "Database Files",
-			Status:  StatusOK,
-			Message: "Single database file",
-		}
-	}
-
-	// Multiple databases found
-	return DoctorCheck{
-		Name:    "Database Files",
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("Multiple database files found: %s", strings.Join(dbFiles, ", ")),
-		Fix:     "Run 'bd migrate' to consolidate databases or manually remove old .db files",
-	}
-}
-
 // CheckPermissions verifies that .beads directory and database are readable/writable
 func CheckPermissions(path string) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
@@ -105,34 +54,32 @@ func CheckPermissions(path string) DoctorCheck {
 	}
 	_ = os.Remove(testFile) // Clean up test file (intentionally ignore error)
 
-	// Check database permissions
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	if _, err := os.Stat(dbPath); err == nil {
-		// Try to open database
-		db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
-		if err != nil {
-			return DoctorCheck{
-				Name:    "Permissions",
-				Status:  StatusError,
-				Message: "Database file exists but cannot be opened",
-				Fix:     "Run 'bd doctor --fix' to fix permissions",
+	// Check Dolt database directory permissions
+	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
+		doltPath := getDatabasePath(beadsDir)
+		if info, err := os.Stat(doltPath); err == nil {
+			if !info.IsDir() {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "dolt/ is not a directory",
+					Fix:     "Run 'bd doctor --fix' to fix permissions",
+				}
 			}
-		}
-		_ = db.Close() // Intentionally ignore close error
-
-		// Try a write test
-		db, err = sql.Open("sqlite", sqliteConnString(dbPath, true))
-		if err == nil {
-			_, err = db.Exec("SELECT 1")
-			_ = db.Close() // Intentionally ignore close error
+			// Try to open Dolt store read-only to verify accessibility
+			ctx := context.Background()
+			store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 			if err != nil {
 				return DoctorCheck{
 					Name:    "Permissions",
 					Status:  StatusError,
-					Message: "Database file is not readable",
+					Message: "Dolt database exists but cannot be opened",
+					Detail:  err.Error(),
 					Fix:     "Run 'bd doctor --fix' to fix permissions",
 				}
 			}
+			_ = store.Close()
 		}
 	}
 
@@ -144,9 +91,21 @@ func CheckPermissions(path string) DoctorCheck {
 }
 
 // CheckUntrackedBeadsFiles checks for untracked .beads/*.jsonl files that should be committed.
+// This check only applies to legacy (non-Dolt) backends where JSONL files are the data store.
 // In sync-branch mode, JSONL files are intentionally untracked in working branches
 // and only committed to the dedicated sync branch (GH#858).
 func CheckUntrackedBeadsFiles(path string) DoctorCheck {
+	backend, _ := getBackendAndBeadsDir(path)
+
+	// Dolt backends store data on the server, not in JSONL files
+	if backend == configfile.BackendDolt {
+		return DoctorCheck{
+			Name:    "Untracked Files",
+			Status:  StatusOK,
+			Message: "N/A (Dolt backend stores data on server)",
+		}
+	}
+
 	beadsDir := filepath.Join(path, ".beads")
 
 	// Skip if .beads doesn't exist
@@ -155,17 +114,6 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 			Name:    "Untracked Files",
 			Status:  StatusOK,
 			Message: "N/A (no .beads directory)",
-		}
-	}
-
-	// In sync-branch mode, JSONL files are intentionally untracked in working branches.
-	// They are committed only to the dedicated sync branch via bd sync.
-	if branch := syncbranch.GetFromYAML(); branch != "" {
-		return DoctorCheck{
-			Name:    "Untracked Files",
-			Status:  StatusOK,
-			Message: "N/A (sync-branch mode)",
-			Detail:  fmt.Sprintf("JSONL files tracked in '%s' branch only", branch),
 		}
 	}
 
@@ -229,9 +177,4 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 // FixPermissions fixes file permission issues in the .beads directory
 func FixPermissions(path string) error {
 	return fix.Permissions(path)
-}
-
-// FixUntrackedJSONL stages and commits untracked .beads/*.jsonl files
-func FixUntrackedJSONL(path string) error {
-	return fix.UntrackedJSONL(path)
 }

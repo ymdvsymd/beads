@@ -135,6 +135,19 @@ func GetGitHooksDir() (string, error) {
 	if out, err := cmd.Output(); err == nil {
 		hooksPath := strings.TrimSpace(string(out))
 		if hooksPath != "" {
+			// Expand tilde — git config may return ~/... which Go doesn't expand.
+			// Without this, Windows treats "~/.githooks" as a relative path and
+			// joins it to the repo root, creating a literal "~" directory. (GH#1796)
+			if strings.HasPrefix(hooksPath, "~/") || strings.HasPrefix(hooksPath, "~\\") {
+				if home, err := os.UserHomeDir(); err == nil {
+					hooksPath = filepath.Join(home, hooksPath[2:])
+				}
+			} else if hooksPath == "~" {
+				if home, err := os.UserHomeDir(); err == nil {
+					hooksPath = home
+				}
+			}
+
 			if filepath.IsAbs(hooksPath) {
 				return hooksPath, nil
 			}
@@ -144,6 +157,7 @@ func GetGitHooksDir() (string, error) {
 			if abs, err := filepath.Abs(p); err == nil {
 				return abs, nil
 			}
+
 			return p, nil
 		}
 	}
@@ -294,6 +308,11 @@ func IsColocatedJJGit() bool {
 
 // GetJujutsuRoot returns the root directory of the jujutsu repository.
 // Returns empty string and error if not in a jujutsu repository.
+//
+// Walking stops at a .git boundary: a git repo nested inside a JJ
+// workspace (e.g. a clean-room scratch repo under a JJ-tracked parent) must not
+// inherit the parent's JJ context.  Only the directory that contains .git itself
+// is checked for a co-located .jj; we never walk further up.
 func GetJujutsuRoot() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -307,10 +326,20 @@ func GetJujutsuRoot() (string, error) {
 			return dir, nil
 		}
 
+		// Stop at a git repo boundary. If .git exists here but no .jj was
+		// found at this level, this is a plain git repo (not JJ). Do not
+		// walk further up — the parent may have .jj but it belongs to a
+		// different (ancestor) repository.
+		gitPath := filepath.Join(dir, ".git")
+		if _, err := os.Stat(gitPath); err == nil {
+			break
+		}
+
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("not a jujutsu repository (no .jj directory found)")
+			break
 		}
 		dir = parent
 	}
+	return "", fmt.Errorf("not a jujutsu repository (no .jj directory found)")
 }

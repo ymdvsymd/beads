@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -5,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -13,9 +15,9 @@ func TestRemapDependencies(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	testStore, err := sqlite.New(context.Background(), dbPath)
+	testStore, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
 	if err != nil {
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer testStore.Close()
 
@@ -123,9 +125,9 @@ func TestRemapDependencies_NoDeps(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	testStore, err := sqlite.New(context.Background(), dbPath)
+	testStore, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
 	if err != nil {
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer testStore.Close()
 
@@ -161,9 +163,9 @@ func TestRemapDependencies_PreservesMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	testStore, err := sqlite.New(context.Background(), dbPath)
+	testStore, err := dolt.New(context.Background(), &dolt.Config{Path: dbPath})
 	if err != nil {
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer testStore.Close()
 
@@ -229,7 +231,8 @@ func TestRemapDependencies_PreservesMetadata(t *testing.T) {
 	if bDepRecords[0].Type != types.DepDiscoveredFrom {
 		t.Errorf("Expected type=discovered-from, got %s", bDepRecords[0].Type)
 	}
-	if bDepRecords[0].Metadata != `{"reason": "found during work"}` {
+	// Compare as normalized JSON (MySQL/Dolt normalizes JSON whitespace on storage)
+	if bDepRecords[0].Metadata != `{"reason":"found during work"}` && bDepRecords[0].Metadata != `{"reason": "found during work"}` {
 		t.Errorf("Metadata not preserved: got %s", bDepRecords[0].Metadata)
 	}
 }

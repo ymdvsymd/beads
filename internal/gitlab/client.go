@@ -98,15 +98,26 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr string, body inte
 		// Limit response body to 50MB to prevent OOM from malformed responses.
 		const maxResponseSize = 50 * 1024 * 1024
 		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() // Best effort: HTTP body close; connection may be reused regardless
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response (attempt %d/%d): %w", attempt+1, MaxRetries+1, err)
 			continue
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return respBody, resp.Header, nil
+		}
+
+		// Retry on rate-limiting and server errors with exponential backoff.
+		retriable := resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusInternalServerError ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout
+
+		if retriable {
 			delay := RetryDelay * time.Duration(1<<attempt)
-			lastErr = fmt.Errorf("rate limited (attempt %d/%d)", attempt+1, MaxRetries+1)
+			lastErr = fmt.Errorf("transient error %d (attempt %d/%d)", resp.StatusCode, attempt+1, MaxRetries+1)
 			select {
 			case <-ctx.Done():
 				return nil, nil, ctx.Err()
@@ -115,8 +126,6 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr string, body inte
 				if body != nil {
 					jsonBody, err := json.Marshal(body)
 					if err != nil {
-						// This shouldn't happen since we marshaled successfully before,
-						// but log it and continue to next retry attempt
 						lastErr = fmt.Errorf("retry marshal failed: %w", err)
 						continue
 					}
@@ -126,11 +135,7 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr string, body inte
 			}
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
-		}
-
-		return respBody, resp.Header, nil
+		return nil, nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
 	}
 
 	return nil, nil, fmt.Errorf("max retries (%d) exceeded: %w", MaxRetries+1, lastErr)

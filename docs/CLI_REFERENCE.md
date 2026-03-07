@@ -19,14 +19,13 @@
 ### Check Status
 
 ```bash
-# Check database path and daemon status
+# Check database path and server status
 bd info --json
 
 # Example output:
 # {
 #   "database_path": "/path/to/.beads/beads.db",
 #   "issue_prefix": "bd",
-#   "daemon_running": true,
 #   "agent_mail_enabled": false
 # }
 ```
@@ -34,12 +33,15 @@ bd info --json
 ### Find Work
 
 ```bash
-# Find ready work (no blockers)
+# Find ready work (no blockers, not already claimed)
 bd ready --json
+
+# Atomically claim an issue from the ready queue
+bd update <id> --claim --json               # Fails if already claimed
 
 # Find stale issues (not updated recently)
 bd stale --days 30 --json                    # Default: 30 days
-bd stale --days 90 --status in_progress --json  # Filter by status
+bd stale --days 90 --status in_progress --json  # Find abandoned claims
 bd stale --limit 20 --json                   # Limit results
 ```
 
@@ -62,6 +64,7 @@ bd create "Issue title" -t bug -p 1 --label bug,critical --json
 # Examples with special characters (all require quoting):
 bd create "Fix: auth doesn't validate tokens" -t bug -p 1 --json
 bd create "Add support for OAuth 2.0" -d "Implement RFC 6749 (OAuth 2.0 spec)" --json
+bd create "Implement auth" --spec-id "docs/specs/auth.md" --json
 
 # Create multiple issues from markdown file
 bd create -f feature-plan.md --json
@@ -71,8 +74,10 @@ bd create "Issue title" --body-file=description.md --json
 bd create "Issue title" --body-file description.md -p 1 --json
 
 # Read description from stdin
+echo "Description text" | bd create "Issue title" --stdin --json
+cat description.md | bd create "Issue title" --stdin -p 1 --json
+# --body-file=- also works:
 echo "Description text" | bd create "Issue title" --body-file=- --json
-cat description.md | bd create "Issue title" --body-file - -p 1 --json
 
 # Create epic with hierarchical child tasks
 bd create "Auth System" -t epic -p 1 --json                     # Returns: bd-a3f8e9
@@ -82,14 +87,29 @@ bd create "Tests" -p 1 --parent bd-a3f8e9 --json                # Auto-assigned:
 
 # Create and link discovered work (one command)
 bd create "Found bug" -t bug -p 1 --deps discovered-from:<parent-id> --json
+
+# Create with external reference (v0.9.2+)
+bd create "Fix login" -t bug -p 1 --external-ref "gh-123" --json  # Short form
+bd create "Fix login" -t bug -p 1 --external-ref "https://github.com/org/repo/issues/123" --json  # Full URL
+bd create "Jira task" -t task -p 1 --external-ref "jira-PROJ-456" --json  # Custom prefix
 ```
 
 ### Update Issues
 
 ```bash
 # Update one or more issues
-bd update <id> [<id>...] --status in_progress --json
+bd update <id> [<id>...] --claim --json
 bd update <id> [<id>...] --priority 1 --json
+bd update <id> [<id>...] --spec-id "docs/specs/auth.md" --json
+
+# Update external reference (v0.9.2+)
+bd update <id> --external-ref "gh-456" --json           # Short form
+bd update <id> --external-ref "jira-PROJ-789" --json    # Custom prefix
+
+# Atomically claim an issue for work (prevents race conditions)
+# Sets assignee to you and status to in_progress in one atomic operation
+# Fails if already claimed (assignee is not empty)
+bd update <id> --claim --json
 
 # Edit issue fields in $EDITOR (HUMANS ONLY - not for agents)
 # NOTE: This command is intentionally NOT exposed via the MCP server
@@ -119,6 +139,9 @@ bd dep tree <id>
 
 # Get issue details (supports multiple IDs)
 bd show <id> [<id>...] --json
+
+# Show the currently active issue (in-progress, hooked, or last touched)
+bd show --current
 ```
 
 ## Dependencies & Labels
@@ -185,6 +208,7 @@ bd list --status open --priority 1 --json               # Status and priority
 bd list --assignee alice --json                         # By assignee
 bd list --type bug --json                               # By issue type
 bd list --id bd-123,bd-456 --json                       # Specific IDs
+bd list --spec "docs/specs/" --json                     # Spec prefix
 ```
 
 ### Label Filters
@@ -207,6 +231,9 @@ bd list --title "auth" --json
 bd list --title-contains "auth" --json                  # Search in title
 bd list --desc-contains "implement" --json              # Search in description
 bd list --notes-contains "TODO" --json                  # Search in notes
+
+# Find beads issue by external reference
+bd list --json | jq -r '.[] | select(.external_ref == "gh-123") | .id'
 ```
 
 ### Date Range Filters
@@ -260,17 +287,13 @@ When detected, you'll see: `ℹ️  Sandbox detected, using direct mode`
 ```bash
 # Explicitly enable sandbox mode
 bd --sandbox <command>
-
-# Equivalent to combining these flags:
-bd --no-daemon --no-auto-flush --no-auto-import <command>
 ```
 
 **What it does:**
-- Disables daemon (uses direct SQLite mode)
-- Disables auto-export to JSONL
-- Disables auto-import from JSONL
+- Uses embedded database mode (no server needed)
+- Disables auto-sync operations
 
-**When to use:** Sandboxed environments where daemon can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
+**When to use:** Sandboxed environments where the Dolt server can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
 
 ### Staleness Control
 
@@ -278,7 +301,7 @@ bd --no-daemon --no-auto-flush --no-auto-import <command>
 # Skip staleness check (emergency escape hatch)
 bd --allow-stale <command>
 
-# Example: access database even if out of sync with JSONL
+# Example: access database even if it appears out of sync
 bd --allow-stale ready --json
 bd --allow-stale list --status open --json
 ```
@@ -296,7 +319,7 @@ bd import --force -i .beads/issues.jsonl
 
 **When to use:** `bd import` reports "0 created, 0 updated" but staleness errors persist.
 
-**Shows:** `Metadata updated (database already in sync with JSONL)`
+**Shows:** `Metadata updated (database already in sync)`
 
 ### Other Global Flags
 
@@ -304,12 +327,9 @@ bd import --force -i .beads/issues.jsonl
 # JSON output for programmatic use
 bd --json <command>
 
-# Force direct mode (bypass daemon)
-bd --no-daemon <command>
-
 # Disable auto-sync
-bd --no-auto-flush <command>    # Disable auto-export to JSONL
-bd --no-auto-import <command>   # Disable auto-import from JSONL
+bd --no-auto-flush <command>    # Disable auto-flush
+bd --no-auto-import <command>   # Disable auto-import
 
 # Custom database path
 bd --db /path/to/.beads/beads.db <command>
@@ -320,7 +340,6 @@ bd --actor alice <command>
 
 **See also:**
 - [TROUBLESHOOTING.md - Sandboxed environments](TROUBLESHOOTING.md#sandboxed-environments-codex-claude-code-etc) for detailed sandbox troubleshooting
-- [DAEMON.md](DAEMON.md) for daemon mode details
 
 ## Advanced Operations
 
@@ -404,15 +423,15 @@ bd admin reset --force
 ```
 
 **What gets removed:**
-- `.beads/` directory (database, JSONL, config)
+- `.beads/` directory (database, config)
 - Git hooks installed by bd
 - Merge driver configuration
 - Sync branch worktrees (`.git/beads-worktrees/`)
 
 **What does NOT get removed:**
 - Remote sync branch (if configured)
-- JSONL history in git commits
-- Remote repository data
+- Remote Dolt repository data
+- Historical git commits
 
 **Important:** If you want a complete clean slate (including remote data), see [Troubleshooting: Old data returns after reset](TROUBLESHOOTING.md#old-data-returns-after-reset).
 
@@ -473,6 +492,11 @@ bd mol wisp list --all --json    # Include closed
 bd mol wisp gc --json
 bd mol wisp gc --age 24h --json  # Custom age threshold
 bd mol wisp gc --dry-run         # Preview what would be cleaned
+
+# Purge all closed wisps (bulk cleanup)
+bd mol wisp gc --closed              # Preview closed wisp deletion
+bd mol wisp gc --closed --force      # Delete all closed wisps
+bd mol wisp gc --closed --dry-run    # Detailed dry-run preview
 ```
 
 ### Bonding (Combining Work)
@@ -526,7 +550,40 @@ bd mol burn <ephemeral-id> --dry-run
 bd mol burn <ephemeral-id> --force --json
 ```
 
-**Note:** Most mol commands require `--no-daemon` flag when daemon is running.
+**Note:** Mol commands use the standard Dolt database access path.
+
+## Gates
+
+Gates are async wait conditions that block dependent work until external conditions are met.
+See [DEPENDENCIES.md](DEPENDENCIES.md) for full documentation.
+
+```bash
+# List open gates
+bd gate list
+bd gate list --all                       # Including closed
+
+# Show gate details
+bd gate show <gate-id>
+
+# Evaluate gates and close resolved ones
+bd gate check                            # All gates
+bd gate check --type=gh:pr               # Only PR merge gates
+bd gate check --type=gh:run              # Only CI run gates
+bd gate check --type=timer               # Only timer gates
+bd gate check --type=bead               # Only cross-rig bead gates
+bd gate check --dry-run                  # Preview without changes
+bd gate check --escalate                 # Escalate failed gates
+
+# Manually resolve a gate
+bd gate resolve <gate-id> --reason "Approved"
+
+# Auto-discover CI run IDs for gh:run gates
+bd gate discover
+bd gate discover --dry-run --branch main
+
+# Add a waiter to a gate
+bd gate add-waiter <gate-id> <waiter>
+```
 
 ## Database Management
 
@@ -593,42 +650,62 @@ bd info --schema --json                                # Get schema, tables, con
 
 These invariants prevent data loss and would have caught issues like GH #201 (missing issue_prefix after migration).
 
-### Daemon Management
+### Migrate to Sync Branch
 
-See [docs/DAEMON.md](DAEMON.md) for complete daemon management reference.
+Set up a dedicated sync branch for beads data, keeping your working branches clean.
 
 ```bash
-# List all running daemons
-bd daemons list --json
+# Basic setup (creates orphan branch by default)
+bd migrate sync beads-sync                             # Create orphan sync branch
+bd migrate sync beads-sync --dry-run                   # Preview without changes
 
-# Check health (version mismatches, stale sockets)
-bd daemons health --json
+# Force reconfigure if already set up
+bd migrate sync beads-sync --force                     # Reconfigure sync branch
 
-# Stop/restart specific daemon
-bd daemons stop /path/to/workspace --json
-bd daemons restart 12345 --json  # By PID
-
-# View daemon logs
-bd daemons logs /path/to/workspace -n 100
-bd daemons logs 12345 -f  # Follow mode
-
-# Stop all daemons
-bd daemons killall --json
-bd daemons killall --force --json  # Force kill if graceful fails
+# Migrate existing non-orphan branch to orphan
+bd migrate sync beads-sync --orphan                    # Delete and recreate as orphan
 ```
+
+**Behavior:**
+
+| Scenario | Result |
+|----------|--------|
+| Branch doesn't exist | Creates orphan branch (no shared history) |
+| Branch exists locally | Uses existing branch as-is |
+| Branch exists + `--orphan` | Migrates: deletes and recreates as orphan |
+| Remote only | Fetches from remote |
+| Remote only + `--orphan` | Creates local orphan (ignores remote) |
+
+**Why orphan branches?**
+
+- Clean "data sync channel" mental model
+- No accidental merge risk (git warns loudly)
+- Smaller repository footprint (no stale source code)
+- Sync branch contains only `.beads/` directory
+
+**After setup:**
+
+- `bd sync` commits beads changes to the sync branch via worktree
+- Your working branch stays clean of beads commits
+- Essential for multi-clone setups where clones work independently
+
+**Safety features for `--orphan` migration:**
+
+- **Unpushed commit check**: If the branch has unpushed commits, migration fails with a helpful error. Use `--force` to override.
+- **Existing worktree**: If a worktree exists for the branch, it's automatically removed before migration.
+- **Non-destructive to remote**: The remote branch is not modified; use `git push --force` to update it after migration.
 
 ### Sync Operations
 
 ```bash
-# Manual sync (force immediate export/import/commit/push)
+# Manual sync (force immediate commit/push)
 bd sync
 
 # What it does:
-# 1. Export pending changes to JSONL
-# 2. Commit to git
-# 3. Pull from remote
-# 4. Import any updates
-# 5. Push to remote
+# 1. Commit pending changes to Dolt
+# 2. Pull from remote
+# 3. Merge any updates
+# 4. Push to remote
 ```
 
 ### Key-Value Store
@@ -657,8 +734,7 @@ bd kv list --json                      # Machine-readable output
 
 **Storage notes:**
 - KV data is stored in the local database with a `kv.` prefix
-- In `dolt-native` or `belt-and-suspenders` sync modes, KV data syncs via Dolt remotes
-- In `git-portable` mode, KV data stays local (not exported to JSONL)
+- KV data syncs via Dolt remotes
 
 **Use cases:**
 - Feature flags: `bd set debug_mode true`
@@ -707,6 +783,14 @@ Only `blocks` dependencies affect the ready work queue.
 
 **Note:** When creating an issue with a `discovered-from` dependency, the new issue automatically inherits the parent's `source_repo` field.
 
+## External References
+
+The `--external-ref` flag (v0.9.2+) links beads issues to external trackers:
+
+- Supports short form (`gh-123`) or full URL (`https://github.com/...`)
+- Portable via Dolt - survives sync across machines
+- Custom prefixes work for any tracker (`jira-PROJ-456`, `linear-789`)
+
 ## Output Formats
 
 ### JSON Output (Recommended for Agents)
@@ -754,7 +838,7 @@ This makes blocking relationships visible without running `bd show` on each issu
 bd ready --json
 
 # 2. Claim issue
-bd update bd-42 --status in_progress --json
+bd update bd-42 --claim --json
 
 # 3. Work on it...
 
@@ -796,7 +880,7 @@ bd ready --json  # Find work
 
 # During session
 bd create "..." -p 1 --json
-bd update bd-42 --status in_progress --json
+bd update bd-42 --claim --json
 # ... work ...
 
 # End of session (IMPORTANT!)
@@ -813,6 +897,7 @@ bd sync  # Force immediate sync, bypass debounce
 # Setup editor integration (choose based on your editor)
 bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md (universal standard)
 bd setup codex    # Codex CLI - creates/updates AGENTS.md
+bd setup mux      # Mux - creates/updates AGENTS.md
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
@@ -820,6 +905,7 @@ bd setup aider    # Aider - creates .aider.conf.yml
 # Check if integration is installed
 bd setup factory --check
 bd setup codex --check
+bd setup mux --check
 bd setup claude --check
 bd setup cursor --check
 bd setup aider --check
@@ -827,6 +913,7 @@ bd setup aider --check
 # Remove integration
 bd setup factory --remove
 bd setup codex --remove
+bd setup mux --remove
 bd setup claude --remove
 bd setup cursor --remove
 bd setup aider --remove
@@ -837,11 +924,14 @@ bd setup aider --remove
 bd setup claude              # Install globally (~/.claude/settings.json)
 bd setup claude --project    # Install for this project only
 bd setup claude --stealth    # Use stealth mode (flush only, no git operations)
+bd setup mux --project       # Also install .mux/AGENTS.md workspace layer
+bd setup mux --global        # Also install ~/.mux/AGENTS.md global layer
 ```
 
 **What each setup does:**
 - **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (works with multiple AI tools using the AGENTS.md standard)
 - **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex
+- **Mux** (`bd setup mux`): Creates or updates AGENTS.md with beads workflow instructions for Mux workspaces
 - **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events
 - **Cursor** (`bd setup cursor`): Creates `.cursor/rules/beads.mdc` with workflow instructions
 - **Aider** (`bd setup aider`): Creates `.aider.conf.yml` with bd workflow instructions
@@ -855,7 +945,6 @@ See also:
 
 - [AGENTS.md](../AGENTS.md) - Main agent workflow guide
 - [MOLECULES.md](MOLECULES.md) - Molecular chemistry metaphor (protos, pour, bond, squash, burn)
-- [DAEMON.md](DAEMON.md) - Daemon management and event-driven mode
-- [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git workflows and merge strategies
+- [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git worktrees and protected branches
 - [LABELS.md](../LABELS.md) - Label system guide
 - [README.md](../README.md) - User documentation

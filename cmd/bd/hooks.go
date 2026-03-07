@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
-	"embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,28 +9,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/git"
 )
 
-//go:embed templates/hooks/*
-var hooksFS embed.FS
-
-func getEmbeddedHooks() (map[string]string, error) {
-	hooks := make(map[string]string)
-	hookNames := []string{"pre-commit", "post-merge", "pre-push", "post-checkout", "prepare-commit-msg"}
-
-	for _, name := range hookNames {
-		content, err := hooksFS.ReadFile("templates/hooks/" + name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read embedded hook %s: %w", name, err)
-		}
-		hooks[name] = string(content)
-	}
-
-	return hooks, nil
-}
+// managedHookNames lists the git hooks managed by beads.
+// Hook content is generated dynamically by generateHookSection().
+var managedHookNames = []string{"pre-commit", "post-merge", "pre-push", "post-checkout", "prepare-commit-msg"}
 
 const hookVersionPrefix = "# bd-hooks-version: "
 const shimVersionPrefix = "# bd-shim "
@@ -40,6 +26,216 @@ const shimVersionPrefix = "# bd-shim "
 // inlineHookMarker identifies inline hooks created by bd init (GH#1120)
 // These hooks have the logic embedded directly rather than using shims
 const inlineHookMarker = "# bd (beads)"
+
+// Section markers for git hooks (GH#1380) — consistent with AGENTS.md pattern.
+// Only content between markers is managed by beads; user content outside is preserved.
+const hookSectionBeginPrefix = "# --- BEGIN BEADS INTEGRATION"
+const hookSectionEndPrefix = "# --- END BEADS INTEGRATION"
+
+// hookSectionBeginLine returns the full begin marker line with the current version.
+func hookSectionBeginLine() string {
+	return fmt.Sprintf("%s v%s ---", hookSectionBeginPrefix, Version)
+}
+
+// hookSectionEndLine returns the full end marker line with the current version.
+func hookSectionEndLine() string {
+	return fmt.Sprintf("%s v%s ---", hookSectionEndPrefix, Version)
+}
+
+// generateHookSection returns the marked section content for a given hook name.
+// The section is self-contained: it checks for bd availability, runs the hook
+// via 'bd hooks run', and propagates exit codes — without preventing any user
+// content after the section from executing on success.
+func generateHookSection(hookName string) string {
+	return hookSectionBeginLine() + "\n" +
+		"# This section is managed by beads. Do not remove these markers.\n" +
+		"if command -v bd >/dev/null 2>&1; then\n" +
+		"  export BD_GIT_HOOK=1\n" +
+		"  bd hooks run " + hookName + " \"$@\"\n" +
+		"  _bd_exit=$?; if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi\n" +
+		"fi\n" +
+		hookSectionEndLine() + "\n"
+}
+
+// injectHookSection merges the beads section into existing hook file content.
+// If section markers are found, only the content between them is replaced.
+// If broken markers exist (orphaned BEGIN, reversed order), the stale markers
+// are removed before injecting the new section.
+// If no markers are found, the section is appended.
+func injectHookSection(existing, section string) string {
+	return injectHookSectionWithDepth(existing, section, 0)
+}
+
+// maxInjectDepth guards against infinite recursion when cleaning broken markers.
+const maxInjectDepth = 5
+
+func injectHookSectionWithDepth(existing, section string, depth int) string {
+	if depth > maxInjectDepth {
+		// Safety: too many recursive cleanups — append as fallback
+		result := existing
+		if !strings.HasSuffix(result, "\n") {
+			result += "\n"
+		}
+		return result + "\n" + section
+	}
+
+	beginIdx := strings.Index(existing, hookSectionBeginPrefix)
+	endIdx := strings.Index(existing, hookSectionEndPrefix)
+
+	if beginIdx != -1 && endIdx != -1 && beginIdx < endIdx {
+		// Case 1: valid BEGIN...END pair — replace between markers
+		lineStart := strings.LastIndex(existing[:beginIdx], "\n")
+		if lineStart == -1 {
+			lineStart = 0
+		} else {
+			lineStart++ // skip the newline itself
+		}
+
+		// Find end of the end-marker line (including trailing newline)
+		endOfEndMarker := endIdx + len(hookSectionEndPrefix)
+		// Consume the rest of the end-marker line (e.g. " v0.58.0 ---\n")
+		restAfterPrefix := existing[endOfEndMarker:]
+		if nlIdx := strings.Index(restAfterPrefix, "\n"); nlIdx != -1 {
+			endOfEndMarker += nlIdx + 1
+		} else {
+			endOfEndMarker = len(existing)
+		}
+
+		return existing[:lineStart] + section + existing[endOfEndMarker:]
+	} else if beginIdx != -1 {
+		// Case 2: broken markers — orphaned BEGIN (no END) or reversed (END before BEGIN).
+		// Remove the orphaned/stale block, then recurse to handle remaining markers.
+		cleaned := removeOrphanedBeginBlock(existing, beginIdx)
+		return injectHookSectionWithDepth(cleaned, section, depth+1)
+	} else if endIdx != -1 {
+		// Case 2b: orphaned END without BEGIN — remove the stale END line
+		cleaned := removeMarkerLine(existing, endIdx, hookSectionEndPrefix)
+		return injectHookSectionWithDepth(cleaned, section, depth+1)
+	}
+
+	// Case 3: no markers — append
+	result := existing
+	if !strings.HasSuffix(result, "\n") {
+		result += "\n"
+	}
+	result += "\n" + section
+	return result
+}
+
+// removeOrphanedBeginBlock removes an orphaned BEGIN block starting at beginIdx.
+// Scans forward from the BEGIN line to the next blank line, next BEGIN marker, or EOF.
+func removeOrphanedBeginBlock(content string, beginIdx int) string {
+	lineStart := strings.LastIndex(content[:beginIdx], "\n")
+	if lineStart == -1 {
+		lineStart = 0
+	} else {
+		lineStart++ // skip the newline itself
+	}
+
+	afterBegin := content[beginIdx:]
+	blockEnd := len(content)
+
+	lines := strings.SplitAfter(afterBegin, "\n")
+	scanned := beginIdx
+	for i, line := range lines {
+		if i == 0 {
+			// Skip the BEGIN line itself
+			scanned += len(line)
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			// Blank line — end of orphaned block (include the blank line)
+			blockEnd = scanned + len(line)
+			break
+		}
+		if strings.Contains(line, hookSectionBeginPrefix) {
+			// Next BEGIN marker — end before this line
+			blockEnd = scanned
+			break
+		}
+		scanned += len(line)
+	}
+
+	return content[:lineStart] + content[blockEnd:]
+}
+
+// removeMarkerLine removes a single marker line from content.
+func removeMarkerLine(content string, markerIdx int, markerPrefix string) string {
+	lineStart := strings.LastIndex(content[:markerIdx], "\n")
+	if lineStart == -1 {
+		lineStart = 0
+	} else {
+		lineStart++ // skip the newline itself
+	}
+
+	lineEnd := markerIdx + len(markerPrefix)
+	restAfterPrefix := content[lineEnd:]
+	if nlIdx := strings.Index(restAfterPrefix, "\n"); nlIdx != -1 {
+		lineEnd += nlIdx + 1
+	} else {
+		lineEnd = len(content)
+	}
+
+	return content[:lineStart] + content[lineEnd:]
+}
+
+// removeHookSection removes only the beads section from hook file content.
+// Returns the content with the section removed, and true if a section was found.
+// Handles valid BEGIN...END pairs, orphaned BEGIN, orphaned END, and reversed markers.
+func removeHookSection(content string) (string, bool) {
+	beginIdx := strings.Index(content, hookSectionBeginPrefix)
+	endIdx := strings.Index(content, hookSectionEndPrefix)
+
+	if beginIdx == -1 && endIdx == -1 {
+		return content, false
+	}
+
+	if beginIdx != -1 && endIdx != -1 && beginIdx < endIdx {
+		// Valid BEGIN...END pair — remove the whole section
+		lineStart := strings.LastIndex(content[:beginIdx], "\n")
+		if lineStart == -1 {
+			lineStart = 0
+		} else {
+			lineStart++
+		}
+
+		endOfSection := endIdx + len(hookSectionEndPrefix)
+		restAfterPrefix := content[endOfSection:]
+		if nlIdx := strings.Index(restAfterPrefix, "\n"); nlIdx != -1 {
+			endOfSection += nlIdx + 1
+		} else {
+			endOfSection = len(content)
+		}
+
+		// Also consume a blank line before the section if present
+		if lineStart >= 2 && content[lineStart-1] == '\n' && content[lineStart-2] == '\n' {
+			lineStart--
+		}
+
+		return content[:lineStart] + content[endOfSection:], true
+	}
+
+	// Broken markers: orphaned BEGIN, orphaned END, or reversed order.
+	// Remove whichever markers exist.
+	result := content
+	if beginIdx != -1 {
+		result = removeOrphanedBeginBlock(result, strings.Index(result, hookSectionBeginPrefix))
+	}
+	if endIdx != -1 {
+		// Re-find END index in the (possibly modified) result
+		if newEndIdx := strings.Index(result, hookSectionEndPrefix); newEndIdx != -1 {
+			result = removeMarkerLine(result, newEndIdx, hookSectionEndPrefix)
+		}
+	}
+
+	// Trim trailing blank lines that may be left from removal
+	for strings.HasSuffix(result, "\n\n\n") {
+		result = result[:len(result)-1]
+	}
+
+	return result, true
+}
 
 // HookStatus represents the status of a single git hook
 type HookStatus struct {
@@ -82,8 +278,8 @@ func CheckGitHooks() []HookStatus {
 			status.IsShim = versionInfo.IsShim
 
 			// Thin shims are never outdated (they delegate to bd)
-			// Legacy hooks are outdated if version differs from current bd version
-			if !versionInfo.IsShim && versionInfo.Version != "" && versionInfo.Version != Version {
+			// bd hooks are outdated if version is missing (legacy inline) or differs
+			if !versionInfo.IsShim && versionInfo.IsBdHook && versionInfo.Version != Version {
 				status.Outdated = true
 			}
 		}
@@ -111,13 +307,22 @@ func getHookVersion(path string) (hookVersionInfo, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// Read first few lines looking for version marker or bd hook marker
-	lineCount := 0
+	// Read the entire file to support section markers anywhere (GH#1380)
 	var content strings.Builder
-	for scanner.Scan() && lineCount < 15 {
+	for scanner.Scan() {
 		line := scanner.Text()
 		content.WriteString(line)
 		content.WriteString("\n")
+		// Check for section marker (GH#1380) — can appear anywhere in the file
+		if strings.HasPrefix(line, hookSectionBeginPrefix) {
+			// Extract version from "# --- BEGIN BEADS INTEGRATION v0.56.1 ---"
+			after := strings.TrimPrefix(line, hookSectionBeginPrefix)
+			after = strings.TrimSpace(after)
+			after = strings.TrimPrefix(after, "v")
+			after = strings.TrimSuffix(after, "---")
+			version := strings.TrimSpace(after)
+			return hookVersionInfo{Version: version, IsShim: true, IsBdHook: true}, nil
+		}
 		// Check for thin shim marker first
 		if strings.HasPrefix(line, shimVersionPrefix) {
 			version := strings.TrimSpace(strings.TrimPrefix(line, shimVersionPrefix))
@@ -128,7 +333,10 @@ func getHookVersion(path string) (hookVersionInfo, error) {
 			version := strings.TrimSpace(strings.TrimPrefix(line, hookVersionPrefix))
 			return hookVersionInfo{Version: version, IsShim: false, IsBdHook: true}, nil
 		}
-		lineCount++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return hookVersionInfo{}, fmt.Errorf("reading hook file: %w", err)
 	}
 
 	// Check if it's an inline bd hook (from bd init) - GH#1120
@@ -178,35 +386,35 @@ func FormatHookWarnings(statuses []HookStatus) string {
 var hooksCmd = &cobra.Command{
 	Use:     "hooks",
 	GroupID: "setup",
-	Short:   "Manage git hooks for bd auto-sync",
-	Long: `Install, uninstall, or list git hooks that provide automatic bd sync.
+	Short:   "Manage git hooks for beads integration",
+	Long: `Install, uninstall, or list git hooks for beads integration.
 
-The hooks ensure that:
-- pre-commit: Flushes pending changes to JSONL before commit
-- post-merge: Imports updated JSONL after pull/merge
-- pre-push: Prevents pushing stale JSONL
-- post-checkout: Imports JSONL after branch checkout
-- prepare-commit-msg: Adds agent identity trailers for forensics`,
+The hooks provide:
+- pre-commit: Run chained hooks before commit
+- post-merge: Run chained hooks after pull/merge
+- pre-push: Run chained hooks before push
+- post-checkout: Run chained hooks after branch checkout
+- prepare-commit-msg: Add agent identity trailers for forensics`,
 }
 
 var hooksInstallCmd = &cobra.Command{
 	Use:   "install",
 	Short: "Install bd git hooks",
-	Long: `Install git hooks for automatic bd sync.
+	Long: `Install git hooks for beads integration.
 
 By default, hooks are installed to .git/hooks/ in the current repository.
 Use --beads to install to .beads/hooks/ (recommended for Dolt backend).
 Use --shared to install to a versioned directory (.beads-hooks/) that can be
 committed to git and shared with team members.
 
-Use --chain to preserve existing hooks and run them before bd hooks. This is
-useful if you have pre-commit framework hooks or other custom hooks.
+Hooks use section markers to coexist with existing hooks — any user content
+outside the markers is preserved across installs and upgrades.
 
 Installed hooks:
-  - pre-commit: Flush changes to JSONL before commit
-  - post-merge: Import JSONL after pull/merge
-  - pre-push: Prevent pushing stale JSONL
-  - post-checkout: Import JSONL after branch checkout
+  - pre-commit: Run chained hooks before commit
+  - post-merge: Run chained hooks after pull/merge
+  - pre-push: Run chained hooks before push
+  - post-checkout: Run chained hooks after branch checkout
   - prepare-commit-msg: Add agent identity trailers (for orchestrator agents)`,
 	Run: func(cmd *cobra.Command, args []string) {
 		force, _ := cmd.Flags().GetBool("force")
@@ -214,31 +422,8 @@ Installed hooks:
 		chain, _ := cmd.Flags().GetBool("chain")
 		beadsHooks, _ := cmd.Flags().GetBool("beads")
 
-		embeddedHooks, err := getEmbeddedHooks()
-		if err != nil {
-			if jsonOutput {
-				output := map[string]interface{}{
-					"error": err.Error(),
-				}
-				jsonBytes, _ := json.MarshalIndent(output, "", "  ")
-				fmt.Println(string(jsonBytes))
-			} else {
-				fmt.Fprintf(os.Stderr, "Error loading hooks: %v\n", err)
-			}
-			os.Exit(1)
-		}
-
-		if err := installHooksWithOptions(embeddedHooks, force, shared, chain, beadsHooks); err != nil {
-			if jsonOutput {
-				output := map[string]interface{}{
-					"error": err.Error(),
-				}
-				jsonBytes, _ := json.MarshalIndent(output, "", "  ")
-				fmt.Println(string(jsonBytes))
-			} else {
-				fmt.Fprintf(os.Stderr, "Error installing hooks: %v\n", err)
-			}
-			os.Exit(1)
+		if err := installHooksWithOptions(managedHookNames, force, shared, chain, beadsHooks); err != nil {
+			FatalErrorRespectJSON("installing hooks: %v", err)
 		}
 
 		if jsonOutput {
@@ -254,10 +439,6 @@ Installed hooks:
 		} else {
 			fmt.Println("✓ Git hooks installed successfully")
 			fmt.Println()
-			if chain {
-				fmt.Println("Mode: chained (existing hooks renamed to .old and will run first)")
-				fmt.Println()
-			}
 			if beadsHooks {
 				fmt.Println("Hooks installed to: .beads/hooks/")
 				fmt.Println("Git config set: core.hooksPath=.beads/hooks")
@@ -270,7 +451,7 @@ Installed hooks:
 				fmt.Println()
 			}
 			fmt.Println("Installed hooks:")
-			for hookName := range embeddedHooks {
+			for _, hookName := range managedHookNames {
 				fmt.Printf("  - %s\n", hookName)
 			}
 		}
@@ -283,16 +464,7 @@ var hooksUninstallCmd = &cobra.Command{
 	Long:  `Remove bd git hooks from .git/hooks/ directory.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := uninstallHooks(); err != nil {
-			if jsonOutput {
-				output := map[string]interface{}{
-					"error": err.Error(),
-				}
-				jsonBytes, _ := json.MarshalIndent(output, "", "  ")
-				fmt.Println(string(jsonBytes))
-			} else {
-				fmt.Fprintf(os.Stderr, "Error uninstalling hooks: %v\n", err)
-			}
-			os.Exit(1)
+			FatalErrorRespectJSON("uninstalling hooks: %v", err)
 		}
 
 		if jsonOutput {
@@ -339,11 +511,8 @@ var hooksListCmd = &cobra.Command{
 	},
 }
 
-func installHooks(embeddedHooks map[string]string, force bool, shared bool, chain bool) error {
-	return installHooksWithOptions(embeddedHooks, force, shared, chain, false)
-}
-
-func installHooksWithOptions(embeddedHooks map[string]string, force bool, shared bool, chain bool, beadsHooks bool) error {
+//nolint:unparam // force and chain kept for CLI flag compatibility; section markers make them no-ops
+func installHooksWithOptions(hookNames []string, force bool, shared bool, chain bool, beadsHooks bool) error {
 	var hooksDir string
 	if beadsHooks {
 		// Use .beads/hooks/ directory (preferred for Dolt backend)
@@ -369,47 +538,50 @@ func installHooksWithOptions(embeddedHooks map[string]string, force bool, shared
 		return fmt.Errorf("failed to create hooks directory: %w", err)
 	}
 
-	// Install each hook
-	for hookName, hookContent := range embeddedHooks {
+	// Install each hook using section markers (GH#1380).
+	// Only the content between markers is managed by beads; user content
+	// outside the markers is preserved across reinstalls and upgrades.
+	for _, hookName := range hookNames {
 		hookPath := filepath.Join(hooksDir, hookName)
+		section := generateHookSection(hookName)
 
-		// Check if hook already exists
-		if _, err := os.Stat(hookPath); err == nil {
-			if chain {
-				// Chain mode - rename to .old so bd hooks run can call it
-				// But skip if existing hook is already a bd hook (shim or inline) - renaming it would
-				// cause infinite recursion or destroy user's original hook. See: GH#843, GH#1120
-				versionInfo, verr := getHookVersion(hookPath)
-				if verr != nil || !versionInfo.IsBdHook {
-					// Not a bd hook - safe to rename for chaining
-					oldPath := hookPath + ".old"
-					// Safety check: don't overwrite existing .old file (GH#1120)
-					// This prevents destroying user's original hook if bd hooks install --chain
-					// is run multiple times or after bd init already created .old
-					if _, oldErr := os.Stat(oldPath); oldErr == nil {
-						// .old already exists - the user's original hook is there
-						// Just overwrite the current hook without renaming
-						// (the existing .old will be chained by the new hook)
-					} else {
-						if err := os.Rename(hookPath, oldPath); err != nil {
-							return fmt.Errorf("failed to rename %s to .old for chaining: %w", hookName, err)
-						}
-					}
-				}
-				// If it IS a bd hook, just overwrite it (no rename needed)
-			} else if !force {
-				// Default mode - back it up
-				backupPath := hookPath + ".backup"
-				if err := os.Rename(hookPath, backupPath); err != nil {
-					return fmt.Errorf("failed to backup %s: %w", hookName, err)
+		// Read existing hook file (if any)
+		// #nosec G304 -- hook path constrained to hooks directory
+		existing, readErr := os.ReadFile(hookPath)
+
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return fmt.Errorf("failed to read %s: %w", hookName, readErr)
+		}
+
+		var newContent string
+		if os.IsNotExist(readErr) {
+			// No existing file — create with shebang + section
+			newContent = "#!/usr/bin/env sh\n" + section
+		} else {
+			existingStr := string(existing)
+			// Check if file already has section markers
+			if strings.Contains(existingStr, hookSectionBeginPrefix) {
+				// Update only the section between markers
+				newContent = injectHookSection(existingStr, section)
+			} else {
+				// Check if this is a legacy bd hook (shim or inline)
+				versionInfo, _ := getHookVersion(hookPath)
+				if versionInfo.IsBdHook {
+					// Legacy bd hook — replace entire file with section format
+					newContent = "#!/usr/bin/env sh\n" + section
+				} else {
+					// Non-bd hook — inject section (preserving existing content)
+					newContent = injectHookSection(existingStr, section)
 				}
 			}
-			// If force is set and not chaining, we just overwrite
 		}
+
+		// Normalize line endings to LF
+		newContent = strings.ReplaceAll(newContent, "\r\n", "\n")
 
 		// Write hook file
 		// #nosec G306 -- git hooks must be executable for Git to run them
-		if err := os.WriteFile(hookPath, []byte(hookContent), 0755); err != nil {
+		if err := os.WriteFile(hookPath, []byte(newContent), 0755); err != nil {
 			return fmt.Errorf("failed to write %s: %w", hookName, err)
 		}
 	}
@@ -468,23 +640,79 @@ func uninstallHooks() error {
 	for _, hookName := range hookNames {
 		hookPath := filepath.Join(hooksDir, hookName)
 
-		// Check if hook exists
-		if _, err := os.Stat(hookPath); os.IsNotExist(err) {
+		// #nosec G304 -- hook path constrained to .git/hooks directory
+		content, err := os.ReadFile(hookPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("failed to read %s: %w", hookName, err)
+		}
+
+		// Try to remove only the beads section (GH#1380)
+		newContent, found := removeHookSection(string(content))
+		if found {
+			remaining := strings.TrimSpace(newContent)
+			if remaining == "" || remaining == "#!/usr/bin/env sh" || remaining == "#!/bin/sh" {
+				// Only shebang left — remove the file entirely
+				if err := os.Remove(hookPath); err != nil {
+					return fmt.Errorf("failed to remove %s: %w", hookName, err)
+				}
+			} else {
+				// #nosec G306 -- git hooks must be executable
+				if err := os.WriteFile(hookPath, []byte(newContent), 0755); err != nil {
+					return fmt.Errorf("failed to write %s: %w", hookName, err)
+				}
+			}
 			continue
 		}
 
-		// Remove hook
-		if err := os.Remove(hookPath); err != nil {
-			return fmt.Errorf("failed to remove %s: %w", hookName, err)
-		}
-
-		// Restore backup if exists
-		backupPath := hookPath + ".backup"
-		if _, err := os.Stat(backupPath); err == nil {
-			if err := os.Rename(backupPath, hookPath); err != nil {
-				// Non-fatal - just warn
-				fmt.Fprintf(os.Stderr, "Warning: failed to restore backup for %s: %v\n", hookName, err)
+		// No section markers — check if it's a legacy bd hook (remove entire file)
+		versionInfo, verr := getHookVersion(hookPath)
+		if verr == nil && versionInfo.IsBdHook {
+			if err := os.Remove(hookPath); err != nil {
+				return fmt.Errorf("failed to remove %s: %w", hookName, err)
 			}
+			// Restore backup if exists
+			backupPath := hookPath + ".backup"
+			if _, err := os.Stat(backupPath); err == nil {
+				if err := os.Rename(backupPath, hookPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to restore backup for %s: %v\n", hookName, err)
+				}
+			}
+		}
+		// Not a bd hook at all — leave it alone
+	}
+
+	// Reset core.hooksPath if it was set to a beads-managed directory
+	if err := resetHooksPathIfBeadsManaged(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to reset core.hooksPath: %v\n", err)
+	}
+
+	return nil
+}
+
+// resetHooksPathIfBeadsManaged unsets core.hooksPath if it points to a
+// beads-managed hooks directory (.beads/hooks or .beads-hooks).
+func resetHooksPathIfBeadsManaged() error {
+	repoRoot := git.GetRepoRoot()
+	if repoRoot == "" {
+		return nil // not in a git repo
+	}
+
+	cmd := exec.Command("git", "config", "--get", "core.hooksPath")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return nil // core.hooksPath not set — nothing to reset
+	}
+
+	hooksPath := strings.TrimSpace(string(out))
+	if hooksPath == ".beads/hooks" || hooksPath == ".beads-hooks" {
+		cmd = exec.Command("git", "config", "--unset", "core.hooksPath")
+		cmd.Dir = repoRoot
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git config --unset core.hooksPath failed: %w (output: %s)", err, string(output))
 		}
 	}
 
@@ -543,82 +771,18 @@ func runChainedHook(hookName string, args []string) int {
 	return 0
 }
 
-// runPreCommitHook flushes pending changes to JSONL before commit.
-// Returns 0 on success (or if not applicable), 1 if unstaged beads changes detected.
+// runPreCommitHook runs chained hooks before commit.
+// Returns 0 on success (or if not applicable).
 func runPreCommitHook() int {
 	// Run chained hook first (if exists)
 	if exitCode := runChainedHook("pre-commit", nil); exitCode != 0 {
 		return exitCode
 	}
-
-	// Check if we're in a bd workspace
-	if _, err := os.Stat(".beads"); os.IsNotExist(err) {
-		return 0 // Not a bd workspace, nothing to do
-	}
-
-	// Check if sync-branch is configured (changes go to separate branch)
-	if hookGetSyncBranch() != "" {
-		return 0 // Skip - changes synced to separate branch
-	}
-
-	// Flush pending changes to JSONL
-	// Use --flush-only to skip git operations (we're already in a git hook)
-	// Use --no-daemon to ensure direct mode (inline import requires local store)
-	cmd := exec.Command("bd", "sync", "--flush-only", "--no-daemon")
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to flush bd changes to JSONL")
-		fmt.Fprintln(os.Stderr, "Run 'bd sync --flush-only' manually to diagnose")
-		// Don't block the commit - user may have removed beads or have other issues
-	}
-
-	// Stage JSONL files for commit
-	// By default, we auto-stage for convenience. Users with conflicting git hooks
-	// (e.g., hooks that read the staging area) can set BEADS_NO_AUTO_STAGE=1 to
-	// disable this and stage manually. See: https://github.com/steveyegge/beads/issues/826
-	if os.Getenv("BEADS_NO_AUTO_STAGE") != "" {
-		// Safe mode: check for unstaged changes and block if found
-		var unstaged []string
-		for _, f := range jsonlFilePaths {
-			if _, err := os.Stat(f); err == nil {
-				if hasUnstagedChanges(f) {
-					unstaged = append(unstaged, f)
-				}
-			}
-		}
-
-		if len(unstaged) > 0 {
-			fmt.Fprintln(os.Stderr, "❌ Unstaged beads changes detected:")
-			for _, f := range unstaged {
-				fmt.Fprintf(os.Stderr, "   %s\n", f)
-			}
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "Run: git add .beads/")
-			return 1
-		}
-	} else {
-		// Default: auto-stage JSONL files
-		rc, rcErr := beads.GetRepoContext()
-		ctx := context.Background()
-		for _, f := range jsonlFilePaths {
-			if _, err := os.Stat(f); err == nil {
-				var gitAdd *exec.Cmd
-				if rcErr == nil {
-					gitAdd = rc.GitCmdCWD(ctx, "add", f)
-				} else {
-					// Fallback if RepoContext unavailable
-					// #nosec G204 -- f comes from jsonlFilePaths (controlled, hardcoded paths)
-					gitAdd = exec.Command("git", "add", f)
-				}
-				_ = gitAdd.Run() // Ignore errors - file may not exist
-			}
-		}
-	}
-
 	return 0
 }
 
-// runPostMergeHook imports JSONL after pull/merge.
-// Returns 0 on success (or if not applicable), non-zero on error.
+// runPostMergeHook runs chained hooks after merge.
+// Returns 0 on success (or if not applicable).
 //
 //nolint:unparam // Always returns 0 by design - warnings don't block merges
 func runPostMergeHook() int {
@@ -626,144 +790,22 @@ func runPostMergeHook() int {
 	if exitCode := runChainedHook("post-merge", nil); exitCode != 0 {
 		return exitCode
 	}
-
-	// Skip during rebase
-	if isRebaseInProgress() {
-		return 0
-	}
-
-	// Check if we're in a bd workspace
-	if _, err := os.Stat(".beads"); os.IsNotExist(err) {
-		return 0
-	}
-
-	// Check if any JSONL file exists
-	if !hasBeadsJSONL() {
-		return 0
-	}
-
-	// Run bd sync --import-only --no-git-history
-	// Use --no-daemon to ensure direct mode (inline import requires local store)
-	cmd := exec.Command("bd", "sync", "--import-only", "--no-git-history", "--no-daemon")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to sync bd changes after merge")
-		fmt.Fprintln(os.Stderr, string(output))
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Run 'bd doctor --fix' to diagnose and repair")
-		// Don't fail the merge, just warn
-	}
-
-	// Run quick health check
-	healthCmd := exec.Command("bd", "doctor", "--check-health")
-	_ = healthCmd.Run() // Ignore errors
-
 	return 0
 }
 
-// runPrePushHook prevents pushing stale JSONL.
+// runPrePushHook runs chained hooks before push.
 // Returns 0 to allow push, non-zero to block.
 func runPrePushHook(args []string) int {
 	// Run chained hook first (if exists)
 	if exitCode := runChainedHook("pre-push", args); exitCode != 0 {
 		return exitCode
 	}
-
-	// Check if we're in a bd workspace
-	if _, err := os.Stat(".beads"); os.IsNotExist(err) {
-		return 0
-	}
-
-	// Skip if bd sync is already in progress (prevents circular error)
-	if os.Getenv("BD_SYNC_IN_PROGRESS") != "" {
-		return 0
-	}
-
-	// Check if sync-branch is configured
-	if hookGetSyncBranch() != "" {
-		return 0 // Skip - changes synced to separate branch
-	}
-
-	// Get RepoContext for git operations (needed for flush and staging)
-	rc, rcErr := beads.GetRepoContext()
-	ctx := context.Background()
-
-	// Flush pending bd changes
-	// Use --no-daemon to ensure direct mode (inline import requires local store)
-	flushCmd := exec.Command("bd", "sync", "--flush-only", "--no-daemon")
-	_ = flushCmd.Run() // Ignore errors
-
-	// Auto-stage JSONL files after flush to prevent race condition.
-	// Without this, flush creates uncommitted changes that the check below
-	// would detect, causing an infinite loop. See: GH#1208
-	for _, f := range jsonlFilePaths {
-		if _, err := os.Stat(f); err == nil {
-			var gitAdd *exec.Cmd
-			if rcErr == nil {
-				gitAdd = rc.GitCmdCWD(ctx, "add", f)
-			} else {
-				// #nosec G204 -- f comes from jsonlFilePaths (controlled, hardcoded paths)
-				gitAdd = exec.Command("git", "add", f)
-			}
-			_ = gitAdd.Run() // Ignore errors - file may not exist
-		}
-	}
-
-	// Check for uncommitted JSONL changes
-	files := []string{}
-	for _, f := range jsonlFilePaths {
-		// Check if file exists or is tracked
-		if _, err := os.Stat(f); err == nil {
-			files = append(files, f)
-		} else {
-			// Check if tracked by git
-			var checkCmd *exec.Cmd
-			if rcErr == nil {
-				checkCmd = rc.GitCmdCWD(ctx, "ls-files", "--error-unmatch", f)
-			} else {
-				// #nosec G204 - f is from jsonlFilePaths (controlled, hardcoded paths)
-				checkCmd = exec.Command("git", "ls-files", "--error-unmatch", f)
-			}
-			if checkCmd.Run() == nil {
-				files = append(files, f)
-			}
-		}
-	}
-
-	if len(files) == 0 {
-		return 0
-	}
-
-	// Check for uncommitted changes using git status
-	statusArgs := append([]string{"status", "--porcelain", "--"}, files...)
-	var statusCmd *exec.Cmd
-	if rcErr == nil {
-		statusCmd = rc.GitCmdCWD(ctx, statusArgs...)
-	} else {
-		// #nosec G204 - statusArgs built from hardcoded list and git subcommands
-		statusCmd = exec.Command("git", statusArgs...)
-	}
-	output, _ := statusCmd.Output()
-	if len(output) > 0 {
-		fmt.Fprintln(os.Stderr, "❌ Error: Uncommitted changes detected")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Before pushing, ensure all changes are committed. This includes:")
-		fmt.Fprintln(os.Stderr, "  • bd JSONL updates (run 'bd sync')")
-		fmt.Fprintln(os.Stderr, "  • any other modified files (run 'git status' to review)")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Run 'bd sync' to commit these changes:")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "  bd sync")
-		fmt.Fprintln(os.Stderr, "")
-		return 1
-	}
-
 	return 0
 }
 
-// runPostCheckoutHook imports JSONL after branch checkout.
+// runPostCheckoutHook runs chained hooks after branch checkout.
 // args: [previous-HEAD, new-HEAD, flag] where flag=1 for branch checkout
-// Returns 0 on success (or if not applicable), non-zero on error.
+// Returns 0 on success (or if not applicable).
 //
 //nolint:unparam // Always returns 0 by design - warnings don't block checkouts
 func runPostCheckoutHook(args []string) int {
@@ -771,63 +813,6 @@ func runPostCheckoutHook(args []string) int {
 	if exitCode := runChainedHook("post-checkout", args); exitCode != 0 {
 		return exitCode
 	}
-
-	// Only run on branch checkouts (flag=1)
-	if len(args) >= 3 && args[2] != "1" {
-		return 0
-	}
-
-	// Skip during rebase
-	if isRebaseInProgress() {
-		return 0
-	}
-
-	// Check if we're in a bd workspace
-	if _, err := os.Stat(".beads"); os.IsNotExist(err) {
-		return 0
-	}
-
-	// Detect git worktree and show warning
-	if isGitWorktree() {
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║ Welcome to beads in git worktree!                                        ║")
-		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════════════╣")
-		fmt.Fprintln(os.Stderr, "║ Note: Daemon mode is not recommended with git worktrees.                 ║")
-		fmt.Fprintln(os.Stderr, "║ Worktrees share the same database, and the daemon may commit changes     ║")
-		fmt.Fprintln(os.Stderr, "║ to the wrong branch.                                                     ║")
-		fmt.Fprintln(os.Stderr, "║                                                                          ║")
-		fmt.Fprintln(os.Stderr, "║ RECOMMENDED: Disable daemon for this session:                            ║")
-		fmt.Fprintln(os.Stderr, "║   export BEADS_NO_DAEMON=1                                               ║")
-		fmt.Fprintln(os.Stderr, "║                                                                          ║")
-		fmt.Fprintln(os.Stderr, "║ For more information:                                                    ║")
-		fmt.Fprintln(os.Stderr, "║   - Run: bd doctor                                                       ║")
-		fmt.Fprintln(os.Stderr, "║   - Read: docs/GIT_INTEGRATION.md (lines 10-53)                          ║")
-		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════════════╝")
-		fmt.Fprintln(os.Stderr, "")
-	}
-
-	// Check if any JSONL file exists
-	if !hasBeadsJSONL() {
-		return 0
-	}
-
-	// Run bd sync --import-only --no-git-history
-	// Use --no-daemon to ensure direct mode (inline import requires local store)
-	cmd := exec.Command("bd", "sync", "--import-only", "--no-git-history", "--no-daemon")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: Failed to sync bd changes after checkout")
-		fmt.Fprintln(os.Stderr, string(output))
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Run 'bd doctor --fix' to diagnose and repair")
-		// Don't fail the checkout, just warn
-	}
-
-	// Run quick health check
-	healthCmd := exec.Command("bd", "doctor", "--check-health")
-	_ = healthCmd.Run() // Ignore errors
-
 	return 0
 }
 
@@ -1000,35 +985,6 @@ func getPinnedMolecule() string {
 // Hook Helper Functions
 // =============================================================================
 
-// hookGetSyncBranch returns the configured sync branch for hook context.
-// This is a simplified version that doesn't require context.
-func hookGetSyncBranch() string {
-	// Check environment variable first
-	if branch := os.Getenv("BEADS_SYNC_BRANCH"); branch != "" {
-		return branch
-	}
-
-	// Check config.yaml
-	configPath := ".beads/config.yaml"
-	data, err := os.ReadFile(configPath) // #nosec G304 -- config path is hardcoded
-	if err != nil {
-		return ""
-	}
-
-	// Simple YAML parsing for sync-branch
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "sync-branch:") {
-			value := strings.TrimPrefix(line, "sync-branch:")
-			value = strings.TrimSpace(value)
-			value = strings.Trim(value, `"'`)
-			return value
-		}
-	}
-
-	return ""
-}
-
 // isRebaseInProgress checks if a rebase is in progress.
 func isRebaseInProgress() bool {
 	if _, err := os.Stat(".git/rebase-merge"); err == nil {
@@ -1040,60 +996,6 @@ func isRebaseInProgress() bool {
 	return false
 }
 
-// hasBeadsJSONL checks if any JSONL file exists in .beads/.
-func hasBeadsJSONL() bool {
-	for _, f := range jsonlFilePaths {
-		if _, err := os.Stat(f); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// hasUnstagedChanges checks if a file has uncommitted changes (modified or untracked).
-// Returns true if the file needs to be staged before commit.
-func hasUnstagedChanges(path string) bool {
-	// Check git status for this specific file
-	rc, rcErr := beads.GetRepoContext()
-	var cmd *exec.Cmd
-	if rcErr == nil {
-		cmd = rc.GitCmdCWD(context.Background(), "status", "--porcelain", "--", path)
-	} else {
-		// #nosec G204 - path is from hardcoded list in caller
-		cmd = exec.Command("git", "status", "--porcelain", "--", path)
-	}
-	output, err := cmd.Output()
-	if err != nil {
-		return false // If git fails, assume no changes
-	}
-
-	// Parse porcelain output: XY filename
-	// X = staged status, Y = unstaged status
-	// We care about Y (unstaged) being non-space, OR the file being untracked (??)
-	status := strings.TrimSpace(string(output))
-	if status == "" {
-		return false // No changes
-	}
-
-	// Check each line (usually just one for a single file)
-	for _, line := range strings.Split(status, "\n") {
-		if len(line) < 2 {
-			continue
-		}
-		x, y := line[0], line[1]
-		// Untracked file
-		if x == '?' && y == '?' {
-			return true
-		}
-		// Modified but not staged (Y is M, D, etc.)
-		if y != ' ' {
-			return true
-		}
-	}
-
-	return false
-}
-
 var hooksRunCmd = &cobra.Command{
 	Use:   "run <hook-name> [args...]",
 	Short: "Execute a git hook (called by thin shims)",
@@ -1101,16 +1003,24 @@ var hooksRunCmd = &cobra.Command{
 thin shim scripts installed in .git/hooks/.
 
 Supported hooks:
-  - pre-commit: Flush pending changes to JSONL before commit
-  - post-merge: Import JSONL after pull/merge
-  - pre-push: Prevent pushing stale JSONL
-  - post-checkout: Import JSONL after branch checkout
+  - pre-commit: Run chained hooks before commit
+  - post-merge: Run chained hooks after pull/merge
+  - pre-push: Run chained hooks before push
+  - post-checkout: Run chained hooks after branch checkout
   - prepare-commit-msg: Add agent identity trailers for forensics
 
 The thin shim pattern ensures hook logic is always in sync with the
 installed bd version - upgrading bd automatically updates hook behavior.`,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		// Disable terminal color probing to prevent OSC 11 escape sequence leaks (GH#1303).
+		// Our shell shims set BD_GIT_HOOK=1 before invoking bd, but third-party hook
+		// runners (lefthook, husky, etc.) call 'bd hooks run' directly without it.
+		// By this point ui.init() has already run, so we must also reset the lipgloss
+		// color profile — the env var alone only helps if set before process start.
+		_ = os.Setenv("BD_GIT_HOOK", "1")
+		lipgloss.SetColorProfile(termenv.Ascii)
+
 		hookName := args[0]
 		hookArgs := args[1:]
 
@@ -1127,8 +1037,7 @@ installed bd version - upgrading bd automatically updates hook behavior.`,
 		case "prepare-commit-msg":
 			exitCode = runPrepareCommitMsgHook(hookArgs)
 		default:
-			fmt.Fprintf(os.Stderr, "Unknown hook: %s\n", hookName)
-			os.Exit(1)
+			FatalError("unknown hook: %s", hookName)
 		}
 
 		os.Exit(exitCode)

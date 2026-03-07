@@ -10,15 +10,20 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 // runContributorWizard guides the user through OSS contributor setup
-func runContributorWizard(ctx context.Context, store storage.Storage) error {
+func runContributorWizard(ctx context.Context, store *dolt.DoltStore) error {
 	fmt.Printf("\n%s %s\n\n", ui.RenderBold("bd"), ui.RenderBold("Contributor Workflow Setup Wizard"))
 	fmt.Println("This wizard will configure beads for OSS contribution.")
 	fmt.Println()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reader := bufio.NewReader(os.Stdin)
 
 	// Early check: BEADS_DIR takes precedence over routing
 	if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
@@ -28,8 +33,13 @@ func runContributorWizard(ctx context.Context, store storage.Storage) error {
 		fmt.Println("  you likely don't need --contributor.")
 		fmt.Println()
 		fmt.Print("Continue anyway? [y/N]: ")
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
+		response, err := readLineWithContext(ctx, reader, os.Stdin)
+		if err != nil {
+			if isCanceled(err) {
+				return err
+			}
+			response = ""
+		}
 		response = strings.TrimSpace(strings.ToLower(response))
 
 		if response != "y" && response != "yes" {
@@ -54,8 +64,13 @@ func runContributorWizard(ctx context.Context, store storage.Storage) error {
 
 		// Ask if they want to continue anyway
 		fmt.Print("Continue with contributor setup? [y/N]: ")
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
+		response, err := readLineWithContext(ctx, reader, os.Stdin)
+		if err != nil {
+			if isCanceled(err) {
+				return err
+			}
+			response = ""
+		}
 		response = strings.TrimSpace(strings.ToLower(response))
 
 		if response != "y" && response != "yes" {
@@ -74,8 +89,13 @@ func runContributorWizard(ctx context.Context, store storage.Storage) error {
 		fmt.Printf("  %s You can commit directly to this repository.\n", ui.RenderWarn("⚠"))
 		fmt.Println()
 		fmt.Print("Do you want to use a separate planning repo anyway? [Y/n]: ")
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
+		response, err := readLineWithContext(ctx, reader, os.Stdin)
+		if err != nil {
+			if isCanceled(err) {
+				return err
+			}
+			response = ""
+		}
 		response = strings.TrimSpace(strings.ToLower(response))
 
 		if response == "n" || response == "no" {
@@ -106,8 +126,13 @@ func runContributorWizard(ctx context.Context, store storage.Storage) error {
 	fmt.Printf("Default: %s\n", ui.RenderAccent(defaultPlanningRepo))
 	fmt.Print("Planning repo path [press Enter for default]: ")
 
-	reader := bufio.NewReader(os.Stdin)
-	planningPath, _ := reader.ReadString('\n')
+	planningPath, err := readLineWithContext(ctx, reader, os.Stdin)
+	if err != nil {
+		if isCanceled(err) {
+			return err
+		}
+		planningPath = ""
+	}
 	planningPath = strings.TrimSpace(planningPath)
 
 	if planningPath == "" {
@@ -138,13 +163,6 @@ func runContributorWizard(ctx context.Context, store storage.Storage) error {
 		beadsDir := filepath.Join(planningPath, ".beads")
 		if err := os.MkdirAll(beadsDir, 0750); err != nil {
 			return fmt.Errorf("failed to create .beads in planning repo: %w", err)
-		}
-
-		// Create issues.jsonl (canonical name, bd-6xd)
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		// #nosec G306 -- planning repo JSONL must be shareable across collaborators
-		if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
-			return fmt.Errorf("failed to create issues.jsonl: %w", err)
 		}
 
 		// Create README in planning repo

@@ -12,11 +12,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Database != "beads.db" {
 		t.Errorf("Database = %q, want beads.db", cfg.Database)
 	}
-
-	// bd-6xd: issues.jsonl is the canonical name
-	if cfg.JSONLExport != "issues.jsonl" {
-		t.Errorf("JSONLExport = %q, want issues.jsonl", cfg.JSONLExport)
-	}
 }
 
 func TestLoadSaveRoundtrip(t *testing.T) {
@@ -44,10 +39,6 @@ func TestLoadSaveRoundtrip(t *testing.T) {
 	if loaded.Database != cfg.Database {
 		t.Errorf("Database = %q, want %q", loaded.Database, cfg.Database)
 	}
-
-	if loaded.JSONLExport != cfg.JSONLExport {
-		t.Errorf("JSONLExport = %q, want %q", loaded.JSONLExport, cfg.JSONLExport)
-	}
 }
 
 func TestLoadNonexistent(t *testing.T) {
@@ -65,10 +56,11 @@ func TestLoadNonexistent(t *testing.T) {
 
 func TestDatabasePath(t *testing.T) {
 	beadsDir := "/home/user/project/.beads"
+	// DatabasePath always returns dolt path regardless of Database field
 	cfg := &Config{Database: "beads.db"}
 
 	got := cfg.DatabasePath(beadsDir)
-	want := filepath.Join(beadsDir, "beads.db")
+	want := filepath.Join(beadsDir, "dolt")
 
 	if got != want {
 		t.Errorf("DatabasePath() = %q, want %q", got, want)
@@ -125,41 +117,6 @@ func TestDatabasePath_Dolt(t *testing.T) {
 			t.Errorf("DatabasePath() = %q, want %q", got, want)
 		}
 	})
-}
-
-func TestJSONLPath(t *testing.T) {
-	beadsDir := "/home/user/project/.beads"
-
-	tests := []struct {
-		name string
-		cfg  *Config
-		want string
-	}{
-		{
-			name: "default",
-			cfg:  &Config{JSONLExport: "issues.jsonl"},
-			want: filepath.Join(beadsDir, "issues.jsonl"),
-		},
-		{
-			name: "custom",
-			cfg:  &Config{JSONLExport: "custom.jsonl"},
-			want: filepath.Join(beadsDir, "custom.jsonl"),
-		},
-		{
-			name: "empty falls back to default",
-			cfg:  &Config{JSONLExport: ""},
-			want: filepath.Join(beadsDir, "issues.jsonl"),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.cfg.JSONLPath(beadsDir)
-			if got != tt.want {
-				t.Errorf("JSONLPath() = %q, want %q", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestConfigPath(t *testing.T) {
@@ -219,8 +176,8 @@ func TestDoltServerMode(t *testing.T) {
 			want bool
 		}{
 			{
-				name: "sqlite backend",
-				cfg:  &Config{Backend: BackendSQLite},
+				name: "empty backend",
+				cfg:  &Config{Backend: ""},
 				want: false,
 			},
 			{
@@ -378,11 +335,11 @@ func TestIsDoltServerModeEnvVar(t *testing.T) {
 		}
 	})
 
-	t.Run("env var ignored for sqlite backend", func(t *testing.T) {
+	t.Run("env var with dolt backend enables server mode", func(t *testing.T) {
 		t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
-		cfg := &Config{Backend: BackendSQLite}
-		if cfg.IsDoltServerMode() {
-			t.Error("IsDoltServerMode() = true, want false when env var set but sqlite backend")
+		cfg := &Config{Backend: ""}
+		if !cfg.IsDoltServerMode() {
+			t.Error("IsDoltServerMode() = false, want true when env var set with default backend")
 		}
 	})
 
@@ -394,6 +351,49 @@ func TestIsDoltServerModeEnvVar(t *testing.T) {
 	})
 }
 
+// TestGetBackendAlwaysDolt tests that GetBackend always returns "dolt".
+func TestGetBackendAlwaysDolt(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+	}{
+		{name: "explicit dolt", cfg: &Config{Backend: BackendDolt}},
+		{name: "empty backend", cfg: &Config{Backend: ""}},
+		{name: "legacy config", cfg: &Config{}},
+		{name: "stale sqlite value", cfg: &Config{Backend: "sqlite"}},
+		{name: "unknown backend", cfg: &Config{Backend: "postgres"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetBackend(); got != BackendDolt {
+				t.Errorf("GetBackend() = %q, want %q", got, BackendDolt)
+			}
+		})
+	}
+}
+
+// TestDatabasePathAlwaysDolt tests that DatabasePath always returns the dolt path.
+func TestDatabasePathAlwaysDolt(t *testing.T) {
+	beadsDir := "/home/user/project/.beads"
+
+	cfg := &Config{Database: "beads.db", Backend: BackendDolt}
+	got := cfg.DatabasePath(beadsDir)
+	want := filepath.Join(beadsDir, "dolt")
+	if got != want {
+		t.Errorf("DatabasePath() = %q, want %q", got, want)
+	}
+}
+
+// TestCapabilitiesForBackend tests that CapabilitiesForBackend returns
+// single-process-only by default.
+func TestCapabilitiesForBackend(t *testing.T) {
+	caps := CapabilitiesForBackend("anything")
+	if !caps.SingleProcessOnly {
+		t.Error("CapabilitiesForBackend().SingleProcessOnly = false, want true")
+	}
+}
+
 // TestGetCapabilities tests that GetCapabilities properly handles server mode
 func TestGetCapabilities(t *testing.T) {
 	tests := []struct {
@@ -401,11 +401,6 @@ func TestGetCapabilities(t *testing.T) {
 		cfg            *Config
 		wantSingleProc bool
 	}{
-		{
-			name:           "sqlite is multi-process",
-			cfg:            &Config{Backend: BackendSQLite},
-			wantSingleProc: false,
-		},
 		{
 			name:           "dolt embedded is single-process",
 			cfg:            &Config{Backend: BackendDolt, DoltMode: DoltModeEmbedded},

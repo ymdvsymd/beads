@@ -15,9 +15,37 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// IssuesQuery is the GraphQL query for fetching issues with all required fields.
+// projectsQuery is the GraphQL query for fetching projects.
+const projectsQuery = `
+	query Projects($filter: ProjectFilter!, $first: Int!, $after: String) {
+		projects(
+			first: $first
+			after: $after
+			filter: $filter
+		) {
+			nodes {
+				id
+				name
+				description
+				slugId
+				url
+				state
+				progress
+				createdAt
+				updatedAt
+				completedAt
+			}
+			pageInfo {
+				hasNextPage
+				endCursor
+			}
+		}
+	}
+`
+
+// issuesQuery is the GraphQL query for fetching issues with all required fields.
 // Used by both FetchIssues and FetchIssuesSince for consistency.
-const IssuesQuery = `
+const issuesQuery = `
 	query Issues($filter: IssueFilter!, $first: Int!, $after: String) {
 		issues(
 			first: $first
@@ -147,7 +175,7 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() // Best effort: HTTP body close; connection may be reused regardless
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response (attempt %d/%d): %w", attempt+1, MaxRetries+1, err)
 			continue
@@ -239,7 +267,7 @@ func (c *Client) FetchIssues(ctx context.Context, state string) ([]Issue, error)
 		}
 
 		req := &GraphQLRequest{
-			Query:     IssuesQuery,
+			Query:     issuesQuery,
 			Variables: variables,
 		}
 
@@ -321,7 +349,7 @@ func (c *Client) FetchIssuesSince(ctx context.Context, state string, since time.
 		}
 
 		req := &GraphQLRequest{
-			Query:     IssuesQuery,
+			Query:     issuesQuery,
 			Variables: variables,
 		}
 
@@ -706,4 +734,159 @@ func (c *Client) FetchTeams(ctx context.Context) ([]Team, error) {
 	}
 
 	return teamsResp.Teams.Nodes, nil
+}
+
+// FetchProjects retrieves projects from Linear with optional filtering by state.
+// state can be: "planned", "started", "paused", "completed", "canceled", or "all"/"".
+func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, error) {
+	var allProjects []Project
+	var cursor string
+
+	filter := map[string]interface{}{
+		"team": map[string]interface{}{
+			"id": map[string]interface{}{
+				"eq": c.TeamID,
+			},
+		},
+	}
+
+	if state != "all" && state != "" {
+		filter["state"] = map[string]interface{}{
+			"eq": state,
+		}
+	}
+
+	for {
+		variables := map[string]interface{}{
+			"filter": filter,
+			"first":  MaxPageSize,
+		}
+		if cursor != "" {
+			variables["after"] = cursor
+		}
+
+		req := &GraphQLRequest{
+			Query:     projectsQuery,
+			Variables: variables,
+		}
+
+		data, err := c.Execute(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch projects: %w", err)
+		}
+
+		var projectsResp ProjectsResponse
+		if err := json.Unmarshal(data, &projectsResp); err != nil {
+			return nil, fmt.Errorf("failed to parse projects response: %w", err)
+		}
+
+		allProjects = append(allProjects, projectsResp.Projects.Nodes...)
+
+		if !projectsResp.Projects.PageInfo.HasNextPage {
+			break
+		}
+		cursor = projectsResp.Projects.PageInfo.EndCursor
+	}
+
+	return allProjects, nil
+}
+
+// CreateProject creates a new project in Linear.
+func (c *Client) CreateProject(ctx context.Context, name, description, state string) (*Project, error) {
+	query := `
+		mutation CreateProject($input: ProjectCreateInput!) {
+			projectCreate(input: $input) {
+				success
+				project {
+					id
+					name
+					description
+					slugId
+					url
+					state
+					progress
+					createdAt
+					updatedAt
+				}
+			}
+		}
+	`
+
+	input := map[string]interface{}{
+		"teamIds":     []string{c.TeamID},
+		"name":        name,
+		"description": description,
+	}
+
+	if state != "" {
+		input["state"] = state
+	}
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"input": input,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create project: %w", err)
+	}
+
+	var createResp ProjectCreateResponse
+	if err := json.Unmarshal(data, &createResp); err != nil {
+		return nil, fmt.Errorf("failed to parse create project response: %w", err)
+	}
+
+	if !createResp.ProjectCreate.Success {
+		return nil, fmt.Errorf("project creation reported as unsuccessful")
+	}
+
+	return &createResp.ProjectCreate.Project, nil
+}
+
+// UpdateProject updates an existing project in Linear.
+func (c *Client) UpdateProject(ctx context.Context, projectID string, updates map[string]interface{}) (*Project, error) {
+	query := `
+		mutation UpdateProject($id: String!, $input: ProjectUpdateInput!) {
+			projectUpdate(id: $id, input: $input) {
+				success
+				project {
+					id
+					name
+					description
+					slugId
+					url
+					state
+					progress
+					updatedAt
+				}
+			}
+		}
+	`
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"id":    projectID,
+			"input": updates,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update project: %w", err)
+	}
+
+	var updateResp ProjectUpdateResponse
+	if err := json.Unmarshal(data, &updateResp); err != nil {
+		return nil, fmt.Errorf("failed to parse update project response: %w", err)
+	}
+
+	if !updateResp.ProjectUpdate.Success {
+		return nil, fmt.Errorf("project update reported as unsuccessful")
+	}
+
+	return &updateResp.ProjectUpdate.Project, nil
 }
