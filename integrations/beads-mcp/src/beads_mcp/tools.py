@@ -38,7 +38,7 @@ from .models import (
 # ContextVar for request-scoped workspace routing
 current_workspace: ContextVar[str | None] = ContextVar('workspace', default=None)
 
-# Connection pool for per-project daemon sockets
+# Connection pool for per-project clients
 _connection_pool: dict[str, BdClientBase] = {}
 _pool_lock = asyncio.Lock()
 
@@ -53,13 +53,13 @@ DEFAULT_DEPENDENCY_TYPE: DependencyType = "blocks"
 def _register_client_for_cleanup(client: BdClientBase) -> None:
     """Register client with server cleanup system.
     
-    This ensures daemon connections are properly closed on server shutdown.
+    This ensures client connections are properly closed on server shutdown.
     Import is deferred to avoid circular dependency.
     """
     try:
         from . import server
-        if hasattr(server, '_daemon_clients'):
-            server._daemon_clients.append(client)
+        if hasattr(server, '_registered_clients'):
+            server._registered_clients.append(client)
     except (ImportError, AttributeError):
         # Server module not available or cleanup not initialized - that's ok
         pass
@@ -91,7 +91,7 @@ def _resolve_beads_redirect(beads_dir: str, workspace_root: str) -> str | None:
         # Resolve relative to workspace_root (the redirect is written from the perspective
         # of being inside workspace_root, not inside workspace_root/.beads)
         # e.g., redirect contains "../../mayor/rig/.beads"
-        # from polecats/capable/, this resolves to mayor/rig/.beads
+        # from agents/capable/, this resolves to the canonical .beads
         resolved = os.path.normpath(os.path.join(workspace_root, redirect_target))
 
         if not os.path.isdir(resolved):
@@ -118,7 +118,7 @@ def _find_beads_db_in_tree(start_dir: str | None = None) -> str | None:
     """Walk up directory tree looking for .beads/*.db (matches Go CLI behavior).
 
     Also follows .beads/redirect files to shared beads locations, which is
-    essential for polecat/crew directories that share a central database.
+    essential for agent/worker directories that share a central database.
 
     Args:
         start_dir: Starting directory (default: current working directory)
@@ -141,7 +141,7 @@ def _find_beads_db_in_tree(start_dir: str | None = None) -> str | None:
         while True:
             beads_dir = os.path.join(current, ".beads")
             if os.path.isdir(beads_dir):
-                # First, check for redirect file (polecat/crew directories use this)
+                # First, check for redirect file (agent/worker directories use this)
                 redirected = _resolve_beads_redirect(beads_dir, current)
                 if redirected:
                     logger.debug(f"Followed redirect from {current} to {redirected}")
@@ -200,7 +200,7 @@ def _canonicalize_path(path: str) -> str:
     """Canonicalize workspace path to handle symlinks and git repos.
     
     This ensures that different paths pointing to the same project
-    (e.g., via symlinks) use the same daemon connection.
+    (e.g., via symlinks) use the same client connection.
     
     Args:
         path: Workspace directory path
@@ -217,7 +217,7 @@ def _canonicalize_path(path: str) -> str:
         return real
     
     # 3. Try to find git toplevel
-    # This ensures we connect to the right daemon for the git repo
+    # This ensures we connect to the right client for the git repo
     return _resolve_workspace_root(real)
 
 
@@ -230,7 +230,7 @@ async def _health_check_client(client: BdClientBase) -> bool:
     Returns:
         True if client is healthy, False otherwise
     """
-    # Only health check daemon clients
+    # Only health check clients that support ping
     if not hasattr(client, 'ping'):
         return True
     
@@ -243,24 +243,21 @@ async def _health_check_client(client: BdClientBase) -> bool:
 
 
 async def _reconnect_client(canonical: str, max_retries: int = 3) -> BdClientBase:
-    """Attempt to reconnect to daemon with exponential backoff.
-    
+    """Attempt to reconnect with exponential backoff.
+
     Args:
         canonical: Canonical workspace path
         max_retries: Maximum number of retry attempts (default: 3)
-        
+
     Returns:
         New client instance
-        
+
     Raises:
         BdError: If all reconnection attempts fail
     """
-    use_daemon = os.environ.get("BEADS_USE_DAEMON", "1") == "1"
-    
     for attempt in range(max_retries):
         try:
             client = create_bd_client(
-                prefer_daemon=use_daemon,
                 working_dir=canonical
             )
             
@@ -277,15 +274,15 @@ async def _reconnect_client(canonical: str, max_retries: int = 3) -> BdClientBas
             continue
     
     raise BdError(
-        f"Failed to connect to daemon after {max_retries} attempts. "
-        "The daemon may be stopped or unresponsive."
+        f"Failed to connect after {max_retries} attempts. "
+        "The bd client may be misconfigured or unresponsive."
     )
 
 
 async def _get_client() -> BdClientBase:
     """Get a BdClient instance for the current workspace.
     
-    Uses connection pool to manage per-project daemon sockets.
+    Uses connection pool to manage per-project clients.
     Workspace is auto-detected using the same logic as CLI:
     1. current_workspace ContextVar (from workspace_root parameter)
     2. BEADS_WORKING_DIR environment variable
@@ -295,7 +292,7 @@ async def _get_client() -> BdClientBase:
     On failure, drops from pool and attempts reconnection with exponential backoff.
     
     Performs version check on first connection to each workspace.
-    Uses daemon client if available, falls back to CLI client.
+    Uses CLI client for all operations.
 
     Returns:
         Configured BdClientBase instance for the current workspace
@@ -339,10 +336,7 @@ async def _get_client() -> BdClientBase:
                 _connection_pool[canonical] = client
         else:
             # Create new client for this workspace
-            use_daemon = os.environ.get("BEADS_USE_DAEMON", "1") == "1"
-            
             client = create_bd_client(
-                prefer_daemon=use_daemon,
                 working_dir=canonical
             )
             
@@ -364,6 +358,7 @@ async def _get_client() -> BdClientBase:
 async def beads_ready_work(
     limit: Annotated[int, "Maximum number of issues to return (1-100)"] = 10,
     priority: Annotated[int | None, "Filter by priority (0-4, 0=highest)"] = None,
+    issue_type: Annotated[IssueType | None, "Filter by type (task, bug, feature, epic, chore, decision, merge-request, or custom)"] = None,
     assignee: Annotated[str | None, "Filter by assignee"] = None,
     labels: Annotated[list[str] | None, "Filter by labels (AND: must have ALL)"] = None,
     labels_any: Annotated[list[str] | None, "Filter by labels (OR: must have at least one)"] = None,
@@ -382,6 +377,7 @@ async def beads_ready_work(
     params = ReadyWorkParams(
         limit=limit,
         priority=priority,
+        issue_type=issue_type,
         assignee=assignee,
         labels=labels,
         labels_any=labels_any,

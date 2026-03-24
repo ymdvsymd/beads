@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,13 @@ const (
 	// circuitCooldown is how long to stay open before allowing a half-open probe.
 	// Keep this short — planned restarts (e.g. gt dolt sync) only take 2-3s.
 	circuitCooldown = 5 * time.Second
+
+	// circuitStaleTTL is the maximum age of an open circuit breaker state file
+	// before it is considered stale and auto-reset to closed. This prevents old
+	// breaker files from poisoning fresh inits when the server was stopped long
+	// ago or the machine was rebooted. The TTL is based on the TrippedAt timestamp
+	// (or LastFailure if TrippedAt is zero).
+	circuitStaleTTL = 5 * time.Minute
 )
 
 // circuitState is the shared file-based circuit breaker state.
@@ -44,10 +52,11 @@ type circuitState struct {
 	TrippedAt    time.Time `json:"tripped_at,omitempty"`
 }
 
-// circuitBreaker manages the circuit breaker for a specific Dolt server port.
+// circuitBreaker manages the circuit breaker for a specific Dolt server host:port.
 // It uses a file in /tmp for cross-process state sharing and an in-process
 // mutex for thread safety within a single process.
 type circuitBreaker struct {
+	host     string
 	port     int
 	filePath string
 	mu       sync.Mutex
@@ -56,11 +65,24 @@ type circuitBreaker struct {
 // ErrCircuitOpen is returned when the circuit breaker is open and rejecting requests.
 var ErrCircuitOpen = fmt.Errorf("dolt circuit breaker is open: server appears down, failing fast (cooldown %s)", circuitCooldown)
 
-// newCircuitBreaker creates a circuit breaker for the given Dolt server port.
-func newCircuitBreaker(port int) *circuitBreaker {
+// maybeNewCircuitBreaker returns a file-backed circuit breaker only for a
+// concrete port. Port 0 means "not yet resolved" during standalone auto-start,
+// and sharing breaker state on port 0 poisons every fresh init on the machine.
+func maybeNewCircuitBreaker(host string, port int) *circuitBreaker {
+	if port <= 0 {
+		return nil
+	}
+	return newCircuitBreaker(host, port)
+}
+
+// newCircuitBreaker creates a circuit breaker for the given Dolt server host:port.
+func newCircuitBreaker(host string, port int) *circuitBreaker {
+	// Sanitize host for use in filename (replace dots/colons with dashes)
+	safeHost := strings.NewReplacer(".", "-", ":", "-").Replace(host)
 	return &circuitBreaker{
+		host:     host,
 		port:     port,
-		filePath: fmt.Sprintf("/tmp/beads-dolt-circuit-%d.json", port),
+		filePath: fmt.Sprintf("/tmp/beads-dolt-circuit-%s-%d.json", safeHost, port),
 	}
 }
 
@@ -73,6 +95,13 @@ func newCircuitBreaker(port int) *circuitBreaker {
 // If the probe succeeds, the breaker resets to closed immediately. This
 // avoids the half-open→open re-trip race that can leave the breaker stuck.
 func (cb *circuitBreaker) Allow() bool {
+	// In test mode, bypass the circuit breaker entirely. Tests manage their
+	// own server lifecycle via testcontainers, and the file-based breaker
+	// state persists across test runs causing cascading false-positive trips.
+	if os.Getenv("BEADS_TEST_MODE") == "1" {
+		return true
+	}
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -86,13 +115,13 @@ func (cb *circuitBreaker) Allow() bool {
 				state.Failures = 0
 				state.FirstFailure = time.Time{}
 				cb.writeState(state)
-				log.Printf("[circuit-breaker] port %d: open → closed (active probe succeeded)", cb.port)
+				log.Printf("[circuit-breaker] %s:%d: open → closed (active probe succeeded)", cb.host, cb.port)
 				return true
 			}
 			// Probe failed — stay open, reset the tripped timer
 			state.TrippedAt = time.Now()
 			cb.writeState(state)
-			log.Printf("[circuit-breaker] port %d: open → open (active probe failed, cooldown reset)", cb.port)
+			log.Printf("[circuit-breaker] %s:%d: open → open (active probe failed, cooldown reset)", cb.host, cb.port)
 			return false
 		}
 		return false
@@ -104,13 +133,13 @@ func (cb *circuitBreaker) Allow() bool {
 			state.Failures = 0
 			state.FirstFailure = time.Time{}
 			cb.writeState(state)
-			log.Printf("[circuit-breaker] port %d: half-open → closed (active probe succeeded)", cb.port)
+			log.Printf("[circuit-breaker] %s:%d: half-open → closed (active probe succeeded)", cb.host, cb.port)
 			return true
 		}
 		state.State = circuitOpen
 		state.TrippedAt = time.Now()
 		cb.writeState(state)
-		log.Printf("[circuit-breaker] port %d: half-open → open (active probe failed)", cb.port)
+		log.Printf("[circuit-breaker] %s:%d: half-open → open (active probe failed)", cb.host, cb.port)
 		return false
 	default:
 		return true
@@ -119,7 +148,7 @@ func (cb *circuitBreaker) Allow() bool {
 
 // probe performs a quick TCP dial to check if the Dolt server is reachable.
 func (cb *circuitBreaker) probe() bool {
-	addr := fmt.Sprintf("127.0.0.1:%d", cb.port)
+	addr := net.JoinHostPort(cb.host, fmt.Sprintf("%d", cb.port))
 	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
 	if err != nil {
 		return false
@@ -135,7 +164,7 @@ func (cb *circuitBreaker) RecordSuccess() {
 
 	state := cb.readState()
 	if state.State == circuitHalfOpen {
-		log.Printf("[circuit-breaker] port %d: half-open → closed (probe succeeded)", cb.port)
+		log.Printf("[circuit-breaker] %s:%d: half-open → closed (probe succeeded)", cb.host, cb.port)
 	}
 	// Reset to clean closed state
 	cb.writeState(circuitState{State: circuitClosed})
@@ -156,7 +185,7 @@ func (cb *circuitBreaker) RecordFailure() {
 		state.TrippedAt = now
 		state.LastFailure = now
 		cb.writeState(state)
-		log.Printf("[circuit-breaker] port %d: half-open → open (probe failed)", cb.port)
+		log.Printf("[circuit-breaker] %s:%d: half-open → open (probe failed)", cb.host, cb.port)
 		return
 
 	case circuitOpen:
@@ -183,8 +212,8 @@ func (cb *circuitBreaker) RecordFailure() {
 			state.State = circuitOpen
 			state.TrippedAt = now
 			cb.writeState(state)
-			log.Printf("[circuit-breaker] port %d: closed → open (tripped after %d failures in %s)",
-				cb.port, state.Failures, now.Sub(state.FirstFailure).Round(time.Millisecond))
+			log.Printf("[circuit-breaker] %s:%d: closed → open (tripped after %d failures in %s)",
+				cb.host, cb.port, state.Failures, now.Sub(state.FirstFailure).Round(time.Millisecond))
 			return
 		}
 
@@ -208,6 +237,9 @@ func (cb *circuitBreaker) Reset() {
 
 // readState reads the circuit state from the shared file.
 // Returns closed state if the file doesn't exist or can't be read.
+// Stale open/half-open states (older than circuitStaleTTL) are auto-reset
+// to closed so that leftover breaker files from previous sessions don't
+// poison fresh inits (GH#2598).
 func (cb *circuitBreaker) readState() circuitState {
 	data, err := os.ReadFile(cb.filePath)
 	if err != nil {
@@ -220,6 +252,24 @@ func (cb *circuitBreaker) readState() circuitState {
 	if state.State == "" {
 		state.State = circuitClosed
 	}
+
+	// Auto-expire stale open/half-open breaker state. Use TrippedAt as the
+	// reference timestamp; fall back to LastFailure if TrippedAt is zero
+	// (e.g. from an older breaker format).
+	if state.State == circuitOpen || state.State == circuitHalfOpen {
+		ref := state.TrippedAt
+		if ref.IsZero() {
+			ref = state.LastFailure
+		}
+		if !ref.IsZero() && time.Since(ref) > circuitStaleTTL {
+			log.Printf("[circuit-breaker] %s:%d: stale %s state (age %s > TTL %s), auto-resetting to closed",
+				cb.host, cb.port, state.State, time.Since(ref).Round(time.Second), circuitStaleTTL)
+			reset := circuitState{State: circuitClosed}
+			cb.writeState(reset)
+			return reset
+		}
+	}
+
 	return state
 }
 
@@ -235,6 +285,60 @@ func (cb *circuitBreaker) writeState(state circuitState) {
 		return
 	}
 	_ = os.Rename(tmp, cb.filePath)
+}
+
+// CleanStaleCircuitBreakerFiles removes stale circuit breaker files from /tmp.
+// This cleans up leftover files that could poison fresh inits:
+//   - Legacy port-0 files (beads-dolt-circuit-0.json) from before the port-0 fix
+//   - Any breaker file whose open/half-open state is older than circuitStaleTTL
+//
+// Called during init to ensure a clean starting state (GH#2598).
+func CleanStaleCircuitBreakerFiles() {
+	cleanStaleCircuitBreakerFilesIn("/tmp")
+}
+
+// cleanStaleCircuitBreakerFilesIn is the testable implementation of
+// CleanStaleCircuitBreakerFiles that accepts a directory parameter.
+func cleanStaleCircuitBreakerFilesIn(dir string) {
+	pattern := filepath.Join(dir, "beads-dolt-circuit-*.json")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return
+	}
+	for _, path := range matches {
+		// Always remove legacy port-0 files — they should never exist
+		// (the port-0 fix prevents creating them, but old ones may linger).
+		base := filepath.Base(path)
+		if base == "beads-dolt-circuit-0.json" {
+			_ = os.Remove(path)
+			log.Printf("[circuit-breaker] removed legacy port-0 breaker file: %s", path)
+			continue
+		}
+
+		// For other breaker files, check if the state is stale.
+		data, err := os.ReadFile(path) //nolint:gosec // G304: path is from filepath.Glob with controlled pattern
+		if err != nil {
+			continue
+		}
+		var state circuitState
+		if err := json.Unmarshal(data, &state); err != nil {
+			// Corrupt file — remove it
+			_ = os.Remove(path)
+			continue
+		}
+		if state.State != circuitOpen && state.State != circuitHalfOpen {
+			continue
+		}
+		ref := state.TrippedAt
+		if ref.IsZero() {
+			ref = state.LastFailure
+		}
+		if !ref.IsZero() && time.Since(ref) > circuitStaleTTL {
+			_ = os.Remove(path)
+			log.Printf("[circuit-breaker] removed stale breaker file: %s (age %s)",
+				path, time.Since(ref).Round(time.Second))
+		}
+	}
 }
 
 // isConnectionError returns true if the error indicates the Dolt server is

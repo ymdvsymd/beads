@@ -118,7 +118,7 @@ func readTypesFromDB(beadsDir string) ([]string, error) {
 	}
 
 	ctx := context.Background()
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
@@ -183,14 +183,14 @@ func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRe
 	}
 
 	ctx := context.Background()
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil
 	}
 	defer func() { _ = store.Close() }()
 
 	// Collect all known types (core work types + parent custom + all child custom)
-	// Only core work types are built-in; Gas Town types require types.custom config.
+	// Only core work types are built-in; orchestrator types require types.custom config.
 	knownTypes := map[string]bool{
 		"bug": true, "feature": true, "task": true, "epic": true, "chore": true, "decision": true,
 	}

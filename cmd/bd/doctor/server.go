@@ -84,9 +84,18 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 
 	// Server mode is configured - run health checks
 	host := cfg.GetDoltServerHost()
-	// Use doltserver.DefaultConfig for port resolution (env > config > DerivePort).
-	// cfg.GetDoltServerPort() falls back to 3307 which is wrong for standalone mode.
+	// Use doltserver.DefaultConfig for port resolution (env > port file > config.yaml).
+	// Port 0 means server not yet started — report that clearly.
 	port := doltserver.DefaultConfig(beadsDir).Port
+	if port == 0 {
+		result.Checks = append(result.Checks, DoctorCheck{
+			Name:     "Server port",
+			Status:   StatusWarning,
+			Message:  "No Dolt server port configured and no server running. Run any bd command to auto-start.",
+			Category: CategoryFederation,
+		})
+		return result
+	}
 
 	// Check 1: Server reachability (TCP connect)
 	reachCheck := checkServerReachable(host, port)
@@ -154,8 +163,8 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 // - testdb_*: BEADS_TEST_MODE=1 FNV hash of temp paths
 // - doctest_*: doctor test helpers
 // - doctortest_*: doctor test helpers
-// - beads_pt*: gastown patrol_helpers_test.go random prefixes
-// - beads_vr*: gastown mail/router_test.go random prefixes
+// - beads_pt*: orchestrator patrol_helpers_test.go random prefixes
+// - beads_vr*: orchestrator mail/router_test.go random prefixes
 // - beads_t[0-9a-f]*: protocol test random prefixes (t + 8 hex chars)
 var staleDatabasePrefixes = []string{
 	"testdb_",

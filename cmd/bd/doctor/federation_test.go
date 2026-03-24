@@ -67,7 +67,7 @@ func TestCheckFederationRemotesAPI_NoDoltDatabase(t *testing.T) {
 }
 
 func TestCheckFederationRemotesAPI_ServerNotRunning(t *testing.T) {
-	// Isolate from Gas Town daemon which would be detected as a running server
+	// Isolate from orchestrator daemon which would be detected as a running server
 	t.Setenv("GT_ROOT", "")
 
 	tmpDir := t.TempDir()
@@ -96,8 +96,60 @@ func TestCheckFederationRemotesAPI_ServerNotRunning(t *testing.T) {
 	}
 }
 
+func TestDoltServerConfig_EnablesCLIAutoStartWithConfiguredPort(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_AUTO_START", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configfile.Config{
+		Backend:        configfile.BackendDolt,
+		DoltDatabase:   "beads_test",
+		DoltServerPort: 12345,
+	}
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := doltServerConfig(beadsDir, filepath.Join(beadsDir, "dolt"))
+	if !result.AutoStart {
+		t.Fatal("doltServerConfig should enable CLI auto-start even with a configured server port")
+	}
+}
+
+func TestDoltServerConfig_HonorsAutoStartOptOut(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_AUTO_START", "0")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configfile.Config{
+		Backend:        configfile.BackendDolt,
+		DoltDatabase:   "beads_test",
+		DoltServerPort: 12345,
+	}
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := doltServerConfig(beadsDir, filepath.Join(beadsDir, "dolt"))
+	if result.AutoStart {
+		t.Fatal("doltServerConfig should honor BEADS_DOLT_AUTO_START=0")
+	}
+}
+
 func TestCheckFederationRemotesAPI_PidFileInBeadsDir(t *testing.T) {
-	// Isolate from Gas Town daemon which would be detected as a running server
+	// Isolate from orchestrator daemon which would be detected as a running server
 	t.Setenv("GT_ROOT", "")
 
 	// Verify the fix: PID file should be looked for in beadsDir, not doltPath.
@@ -445,7 +497,7 @@ func TestDoltDatabaseName_FromConfig(t *testing.T) {
 // returns StatusOK instead of erroring about the remotesapi port.
 // This is the bug described in GH#2273.
 func TestCheckFederationRemotesAPI_ServerRunningNoPeers(t *testing.T) {
-	// Isolate from Gas Town daemon — we'll simulate "server running" via
+	// Isolate from orchestrator daemon — we'll simulate "server running" via
 	// a standalone PID file pointing at a real dolt process on the host.
 	t.Setenv("GT_ROOT", "")
 

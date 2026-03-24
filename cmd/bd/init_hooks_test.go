@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -190,6 +192,65 @@ func TestGenerateHookSection(t *testing.T) {
 	expectedEnd := hookSectionEndLine()
 	if !strings.Contains(section, expectedEnd) {
 		t.Errorf("section missing versioned end marker %q\ngot:\n%s", expectedEnd, section)
+	}
+}
+
+// TestGenerateHookSection_Timeout verifies the timeout wrapper around bd hooks run (GH#2453).
+func TestGenerateHookSection_Timeout(t *testing.T) {
+	section := generateHookSection("pre-push")
+
+	// Must use shell timeout command with configurable duration
+	if !strings.Contains(section, "BEADS_HOOK_TIMEOUT") {
+		t.Error("section missing BEADS_HOOK_TIMEOUT env var")
+	}
+	if !strings.Contains(section, fmt.Sprintf("%d", hookTimeoutSeconds)) {
+		t.Errorf("section missing default timeout %d", hookTimeoutSeconds)
+	}
+	if !strings.Contains(section, "command -v timeout") {
+		t.Error("section missing timeout availability check")
+	}
+
+	// Timeout exit code (124) must be handled gracefully — continue, don't block git
+	if !strings.Contains(section, "_bd_exit -eq 124") {
+		t.Error("section missing timeout exit code handling")
+	}
+	if !strings.Contains(section, "timed out") {
+		t.Error("section missing timeout warning message")
+	}
+
+	// Fallback path when timeout command is not available (e.g. macOS without coreutils)
+	if !strings.Contains(section, "else") {
+		t.Error("section missing fallback for systems without timeout command")
+	}
+}
+
+// TestGenerateHookSection_DBNotInitialized verifies exit code 3 handling (GH#2449).
+func TestGenerateHookSection_DBNotInitialized(t *testing.T) {
+	section := generateHookSection("pre-commit")
+
+	// Exit code 3 = beads database not initialized; hook must continue gracefully
+	if !strings.Contains(section, "_bd_exit -eq 3") {
+		t.Error("section missing exit code 3 (DB not initialized) handling")
+	}
+	if !strings.Contains(section, "database not initialized") {
+		t.Error("section missing DB-not-initialized warning message")
+	}
+
+	// After handling exit code 3, the effective exit must be 0 (success)
+	// Verify the pattern: set _bd_exit=0 after detecting code 3
+	if !strings.Contains(section, "if [ $_bd_exit -eq 3 ]; then") {
+		t.Error("section missing exit code 3 conditional")
+	}
+}
+
+// TestGenerateHookSection_HookNameInMessages verifies hook name appears in warning messages.
+func TestGenerateHookSection_HookNameInMessages(t *testing.T) {
+	for _, hook := range managedHookNames {
+		section := generateHookSection(hook)
+		// Each hook's timeout and DB-missing messages should include the hook name
+		if !strings.Contains(section, "hook '"+hook+"'") {
+			t.Errorf("section for %q missing hook name in warning messages", hook)
+		}
 	}
 }
 
@@ -623,6 +684,240 @@ func TestUninstallHooksRemovesEmptyFile(t *testing.T) {
 		// File should be removed entirely (only shebang left)
 		if _, err := os.Stat(preCommitPath); !os.IsNotExist(err) {
 			t.Error("hook file with only shebang should be removed entirely")
+		}
+	})
+}
+
+// TestConfigureBeadsHooksPath_AbsolutePath verifies that core.hooksPath is set to
+// an absolute path so that git worktrees can find the hooks directory (GH#2414).
+func TestConfigureBeadsHooksPath_AbsolutePath(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+		// Create .beads/hooks/ directory
+		beadsHooksDir := filepath.Join(tmpDir, ".beads", "hooks")
+		if err := os.MkdirAll(beadsHooksDir, 0750); err != nil {
+			t.Fatalf("Failed to create .beads/hooks/: %v", err)
+		}
+
+		if err := configureBeadsHooksPath(); err != nil {
+			t.Fatalf("configureBeadsHooksPath() failed: %v", err)
+		}
+
+		// Read back core.hooksPath
+		out, err := exec.Command("git", "config", "--get", "core.hooksPath").Output()
+		if err != nil {
+			t.Fatalf("git config --get core.hooksPath failed: %v", err)
+		}
+		hooksPath := strings.TrimSpace(string(out))
+
+		// Must be absolute
+		if !filepath.IsAbs(hooksPath) {
+			t.Errorf("core.hooksPath should be absolute, got %q", hooksPath)
+		}
+
+		// Must point to .beads/hooks
+		if !strings.HasSuffix(hooksPath, filepath.Join(".beads", "hooks")) {
+			t.Errorf("core.hooksPath should end with .beads/hooks, got %q", hooksPath)
+		}
+	})
+}
+
+// TestInstallHooksBeads_WorktreeAccess verifies that hooks installed with --beads
+// are accessible from a git worktree (GH#2414).
+func TestInstallHooksBeads_WorktreeAccess(t *testing.T) {
+	tmpDir := newGitRepo(t)
+	runInDir(t, tmpDir, func() {
+		// Create .beads/ directory with metadata.json (needed for FindBeadsDir)
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0750); err != nil {
+			t.Fatalf("Failed to create .beads/: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{}`), 0644); err != nil {
+			t.Fatalf("Failed to create metadata.json: %v", err)
+		}
+
+		// Install hooks with --beads
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
+		}
+
+		// Verify hooks exist in .beads/hooks/
+		for _, hookName := range managedHookNames {
+			hookPath := filepath.Join(beadsDir, "hooks", hookName)
+			if _, err := os.Stat(hookPath); err != nil {
+				t.Errorf("hook %s not found at %s", hookName, hookPath)
+			}
+		}
+
+		// Read core.hooksPath and verify it's absolute
+		out, err := exec.Command("git", "config", "--get", "core.hooksPath").Output()
+		if err != nil {
+			t.Fatalf("core.hooksPath not set after --beads install: %v", err)
+		}
+		hooksPath := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(hooksPath) {
+			t.Errorf("core.hooksPath should be absolute for worktree compatibility, got %q", hooksPath)
+		}
+
+		// Create a worktree and verify hooks are accessible from it
+		worktreeDir := filepath.Join(t.TempDir(), "worktree")
+		cmd := exec.Command("git", "worktree", "add", worktreeDir, "-b", "test-worktree")
+		cmd.Dir = tmpDir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add failed: %v\n%s", err, string(output))
+		}
+		defer func() {
+			exec.Command("git", "worktree", "remove", worktreeDir).Run()
+		}()
+
+		// From the worktree, core.hooksPath should resolve to the same hooks
+		cmd = exec.Command("git", "config", "--get", "core.hooksPath")
+		cmd.Dir = worktreeDir
+		wtOut, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("core.hooksPath not visible from worktree: %v", err)
+		}
+		wtHooksPath := strings.TrimSpace(string(wtOut))
+
+		if wtHooksPath != hooksPath {
+			t.Errorf("worktree core.hooksPath = %q, want %q", wtHooksPath, hooksPath)
+		}
+
+		// The hooks directory must actually exist at the resolved path
+		if _, err := os.Stat(wtHooksPath); err != nil {
+			t.Errorf("hooks directory not accessible from worktree at %q: %v", wtHooksPath, err)
+		}
+
+		// Verify a specific hook file exists
+		preCommitPath := filepath.Join(wtHooksPath, "pre-commit")
+		if _, err := os.Stat(preCommitPath); err != nil {
+			t.Errorf("pre-commit hook not accessible from worktree: %v", err)
+		}
+	})
+}
+
+// setupBeadsDir creates .beads/ with a minimal metadata.json so FindBeadsDir works.
+func setupBeadsDir(t *testing.T, repoDir string) string {
+	t.Helper()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads/: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatalf("failed to create metadata.json: %v", err)
+	}
+	return beadsDir
+}
+
+// TestInstallHooksBeads_PreservesGlobalHooks is a regression test: bd init sets
+// a local core.hooksPath that shadows the global one, silently killing global
+// hooks. The fix copies hooks from the effective directory before overriding.
+func TestInstallHooksBeads_PreservesGlobalHooks(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(fakeHome, ".gitconfig"))
+
+	globalHooksDir := filepath.Join(fakeHome, "global-hooks")
+	if err := os.MkdirAll(globalHooksDir, 0755); err != nil {
+		t.Fatalf("failed to create global hooks dir: %v", err)
+	}
+	globalHookContent := "#!/bin/sh\necho global-hook-marker\n"
+	if err := os.WriteFile(filepath.Join(globalHooksDir, "pre-commit"), []byte(globalHookContent), 0755); err != nil {
+		t.Fatalf("failed to write global pre-commit hook: %v", err)
+	}
+
+	setGlobal := exec.Command("git", "config", "--global", "core.hooksPath", globalHooksDir)
+	if out, err := setGlobal.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set global core.hooksPath: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	// Manual repo init (can't use newGitRepo which sets a local core.hooksPath).
+	repoDir := t.TempDir()
+	initCmd := exec.Command("git", "init", "--initial-branch=main")
+	initCmd.Dir = repoDir
+	if err := initCmd.Run(); err != nil {
+		t.Fatalf("git init failed: %v", err)
+	}
+	for _, args := range [][]string{
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git config %v failed: %v", args, err)
+		}
+	}
+
+	runInDir(t, repoDir, func() {
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
+		}
+
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("failed to read .beads/hooks/pre-commit: %v", err)
+		}
+		contentStr := string(content)
+
+		if !strings.Contains(contentStr, "echo global-hook-marker") {
+			t.Errorf("global hook content not preserved in .beads/hooks/pre-commit.\nGot:\n%s", contentStr)
+		}
+		if !strings.Contains(contentStr, hookSectionBeginPrefix) {
+			t.Errorf("beads section marker missing.\nGot:\n%s", contentStr)
+		}
+	})
+}
+
+// TestInstallHooksBeads_PreservesDefaultGitHooks verifies that hooks in the
+// default .git/hooks/ directory (both managed and non-managed) are preserved
+// when beads redirects core.hooksPath to .beads/hooks/.
+func TestInstallHooksBeads_PreservesDefaultGitHooks(t *testing.T) {
+	repoDir := newGitRepo(t)
+	runInDir(t, repoDir, func() {
+		hooksDir := filepath.Join(repoDir, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0755); err != nil {
+			t.Fatalf("failed to create .git/hooks: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte("#!/bin/sh\necho custom-default-hook\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(hooksDir, "commit-msg"), []byte("#!/bin/sh\necho commit-msg-hook\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Unset the local core.hooksPath that newGitRepo sets so git falls back to .git/hooks/.
+		exec.Command("git", "config", "--unset", "core.hooksPath").Run()
+
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
+		}
+
+		// Managed hook: should be preserved with beads section injected.
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("failed to read .beads/hooks/pre-commit: %v", err)
+		}
+		contentStr := string(content)
+		if !strings.Contains(contentStr, "echo custom-default-hook") {
+			t.Errorf(".git/hooks/pre-commit content not preserved.\nGot:\n%s", contentStr)
+		}
+		if !strings.Contains(contentStr, hookSectionBeginPrefix) {
+			t.Errorf("beads section marker missing.\nGot:\n%s", contentStr)
+		}
+
+		// Non-managed hook: should be copied as-is.
+		cmContent, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "commit-msg"))
+		if err != nil {
+			t.Fatalf("non-managed hook commit-msg not copied to .beads/hooks/: %v", err)
+		}
+		if !strings.Contains(string(cmContent), "echo commit-msg-hook") {
+			t.Errorf("Unmanaged hook content not preserved.\nGot:\n%s", string(cmContent))
 		}
 	})
 }

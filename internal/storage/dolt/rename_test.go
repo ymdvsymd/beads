@@ -37,7 +37,7 @@ func TestUpdateIssueIDUpdatesWispTables(t *testing.T) {
 		IssueType: types.TypeTask,
 		Ephemeral: true,
 	}
-	if err := store.createWisp(ctx, wisp, "test"); err != nil {
+	if err := store.CreateIssue(ctx, wisp, "test"); err != nil {
 		t.Fatalf("failed to create wisp: %v", err)
 	}
 
@@ -60,7 +60,7 @@ func TestUpdateIssueIDUpdatesWispTables(t *testing.T) {
 		IssueType: types.TypeTask,
 		Ephemeral: true,
 	}
-	if err := store.createWisp(ctx, wisp2, "test"); err != nil {
+	if err := store.CreateIssue(ctx, wisp2, "test"); err != nil {
 		t.Fatalf("failed to create wisp2: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestUpdateIssueIDUpdatesWispTables(t *testing.T) {
 	}
 
 	// Add a wisp label for the old issue ID
-	if err := store.addWispLabel(ctx, "test-old1", "bug", "test"); err != nil {
+	if err := store.AddLabel(ctx, "test-old1", "bug", "test"); err != nil {
 		t.Fatalf("failed to add wisp label: %v", err)
 	}
 
@@ -187,8 +187,8 @@ func TestUpdateIssueIDRenamesWisp(t *testing.T) {
 		IssueType: types.TypeTask,
 		Ephemeral: true,
 	}
-	if err := store.createWisp(ctx, wisp, "tester"); err != nil {
-		t.Fatalf("createWisp failed: %v", err)
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("CreateIssue (wisp) failed: %v", err)
 	}
 	oldID := wisp.ID
 	if oldID == "" {
@@ -211,7 +211,7 @@ func TestUpdateIssueIDRenamesWisp(t *testing.T) {
 	}
 
 	// Add a label to the wisp
-	if err := store.addWispLabel(ctx, oldID, "test-label", "tester"); err != nil {
+	if err := store.AddLabel(ctx, oldID, "test-label", "tester"); err != nil {
 		t.Fatalf("failed to add wisp label: %v", err)
 	}
 

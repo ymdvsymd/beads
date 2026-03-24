@@ -590,7 +590,7 @@ func (s *configStore) GetIssueComments(_ context.Context, _ string) ([]*types.Co
 func (s *configStore) GetEvents(_ context.Context, _ string, _ int) ([]*types.Event, error) {
 	return nil, nil
 }
-func (s *configStore) GetAllEventsSince(_ context.Context, _ int64) ([]*types.Event, error) {
+func (s *configStore) GetAllEventsSince(_ context.Context, _ time.Time) ([]*types.Event, error) {
 	return nil, nil
 }
 func (s *configStore) GetStatistics(_ context.Context) (*types.Statistics, error) { return nil, nil }
@@ -598,6 +598,88 @@ func (s *configStore) RunInTransaction(_ context.Context, _ string, _ func(tx st
 	return nil
 }
 func (s *configStore) Close() error { return nil }
+
+func TestFetchIssuesIncludesPullJQLInQuery(t *testing.T) {
+	var capturedJQL string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rest/api/3/search/jql" {
+			capturedJQL = r.URL.Query().Get("jql")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"issues":     []Issue{},
+				"total":      0,
+				"maxResults": 50,
+				"startAt":    0,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	store := &configStore{
+		data: map[string]string{
+			"jira.pull_jql": `labels = "agent-ready"`,
+		},
+	}
+
+	tr := &Tracker{
+		client:     newTestClient(srv.URL, "3"),
+		store:      store,
+		projectKey: "TEST",
+		apiVersion: "3",
+	}
+
+	_, err := tr.FetchIssues(context.Background(), tracker.FetchOptions{State: "open"})
+	if err != nil {
+		t.Fatalf("FetchIssues error: %v", err)
+	}
+
+	if !strings.Contains(capturedJQL, `labels = "agent-ready"`) {
+		t.Errorf("JQL should contain pull_jql filter, got: %s", capturedJQL)
+	}
+}
+
+func TestFetchIssuesWithoutPullJQLOmitsExtraFilter(t *testing.T) {
+	var capturedJQL string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rest/api/3/search/jql" {
+			capturedJQL = r.URL.Query().Get("jql")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"issues":     []Issue{},
+				"total":      0,
+				"maxResults": 50,
+				"startAt":    0,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	store := &configStore{
+		data: map[string]string{},
+	}
+
+	tr := &Tracker{
+		client:     newTestClient(srv.URL, "3"),
+		store:      store,
+		projectKey: "TEST",
+		apiVersion: "3",
+	}
+
+	_, err := tr.FetchIssues(context.Background(), tracker.FetchOptions{State: "open"})
+	if err != nil {
+		t.Fatalf("FetchIssues error: %v", err)
+	}
+
+	if strings.Contains(capturedJQL, "agent-ready") {
+		t.Errorf("JQL should NOT contain pull_jql filter when unconfigured, got: %s", capturedJQL)
+	}
+}
 
 func TestInitLoadsCustomStatusMapFromAllConfig(t *testing.T) {
 	store := &configStore{
@@ -633,5 +715,54 @@ func TestInitLoadsCustomStatusMapFromAllConfig(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("StatusToTracker(%q) = %q, want %q", tt.status, got, tt.want)
 		}
+	}
+}
+
+func TestInitLoadsCustomTypeMapFromAllConfig(t *testing.T) {
+	store := &configStore{
+		data: map[string]string{
+			"jira.url":              "https://example.atlassian.net",
+			"jira.project":          "PROJ",
+			"jira.api_token":        "token123",
+			"jira.type_map.story":   "User Story",
+			"jira.type_map.feature": "Feature",
+		},
+	}
+
+	tr := &Tracker{}
+	if err := tr.Init(context.Background(), store); err != nil {
+		t.Fatalf("Init error: %v", err)
+	}
+
+	mapper := tr.FieldMapper()
+
+	// Custom "story" type should map from Jira "User Story"
+	got := mapper.TypeToBeads("User Story")
+	if got != "story" {
+		t.Errorf("TypeToBeads(\"User Story\") = %q, want %q", got, "story")
+	}
+
+	// Custom "feature" should map from Jira "Feature"
+	got = mapper.TypeToBeads("Feature")
+	if got != "feature" {
+		t.Errorf("TypeToBeads(\"Feature\") = %q, want %q", got, "feature")
+	}
+
+	// Unmapped Jira types fall back to defaults
+	got = mapper.TypeToBeads("Bug")
+	if got != types.TypeBug {
+		t.Errorf("TypeToBeads(\"Bug\") = %q, want %q", got, types.TypeBug)
+	}
+
+	// Reverse: custom "story" → "User Story"
+	gotTracker, _ := mapper.TypeToTracker("story").(string)
+	if gotTracker != "User Story" {
+		t.Errorf("TypeToTracker(\"story\") = %q, want %q", gotTracker, "User Story")
+	}
+
+	// Reverse: unmapped "epic" falls back to default "Epic"
+	gotTracker, _ = mapper.TypeToTracker(types.TypeEpic).(string)
+	if gotTracker != "Epic" {
+		t.Errorf("TypeToTracker(epic) = %q, want %q", gotTracker, "Epic")
 	}
 }

@@ -37,7 +37,7 @@ Examples:
 
 		if store == nil {
 			FatalErrorWithHint("database not initialized",
-				"run 'bd init' to create a database")
+				"run 'bd doctor' to diagnose, or 'bd init' to create a new database")
 		}
 
 		// Handle cross-rig routing
@@ -76,6 +76,13 @@ Examples:
 		}
 		if err := store.AddComment(ctx, fullID, actor, comment); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to add promotion comment to %s: %v\n", fullID, err)
+		}
+
+		// Embedded mode: flush Dolt commit.
+		if isEmbeddedDolt && store != nil {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
+				FatalErrorRespectJSON("failed to commit: %v", err)
+			}
 		}
 
 		if jsonOutput {
@@ -117,6 +124,13 @@ func promoteRouted(id, reason string) {
 	}
 	if err := result.Store.AddComment(rootCtx, result.ResolvedID, actor, comment); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to add promotion comment to %s: %v\n", id, err)
+	}
+
+	// Embedded mode: flush Dolt commit.
+	if isEmbeddedDolt {
+		if _, err := result.Store.CommitPending(rootCtx, actor); err != nil {
+			FatalErrorRespectJSON("failed to commit: %v", err)
+		}
 	}
 
 	if jsonOutput {

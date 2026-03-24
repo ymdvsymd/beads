@@ -37,6 +37,7 @@ func doltServerConfig(beadsDir, doltPath string) *dolt.Config {
 		cfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
 		cfg.ServerUser = bcfg.GetDoltServerUser()
 	}
+	dolt.ApplyCLIAutoStart(beadsDir, cfg)
 	return cfg
 }
 
@@ -68,7 +69,7 @@ func CheckFederationRemotesAPI(path string) DoctorCheck {
 
 	// Check if dolt server is running using doltserver.IsRunning which
 	// correctly resolves PID file paths (in beadsDir, not doltPath)
-	// and handles Gas Town daemon PID files.
+	// and handles orchestrator daemon PID files.
 	serverState, _ := doltserver.IsRunning(beadsDir)
 	serverRunning := serverState != nil && serverState.Running
 

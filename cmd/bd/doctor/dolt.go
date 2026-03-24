@@ -24,22 +24,21 @@ func openDoltDB(beadsDir string) (*sql.DB, *configfile.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("no beads configuration found in %s", beadsDir)
+	}
 
-	host := configfile.DefaultDoltServerHost
-	user := configfile.DefaultDoltServerUser
-	database := configfile.DefaultDoltDatabase
+	host := cfg.GetDoltServerHost()
+	user := cfg.GetDoltServerUser()
+	database := cfg.GetDoltDatabase()
 	password := os.Getenv("BEADS_DOLT_PASSWORD")
 
-	// Use doltserver.DefaultConfig for port resolution (env > config > Gas Town > DerivePort).
-	// cfg.GetDoltServerPort() is deprecated — it falls back to 3307 which is wrong
-	// for standalone mode where the port is hash-derived from the project path.
+	// Use doltserver.DefaultConfig for port resolution (env > port file > config.yaml).
+	// Port 0 means no server running yet.
 	dsCfg := doltserver.DefaultConfig(beadsDir)
 	port := dsCfg.Port
-
-	if cfg != nil {
-		host = cfg.GetDoltServerHost()
-		user = cfg.GetDoltServerUser()
-		database = cfg.GetDoltDatabase()
+	if port == 0 {
+		return nil, nil, fmt.Errorf("no Dolt server port configured and no server running; run any bd command to auto-start")
 	}
 
 	var connStr string
@@ -124,7 +123,7 @@ func RunDoltHealthChecks(path string) []DoctorCheck {
 // CheckLockHealth before any checks that open embedded Dolt databases,
 // avoiding false positives from doctor's own noms LOCK files (GH#1981).
 func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	if !IsDoltBackend(beadsDir) {
 		return []DoctorCheck{
@@ -134,11 +133,33 @@ func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorChe
 			{Name: "Dolt Status", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryData},
 			{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryRuntime},
 			{Name: "Phantom Databases", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryData},
+			{Name: "Shared Server", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryRuntime},
 		}
 	}
 
 	conn, err := openDoltConn(beadsDir)
 	if err != nil {
+		// GH#2722: When no server is running and the mode is not external
+		// (i.e., no expectation of a persistent server), skip server-dependent
+		// checks gracefully instead of reporting false errors. The SharedStore-
+		// based embedded checks already validate data integrity; the server
+		// will auto-start on the next bd command.
+		serverMode := doltserver.DefaultConfig(beadsDir).Mode
+		if serverMode != doltserver.ServerModeExternal {
+			skipMsg := "Skipped (no server running; will auto-start on next bd command)"
+			return []DoctorCheck{
+				{Name: "Dolt Connection", Status: StatusOK, Message: skipMsg, Category: CategoryCore},
+				{Name: "Dolt Schema", Status: StatusOK, Message: skipMsg, Category: CategoryCore},
+				{Name: "Dolt Issue Count", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				{Name: "Dolt Status", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				lockCheck,
+				{Name: "Phantom Databases", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				checkSharedServerHealth(beadsDir),
+			}
+		}
+
+		// External/shared server mode: a server is expected to be running,
+		// so connection failure is a real error.
 		connErr := err.Error()
 		return []DoctorCheck{
 			{Name: "Dolt Connection", Status: StatusError, Message: "Failed to connect to Dolt server", Detail: connErr, Fix: "Ensure dolt sql-server is running, or check server host/port configuration", Category: CategoryCore},
@@ -147,6 +168,7 @@ func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorChe
 			{Name: "Dolt Status", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryData},
 			lockCheck,
 			{Name: "Phantom Databases", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryData},
+			checkSharedServerHealth(beadsDir),
 		}
 	}
 	defer conn.Close()
@@ -158,6 +180,7 @@ func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorChe
 		checkStatusWithDB(conn),
 		lockCheck,
 		checkPhantomDatabases(conn),
+		checkSharedServerHealth(beadsDir),
 	}
 }
 
@@ -194,7 +217,7 @@ func checkConnectionWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltConnection(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run this check for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -458,7 +481,7 @@ func checkStatusWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltStatus(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -489,7 +512,7 @@ func CheckDoltStatus(path string) DoctorCheck {
 // It probes for stale noms LOCK files and checks whether the advisory lock
 // is currently held, providing actionable guidance when issues are found.
 func CheckLockHealth(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	if !IsDoltBackend(beadsDir) {
 		return DoctorCheck{
@@ -685,4 +708,64 @@ func probeForCorrectDatabase(conn *doltConn) string {
 	}
 
 	return ""
+}
+
+// checkSharedServerHealth verifies shared server configuration and health.
+func checkSharedServerHealth(beadsDir string) DoctorCheck {
+	if !doltserver.IsSharedServerMode() {
+		return DoctorCheck{
+			Name:     "Shared Server",
+			Status:   StatusOK,
+			Message:  "N/A (per-project mode)",
+			Category: CategoryRuntime,
+		}
+	}
+
+	sharedDir, err := doltserver.SharedServerDir()
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Shared Server",
+			Status:   StatusError,
+			Message:  "Cannot access shared server directory",
+			Detail:   err.Error(),
+			Fix:      "Ensure ~/.beads/shared-server/ is writable",
+			Category: CategoryRuntime,
+		}
+	}
+
+	state, err := doltserver.IsRunning(sharedDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Shared Server",
+			Status:   StatusWarning,
+			Message:  "Cannot check shared server status",
+			Detail:   err.Error(),
+			Category: CategoryRuntime,
+		}
+	}
+
+	if state == nil || !state.Running {
+		return DoctorCheck{
+			Name:     "Shared Server",
+			Status:   StatusWarning,
+			Message:  "Shared server not running (will auto-start on next bd command)",
+			Detail:   fmt.Sprintf("Server directory: %s", sharedDir),
+			Fix:      "Run 'bd dolt start' to start the shared server",
+			Category: CategoryRuntime,
+		}
+	}
+
+	cfg, _ := configfile.Load(beadsDir)
+	dbName := configfile.DefaultDoltDatabase
+	if cfg != nil {
+		dbName = cfg.GetDoltDatabase()
+	}
+
+	return DoctorCheck{
+		Name:     "Shared Server",
+		Status:   StatusOK,
+		Message:  fmt.Sprintf("Running (PID %d, port %d), database: %s", state.PID, state.Port, dbName),
+		Detail:   fmt.Sprintf("Server directory: %s", sharedDir),
+		Category: CategoryRuntime,
+	}
 }

@@ -25,6 +25,21 @@ import (
 // driver's async operations rather than with the DoltStore implementation.
 const testTimeout = 30 * time.Second
 
+// testSem limits concurrent database-touching tests to avoid overwhelming the
+// shared Dolt testcontainer. Without this, 200+ parallel tests cause a
+// connection storm that crashes the container. Size 6 is conservative —
+// the container handles ~10 concurrent connections but we leave headroom.
+var testSem = make(chan struct{}, 2)
+
+// acquireTestSlot blocks until a semaphore slot is available.
+// Must be called AFTER t.Parallel() to avoid deadlocks (t.Parallel suspends
+// the goroutine, and if it holds a semaphore slot while suspended, other
+// tests can't proceed).
+func acquireTestSlot() { testSem <- struct{}{} }
+
+// releaseTestSlot returns a semaphore slot.
+func releaseTestSlot() { <-testSem }
+
 // testContext returns a context with timeout for test operations
 func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -67,6 +82,11 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	t.Helper()
 	skipIfNoDolt(t)
 	t.Parallel()
+
+	// Acquire AFTER t.Parallel() to avoid deadlock — t.Parallel() suspends
+	// the goroutine until the parent test finishes its sequential phase.
+	acquireTestSlot()
+	t.Cleanup(releaseTestSlot) // guaranteed even on panic/Fatalf
 
 	if testSharedDB == "" {
 		t.Fatal("testSharedDB not set — TestMain did not initialize shared database")
@@ -119,9 +139,12 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 // setupConcurrentTestStore creates a test store with its own database for
 // concurrent tests that need multiple connections. Branch-per-test isolation
 // requires MaxOpenConns=1, which prevents concurrent transactions.
+// MaxOpenConns is limited to 3 to avoid overwhelming the test container.
 func setupConcurrentTestStore(t *testing.T) (*DoltStore, func()) {
 	t.Helper()
 	skipIfNoDolt(t)
+	acquireTestSlot()
+	t.Cleanup(releaseTestSlot)
 
 	ctx, cancel := testContext(t)
 	defer cancel()
@@ -138,6 +161,7 @@ func setupConcurrentTestStore(t *testing.T) (*DoltStore, func()) {
 		CommitterName:   "test",
 		CommitterEmail:  "test@example.com",
 		Database:        dbName,
+		MaxOpenConns:    2,    // limit to avoid overwhelming the test container
 		CreateIfMissing: true, // tests create fresh databases
 	}
 
@@ -146,6 +170,9 @@ func setupConcurrentTestStore(t *testing.T) (*DoltStore, func()) {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("failed to create Dolt store: %v", err)
 	}
+	// Close idle connections immediately to reduce container pressure.
+	store.db.SetMaxIdleConns(0)
+	store.db.SetConnMaxIdleTime(time.Second)
 
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		store.Close()
@@ -154,9 +181,8 @@ func setupConcurrentTestStore(t *testing.T) (*DoltStore, func()) {
 	}
 
 	cleanup := func() {
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer dropCancel()
-		_, _ = store.db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
+		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
+		// Orphan databases are cleaned up when the container is terminated.
 		store.Close()
 		os.RemoveAll(tmpDir)
 	}
@@ -355,8 +381,8 @@ func TestCreateWispNoDoubleHyphen(t *testing.T) {
 		IssueType: types.TypeBug,
 		Ephemeral: true,
 	}
-	if err := store.createWisp(ctx, wisp, "test-user"); err != nil {
-		t.Fatalf("createWisp failed: %v", err)
+	if err := store.CreateIssue(ctx, wisp, "test-user"); err != nil {
+		t.Fatalf("CreateIssue (wisp) failed: %v", err)
 	}
 
 	// Wisp ID should contain "gt-wisp-" not "gt--wisp-"
@@ -385,8 +411,8 @@ func TestCreateWispNoDoublePrefix(t *testing.T) {
 		Ephemeral: true,
 		IDPrefix:  "wisp", // Set by cloneSubgraph for wisp molecules
 	}
-	if err := store.createWisp(ctx, wisp, "test-user"); err != nil {
-		t.Fatalf("createWisp failed: %v", err)
+	if err := store.CreateIssue(ctx, wisp, "test-user"); err != nil {
+		t.Fatalf("CreateIssue (wisp) failed: %v", err)
 	}
 
 	// ID should be "<prefix>-wisp-<hash>", NOT "<prefix>-wisp-wisp-<hash>"
@@ -615,8 +641,15 @@ func TestClosePromotedWisp(t *testing.T) {
 		IssueType: types.TypeTask,
 		Ephemeral: true,
 	}
-	if err := store.createWisp(ctx, wisp, "tester"); err != nil {
-		t.Fatalf("createWisp failed: %v", err)
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("CreateIssue (wisp) failed: %v", err)
+	}
+	got, err := store.GetIssue(ctx, wisp.ID)
+	if err != nil {
+		t.Fatalf("GetIssue failed for promoted wisp: %v", err)
+	}
+	if got.ID != wisp.ID {
+		t.Fatalf("GetIssue returned wrong ID: %q vs %q", got.ID, wisp.ID)
 	}
 	if !IsEphemeralID(wisp.ID) {
 		t.Fatalf("expected wisp ID to match ephemeral pattern, got %q", wisp.ID)
@@ -631,7 +664,7 @@ func TestClosePromotedWisp(t *testing.T) {
 	if store.isActiveWisp(ctx, wisp.ID) {
 		t.Fatal("promoted wisp should not be active in wisps table")
 	}
-	got, err := store.GetIssue(ctx, wisp.ID)
+	got, err = store.GetIssue(ctx, wisp.ID)
 	if err != nil {
 		t.Fatalf("GetIssue failed for promoted wisp: %v", err)
 	}
@@ -728,14 +761,15 @@ func TestDoltStoreDependencies(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	// Create parent and child issues
+	// Create parent and child issues (both tasks — cross-type blocking
+	// is disallowed per GH#1495)
 	parent := &types.Issue{
 		ID:          "test-parent",
 		Title:       "Parent Issue",
 		Description: "Parent description",
 		Status:      types.StatusOpen,
 		Priority:    1,
-		IssueType:   types.TypeEpic,
+		IssueType:   types.TypeTask,
 	}
 	child := &types.Issue{
 		ID:          "test-child",
@@ -954,7 +988,7 @@ func TestDoltStoreComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to add first comment: %v", err)
 	}
-	if comment1.ID == 0 {
+	if comment1.ID == "" {
 		t.Error("expected comment ID to be generated")
 	}
 
@@ -2119,8 +2153,8 @@ func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
 	defer cancel()
 
 	issue := &types.Issue{
-		ID:        "test-agent-max",
-		Title:     "Agent: test-agent-max",
+		ID:        "test-ephemeral-update",
+		Title:     "Ephemeral: test-ephemeral-update",
 		Status:    types.StatusOpen,
 		Priority:  2,
 		IssueType: types.TypeTask,
@@ -2132,19 +2166,19 @@ func TestEphemeralExplicitID_UpdateIssue(t *testing.T) {
 
 	// UpdateIssue should work (this was broken per GH#2053)
 	updates := map[string]interface{}{
-		"agent_state": "running",
+		"title": "Updated ephemeral title",
 	}
-	if err := store.UpdateIssue(ctx, "test-agent-max", updates, "test-user"); err != nil {
+	if err := store.UpdateIssue(ctx, "test-ephemeral-update", updates, "test-user"); err != nil {
 		t.Fatalf("UpdateIssue failed for ephemeral bead with explicit ID: %v", err)
 	}
 
 	// Verify the update persisted
-	got, err := store.GetIssue(ctx, "test-agent-max")
+	got, err := store.GetIssue(ctx, "test-ephemeral-update")
 	if err != nil {
 		t.Fatalf("GetIssue after update failed: %v", err)
 	}
-	if got.AgentState != "running" {
-		t.Errorf("Expected agent_state %q, got %q", "running", got.AgentState)
+	if got.Title != "Updated ephemeral title" {
+		t.Errorf("Expected title %q, got %q", "Updated ephemeral title", got.Title)
 	}
 }
 

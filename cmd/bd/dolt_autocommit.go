@@ -7,14 +7,14 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
 // transact wraps store.RunInTransaction and marks that a transactional
 // DOLT_COMMIT occurred, preventing the redundant maybeAutoCommit in
 // PersistentPostRun. Use this instead of calling store.RunInTransaction
 // directly from command handlers.
-func transact(ctx context.Context, s *dolt.DoltStore, commitMsg string, fn func(tx storage.Transaction) error) error {
+func transact(ctx context.Context, s storage.DoltStorage, commitMsg string, fn func(tx storage.Transaction) error) error {
 	err := s.RunInTransaction(ctx, commitMsg, fn)
 	if err == nil {
 		commandDidExplicitDoltCommit = true
@@ -36,7 +36,7 @@ type doltAutoCommitParams struct {
 // Semantics:
 //   - Only applies when dolt auto-commit is "on" AND the active store is versioned (Dolt).
 //   - In "batch" mode, commits are deferred — changes accumulate in the working set
-//     until an explicit commit point (bd sync, bd dolt commit).
+//     until an explicit commit point (bd dolt commit).
 //   - Uses Dolt's "commit all" behavior under the hood (DOLT_COMMIT -Am).
 //   - Treats "nothing to commit" as a no-op.
 func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
@@ -45,13 +45,16 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 		return err
 	}
 	// In batch mode, skip per-command commits. Changes stay in the working set
-	// and are committed at logical boundaries (bd sync, bd dolt commit).
+	// and are committed at logical boundaries (bd dolt commit).
 	if mode != doltAutoCommitOn {
 		return nil
 	}
 
 	st := getStore()
-	if st == nil || st.IsClosed() {
+	if st == nil {
+		return nil
+	}
+	if lm, ok := st.(storage.LifecycleManager); ok && lm.IsClosed() {
 		return nil
 	}
 
@@ -70,19 +73,7 @@ func maybeAutoCommit(ctx context.Context, p doltAutoCommitParams) error {
 }
 
 func isDoltNothingToCommit(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	// Dolt commonly reports "nothing to commit".
-	if strings.Contains(s, "nothing to commit") {
-		return true
-	}
-	// Some versions/paths may report "no changes".
-	if strings.Contains(s, "no changes") && strings.Contains(s, "commit") {
-		return true
-	}
-	return false
+	return issueops.IsNothingToCommitError(err)
 }
 
 func formatDoltAutoCommitMessage(cmd string, actor string, issueIDs []string) string {

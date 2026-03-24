@@ -8,17 +8,17 @@ Beads uses Dolt as its storage backend. Dolt provides a version-controlled SQL d
 - **Multi-writer support** — server mode enables concurrent agents
 - **Built-in history** — every write creates a Dolt commit
 - **Native branching** — Dolt branches independent of git branches
-- **Single-binary option** — embedded mode for solo users (no daemon needed)
+- **Single-binary option** — embedded mode for solo users (no server needed)
 
 ## Getting Started
 
 ### New Project
 
 ```bash
-# Embedded mode (single writer, no daemon — default for standalone)
+# Embedded mode (single writer, no server — default for standalone)
 bd init
 
-# Server mode (multi-writer, e.g. Gas Town)
+# Server mode (multi-writer, e.g. orchestrator)
 gt dolt start           # Start the Dolt server
 bd init --server        # Initialize with server mode
 ```
@@ -48,14 +48,14 @@ standalone Beads users. The `bd` binary includes everything; just `bd init` and 
 - Single-writer (one process at a time)
 - Data lives in `.beads/dolt/` alongside your code
 - Push to GitHub with `bd dolt push` — code and issues in one repo
-- Zero ops: no daemon, no ports, no PID files
+- Zero ops: no server, no ports, no PID files
 
-### Server Mode (Multi-Writer / Gas Town)
+### Server Mode (Multi-Writer / Orchestrator)
 
 Connects to a running `dolt sql-server` for multi-client access.
 
 ```bash
-# Start the server (Gas Town)
+# Start the server (orchestrator)
 gt dolt start
 
 # Or manually
@@ -73,7 +73,7 @@ dolt:
 
 Server mode is required for:
 - Multiple agents writing simultaneously
-- Gas Town multi-rig setups
+- Orchestrator multi-rig setups
 - Federation with remote peers
 
 ## Federation (Peer-to-Peer Sync)
@@ -84,7 +84,7 @@ Federation enables direct sync between Dolt installations without a central hub.
 
 ```
 ┌─────────────────┐         ┌─────────────────┐
-│   Gas Town A    │◄───────►│   Gas Town B    │
+│  Workspace A    │◄───────►│  Workspace B    │
 │  dolt sql-server│  sync   │  dolt sql-server│
 │  :3306 (sql)    │         │  :3306 (sql)    │
 │  :8080 (remote) │         │  :8080 (remote) │
@@ -147,16 +147,19 @@ bd federation status
 
 When someone clones a repository that uses Dolt backend:
 
-1. On first `bd` command (e.g., `bd list`), bootstrap runs automatically
-2. A fresh Dolt database is created
-3. If a Dolt remote is configured, data is pulled from the remote
-4. Work continues normally
+1. Run `bd bootstrap` in the clone
+2. If the git remote has `refs/dolt/data` (pushed via `bd dolt push`),
+   `bd bootstrap` auto-detects it and clones the database from the remote
+3. Work continues normally — all existing issues are available
 
-**No manual steps required.** The bootstrap:
-- Detects fresh clone (no Dolt database yet)
-- Acquires a lock to prevent race conditions
-- Initializes the Dolt database and pulls from configured remotes
-- Creates initial Dolt commit
+**No manual steps required** beyond `bd bootstrap`. The auto-detect:
+- Probes `origin` for `refs/dolt/data`
+- Clones the Dolt database from the remote (instead of creating a fresh one)
+- Configures the Dolt remote for future `bd dolt push`/`pull`
+
+If `sync.git-remote` is set in `.beads/config.yaml`, that takes precedence
+over auto-detection. `bd init` will warn if it detects `refs/dolt/data` on
+origin and suggest using `bd bootstrap` instead.
 
 ### Verifying Bootstrap Worked
 
@@ -177,7 +180,7 @@ failed to create database: dial tcp 127.0.0.1:3307: connect: connection refused
 
 **Fix:**
 ```bash
-gt dolt start        # Gas Town command
+gt dolt start        # Orchestrator command
 # Or
 gt dolt status       # Check if running
 ```
@@ -250,6 +253,14 @@ dolt:
   port: 3307
   user: root
   # Password via BEADS_DOLT_PASSWORD env var
+
+  # Shared server mode (GH#2377): all projects share a single Dolt server
+  # at ~/.beads/shared-server/. Each project uses its own database (prefix-based).
+  # Eliminates port conflicts and reduces resource usage on multi-project machines.
+  shared-server: false   # true | false
+
+  # Idle auto-stop timeout for the Dolt server (default: "30m", "0" disables)
+  idle-timeout: 30m
 ```
 
 ### Environment Variables
@@ -259,9 +270,10 @@ dolt:
 | `BEADS_DOLT_PASSWORD` | Server mode password |
 | `BEADS_DOLT_SERVER_MODE` | Enable server mode (set to "1") |
 | `BEADS_DOLT_SERVER_HOST` | Server host (default: 127.0.0.1) |
-| `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307) |
+| `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307, or 3308 in shared mode) |
 | `BEADS_DOLT_SERVER_TLS` | Enable TLS (set to "1" or "true") |
 | `BEADS_DOLT_SERVER_USER` | MySQL connection user |
+| `BEADS_DOLT_SHARED_SERVER` | Enable shared server mode (set to "1" or "true") |
 | `DOLT_REMOTE_USER` | Push/pull auth user |
 | `DOLT_REMOTE_PASSWORD` | Push/pull auth password |
 | `BD_DOLT_AUTO_COMMIT` | Override auto-commit setting |
@@ -289,7 +301,7 @@ In **embedded mode** (standalone default), each `bd` write command creates a Dol
 bd create "New issue"    # Creates issue + Dolt commit
 ```
 
-In **server mode** (Gas Town), auto-commit defaults to OFF because the server
+In **server mode** (orchestrator), auto-commit defaults to OFF because the server
 manages its own transaction lifecycle. Firing `DOLT_COMMIT` after every write
 under concurrent load causes 'database is read only' errors.
 
@@ -301,9 +313,9 @@ bd --dolt-auto-commit off create "Issue 2"
 bd vc commit -m "Batch: created issues"
 ```
 
-## Server Management (Gas Town)
+## Server Management (Orchestrator)
 
-Gas Town provides integrated Dolt server management:
+The orchestrator provides integrated Dolt server management:
 
 ```bash
 gt dolt start            # Start server (background)
@@ -315,15 +327,55 @@ gt dolt sql              # Open SQL shell
 
 Server runs on port 3307 (avoids MySQL conflict on 3306).
 
-### Data Location (Gas Town)
+### Shared Server Mode
+
+On machines with multiple beads projects, each project normally starts its own Dolt server.
+Shared server mode runs a single Dolt server at `~/.beads/shared-server/` that serves all projects:
+
+```bash
+# Enable for this project
+bd dolt set shared-server true
+
+# Or enable machine-wide via environment variable
+export BEADS_DOLT_SHARED_SERVER=1
+
+# Or enable during init
+bd init --prefix myproject --shared-server
+```
+
+**Benefits:**
+- No port conflicts between projects (single server on port 3308, avoids orchestrator on 3307)
+- Reduced resource usage (one process instead of many)
+- Automatic database isolation (each project uses its own database name)
+
+**How it works:**
+- Server state files (PID, port, lock, log) live in `~/.beads/shared-server/`
+- Dolt data directory: `~/.beads/shared-server/dolt/`
+- Each project's database is stored as a subdirectory (e.g., `~/.beads/shared-server/dolt/myproject/`)
+- The file lock mechanism ensures safe concurrent access from multiple projects
+- Default port is 3308 (not 3307) to avoid conflict with the orchestrator. Override with `BEADS_DOLT_SERVER_PORT` or `dolt.port` in config.yaml
+
+**Important:** Each project on a shared server **must have a unique prefix** (database name).
+Two projects with the same prefix share the same database — if this happens accidentally,
+the project identity check will detect the mismatch and refuse to connect, preventing
+silent data corruption. Always use distinct prefixes when running `bd init --shared-server`.
+
+```bash
+# Check shared server status from any project
+bd dolt status
+
+# Show full configuration including shared mode
+bd dolt show
+```
+
+### Data Location (Orchestrator)
 
 ```
-~/gt/.dolt-data/
+<town-root>/.dolt-data/
 ├── hq/                  # Town beads (hq-*)
-├── gastown/             # Gastown rig (gt-*)
+├── my-project/          # Project rig (mp-*)
 ├── beads/               # Beads rig (bd-*)
-├── wyvern/              # Wyvern rig (wy-*)
-└── sky/                 # Sky rig (sky-*)
+└── other-project/       # Other rig (op-*)
 ```
 
 ## Migration Cleanup
@@ -350,6 +402,7 @@ rm .beads/*.backup-*.db
 
 ## See Also
 
+- [SYNC_SETUP.md](SYNC_SETUP.md) - Setting up sync across multiple computers
 - [CONFIG.md](CONFIG.md) - Full configuration reference
 - [DEPENDENCIES.md](DEPENDENCIES.md) - Dependencies and gates
 - [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git worktrees and protected branches

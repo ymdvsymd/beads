@@ -12,12 +12,13 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // openStoreDB opens the beads database and returns the underlying *sql.DB for
 // raw queries. The caller must close the returned store when done.
-func openStoreDB(beadsDir string) (*sql.DB, *dolt.DoltStore, error) {
+func openStoreDB(beadsDir string) (*sql.DB, storage.DoltStorage, error) {
 	ctx := context.Background()
 	doltPath := getDatabasePath(beadsDir)
 	cfg := doltServerConfig(beadsDir, doltPath)
@@ -31,100 +32,6 @@ func openStoreDB(beadsDir string) (*sql.DB, *dolt.DoltStore, error) {
 		return nil, nil, fmt.Errorf("storage backend has no underlying database")
 	}
 	return db, store, nil
-}
-
-// CheckMergeArtifacts detects temporary git merge files in .beads directory.
-// These are created during git merges and should be cleaned up.
-func CheckMergeArtifacts(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:    "Merge Artifacts",
-			Status:  "ok",
-			Message: "N/A (no .beads directory)",
-		}
-	}
-
-	// Read patterns from .beads/.gitignore (merge artifacts section)
-	patterns, err := readMergeArtifactPatterns(beadsDir)
-	if err != nil {
-		// No .gitignore or can't read it - use default patterns
-		patterns = []string{
-			"*.base.jsonl",
-			"*.left.jsonl",
-			"*.right.jsonl",
-			"*.meta.json",
-		}
-	}
-
-	// Find matching files
-	var artifacts []string
-	for _, pattern := range patterns {
-		matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
-		if err != nil {
-			continue
-		}
-		artifacts = append(artifacts, matches...)
-	}
-
-	if len(artifacts) == 0 {
-		return DoctorCheck{
-			Name:    "Merge Artifacts",
-			Status:  "ok",
-			Message: "No merge artifacts found",
-		}
-	}
-
-	// Build list of relative paths for display
-	var relPaths []string
-	for _, f := range artifacts {
-		if rel, err := filepath.Rel(beadsDir, f); err == nil {
-			relPaths = append(relPaths, rel)
-		}
-	}
-
-	return DoctorCheck{
-		Name:    "Merge Artifacts",
-		Status:  "warning",
-		Message: fmt.Sprintf("%d temporary merge file(s) found", len(artifacts)),
-		Detail:  strings.Join(relPaths, ", "),
-		Fix:     "Run 'bd doctor --fix' to remove merge artifacts",
-	}
-}
-
-// readMergeArtifactPatterns reads patterns from .beads/.gitignore merge section
-func readMergeArtifactPatterns(beadsDir string) ([]string, error) {
-	gitignorePath := filepath.Join(beadsDir, ".gitignore")
-	file, err := os.Open(gitignorePath) // #nosec G304 - path constructed from beadsDir
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var patterns []string
-	inMergeSection := false
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		if strings.Contains(line, "Merge artifacts") {
-			inMergeSection = true
-			continue
-		}
-
-		if inMergeSection && strings.HasPrefix(line, "#") {
-			break
-		}
-
-		if inMergeSection && line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "!") {
-			patterns = append(patterns, line)
-		}
-	}
-
-	return patterns, scanner.Err()
 }
 
 // CheckOrphanedDependencies detects dependencies pointing to non-existent issues.
@@ -207,9 +114,9 @@ func checkOrphanedDependenciesDB(db *sql.DB) DoctorCheck {
 }
 
 // CheckDuplicateIssues detects issues with identical content.
-// When gastownMode is true, the threshold parameter defines how many duplicates
-// are acceptable before warning (default 1000 for gastown's ephemeral wisps).
-func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) DoctorCheck {
+// When orchestratorMode is true, the threshold parameter defines how many duplicates
+// are acceptable before warning (default 1000 for orchestrator's ephemeral wisps).
+func CheckDuplicateIssues(path string, orchestratorMode bool, orchestratorThreshold int) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
@@ -223,13 +130,13 @@ func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) D
 	}
 	defer func() { _ = store.Close() }()
 
-	return checkDuplicateIssuesDB(db, gastownMode, gastownThreshold)
+	return checkDuplicateIssuesDB(db, orchestratorMode, orchestratorThreshold)
 }
 
 // checkDuplicateIssuesDB is the core logic for CheckDuplicateIssues, operating
 // on a *sql.DB directly. This enables fast testing with branch-per-test isolation
 // instead of per-test database creation.
-func checkDuplicateIssuesDB(db *sql.DB, gastownMode bool, gastownThreshold int) DoctorCheck {
+func checkDuplicateIssuesDB(db *sql.DB, orchestratorMode bool, orchestratorThreshold int) DoctorCheck {
 	// Use SQL aggregation to find duplicates without loading all issues into memory.
 	// The old approach loaded every issue via SearchIssues which was O(n) in both
 	// time and memory — catastrophically slow on large databases (e.g., 23k+ issues
@@ -258,8 +165,8 @@ func checkDuplicateIssuesDB(db *sql.DB, gastownMode bool, gastownThreshold int) 
 
 	// Apply threshold based on mode
 	threshold := 0 // Default: any duplicates are warnings
-	if gastownMode {
-		threshold = gastownThreshold // Gastown: configurable threshold (default 1000)
+	if orchestratorMode {
+		threshold = orchestratorThreshold // Orchestrator: configurable threshold (default 1000)
 	}
 
 	if totalDuplicates == 0 {
@@ -283,8 +190,8 @@ func checkDuplicateIssuesDB(db *sql.DB, gastownMode bool, gastownThreshold int) 
 
 	// Under threshold - OK
 	message := "No duplicate issues"
-	if gastownMode && totalDuplicates > 0 {
-		message = fmt.Sprintf("%d duplicate(s) detected (within gastown threshold of %d)", totalDuplicates, threshold)
+	if orchestratorMode && totalDuplicates > 0 {
+		message = fmt.Sprintf("%d duplicate(s) detected (within orchestrator threshold of %d)", totalDuplicates, threshold)
 	}
 	return DoctorCheck{
 		Name:    "Duplicate Issues",

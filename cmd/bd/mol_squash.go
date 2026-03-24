@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -65,9 +64,9 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 
-	// mol squash requires direct store access (daemon auto-bypassed for wisp ops)
+	// mol squash requires direct store access
 	if store == nil {
-		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
+		FatalErrorWithHint("no database connection", "run 'bd doctor' to diagnose, or 'bd init' to create a new database")
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -209,7 +208,7 @@ func generateDigest(root *types.Issue, children []*types.Issue) string {
 // If summary is provided (non-empty), it's used as the digest content.
 // Otherwise, generateDigest() creates a basic concatenation.
 // This enables agents to provide AI-generated summaries while keeping bd as a pure tool.
-func squashMolecule(ctx context.Context, s *dolt.DoltStore, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
+func squashMolecule(ctx context.Context, s storage.DoltStorage, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -107,7 +108,7 @@ type orphanIssueOutput struct {
 	LatestCommitMessage string `json:"latest_commit_message,omitempty"`
 }
 
-// doltStoreProvider wraps *dolt.DoltStore to implement types.IssueProvider.
+// doltStoreProvider wraps storage.DoltStorage to implement types.IssueProvider.
 type doltStoreProvider struct{}
 
 func (p *doltStoreProvider) GetOpenIssues(ctx context.Context) ([]*types.Issue, error) {
@@ -125,6 +126,11 @@ func (p *doltStoreProvider) GetOpenIssues(ctx context.Context) ([]*types.Issue, 
 }
 
 func (p *doltStoreProvider) GetIssuePrefix() string {
+	// YAML config takes precedence — in shared-server mode the DB
+	// may belong to a different project (GH#2469).
+	if yamlPrefix := config.GetString("issue-prefix"); yamlPrefix != "" {
+		return yamlPrefix
+	}
 	ctx := context.Background()
 	prefix, err := store.GetConfig(ctx, "issue_prefix")
 	if err != nil || prefix == "" {

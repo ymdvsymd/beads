@@ -2,164 +2,49 @@ package dolt
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // AddLabel adds a label to an issue
 func (s *DoltStore) AddLabel(ctx context.Context, issueID, label, actor string) error {
-	if s.isActiveWisp(ctx, issueID) {
-		return s.addWispLabel(ctx, issueID, label, actor)
-	}
-	_, err := s.execContext(ctx, `
-		INSERT IGNORE INTO labels (issue_id, label) VALUES (?, ?)
-	`, issueID, label)
-	if err != nil {
-		return fmt.Errorf("failed to add label: %w", err)
-	}
-	comment := "Added label: " + label
-	_, err = s.execContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, issueID, types.EventLabelAdded, actor, comment)
-	if err != nil {
-		return fmt.Errorf("failed to record label event: %w", err)
-	}
-	return nil
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return issueops.AddLabelInTx(ctx, tx, "", "", issueID, label, actor)
+	})
 }
 
-// RemoveLabel removes a label from an issue
+// RemoveLabel removes a label from an issue.
+// Delegates SQL work to issueops.RemoveLabelInTx which handles wisp routing.
 func (s *DoltStore) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
-	if s.isActiveWisp(ctx, issueID) {
-		return s.removeWispLabel(ctx, issueID, label, actor)
-	}
-	_, err := s.execContext(ctx, `
-		DELETE FROM labels WHERE issue_id = ? AND label = ?
-	`, issueID, label)
-	if err != nil {
-		return fmt.Errorf("failed to remove label: %w", err)
-	}
-	comment := "Removed label: " + label
-	_, err = s.execContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, issueID, types.EventLabelRemoved, actor, comment)
-	if err != nil {
-		return fmt.Errorf("failed to record label event: %w", err)
-	}
-	return nil
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return issueops.RemoveLabelInTx(ctx, tx, "", "", issueID, label, actor)
+	})
 }
 
 // GetLabels retrieves all labels for an issue
 func (s *DoltStore) GetLabels(ctx context.Context, issueID string) ([]string, error) {
-	if s.isActiveWisp(ctx, issueID) {
-		return s.getWispLabels(ctx, issueID)
-	}
-	rows, err := s.queryContext(ctx, `
-		SELECT label FROM labels WHERE issue_id = ? ORDER BY label
-	`, issueID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get labels: %w", err)
-	}
-	defer rows.Close()
-
 	var labels []string
-	for rows.Next() {
-		var label string
-		if err := rows.Scan(&label); err != nil {
-			return nil, fmt.Errorf("failed to scan label: %w", err)
-		}
-		labels = append(labels, label)
-	}
-	return labels, rows.Err()
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		labels, err = issueops.GetLabelsInTx(ctx, tx, "", issueID)
+		return err
+	})
+	return labels, err
 }
 
-// GetLabelsForIssues retrieves labels for multiple issues, batching queries
-// to avoid oversized IN-clauses that cause slow queries on large databases.
+// GetLabelsForIssues retrieves labels for multiple issues.
+// Delegates to issueops.GetLabelsForIssuesInTx for shared query logic.
 func (s *DoltStore) GetLabelsForIssues(ctx context.Context, issueIDs []string) (map[string][]string, error) {
-	if len(issueIDs) == 0 {
-		return make(map[string][]string), nil
-	}
-
-	// Partition into wisp and dolt IDs
-	ephIDs, doltIDs := s.partitionByWispStatus(ctx, issueIDs)
-
-	result := make(map[string][]string)
-
-	// Fetch wisp labels in batches (replaces N+1 single-ID queries).
-	for start := 0; start < len(ephIDs); start += queryBatchSize {
-		end := start + queryBatchSize
-		if end > len(ephIDs) {
-			end = len(ephIDs)
-		}
-		batch := ephIDs[start:end]
-		placeholders, args := doltBuildSQLInClause(batch)
-
-		//nolint:gosec // G201: placeholders contains only ? markers
-		query := fmt.Sprintf(`
-			SELECT issue_id, label FROM wisp_labels
-			WHERE issue_id IN (%s)
-			ORDER BY issue_id, label
-		`, placeholders)
-
-		rows, err := s.queryContext(ctx, query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get wisp labels: %w", err)
-		}
-
-		for rows.Next() {
-			var issueID, label string
-			if err := rows.Scan(&issueID, &label); err != nil {
-				_ = rows.Close()
-				return nil, fmt.Errorf("failed to scan wisp label: %w", err)
-			}
-			result[issueID] = append(result[issueID], label)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, wrapQueryError("iterate wisp labels for issues", err)
-		}
-		_ = rows.Close()
-	}
-
-	// Fetch dolt labels in batches.
-	for start := 0; start < len(doltIDs); start += queryBatchSize {
-		end := start + queryBatchSize
-		if end > len(doltIDs) {
-			end = len(doltIDs)
-		}
-		batch := doltIDs[start:end]
-		placeholders, args := doltBuildSQLInClause(batch)
-
-		//nolint:gosec // G201: placeholders contains only ? markers
-		query := fmt.Sprintf(`
-			SELECT issue_id, label FROM labels
-			WHERE issue_id IN (%s)
-			ORDER BY issue_id, label
-		`, placeholders)
-
-		rows, err := s.queryContext(ctx, query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get labels for issues: %w", err)
-		}
-
-		for rows.Next() {
-			var issueID, label string
-			if err := rows.Scan(&issueID, &label); err != nil {
-				_ = rows.Close()
-				return nil, fmt.Errorf("failed to scan label: %w", err)
-			}
-			result[issueID] = append(result[issueID], label)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, wrapQueryError("iterate labels for issues", err)
-		}
-		_ = rows.Close()
-	}
-
-	return result, nil
+	var result map[string][]string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetLabelsForIssuesInTx(ctx, tx, issueIDs)
+		return err
+	})
+	return result, err
 }
 
 // GetIssuesByLabel retrieves all issues with a specific label

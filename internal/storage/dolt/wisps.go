@@ -3,13 +3,12 @@ package dolt
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -18,67 +17,9 @@ import (
 // wisp_events, wisp_comments) to avoid Dolt history bloat. All operations use the
 // same Dolt SQL connection — no separate store or transaction routing needed.
 
-// insertIssueIntoTable inserts an issue into the specified table,
-// using ON DUPLICATE KEY UPDATE to handle pre-existing records gracefully (GH#2061).
-// The table must be either "issues" or "wisps" (same schema).
-//
-//nolint:gosec // G201: table is a hardcoded constant ("issues" or "wisps")
+// insertIssueIntoTable delegates to the shared issueops.InsertIssueIntoTable.
 func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *types.Issue) error {
-	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (
-			id, content_hash, title, description, design, acceptance_criteria, notes,
-			status, priority, issue_type, assignee, estimated_minutes,
-			created_at, created_by, owner, updated_at, closed_at, external_ref, spec_id,
-			compaction_level, compacted_at, compacted_at_commit, original_size,
-			sender, ephemeral, wisp_type, pinned, is_template, crystallizes,
-			mol_type, work_type, quality_score, source_system, source_repo, close_reason,
-			event_kind, actor, target, payload,
-			await_type, await_id, timeout_ns, waiters,
-			hook_bead, role_bead, agent_state, last_activity, role_type, rig,
-			due_at, defer_until, metadata
-		) VALUES (
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?
-		)
-		ON DUPLICATE KEY UPDATE
-			content_hash = VALUES(content_hash),
-			title = VALUES(title),
-			description = VALUES(description),
-			design = VALUES(design),
-			acceptance_criteria = VALUES(acceptance_criteria),
-			notes = VALUES(notes),
-			status = VALUES(status),
-			priority = VALUES(priority),
-			issue_type = VALUES(issue_type),
-			assignee = VALUES(assignee),
-			estimated_minutes = VALUES(estimated_minutes),
-			updated_at = VALUES(updated_at),
-			closed_at = VALUES(closed_at),
-			external_ref = VALUES(external_ref),
-			source_repo = VALUES(source_repo),
-			close_reason = VALUES(close_reason),
-			metadata = VALUES(metadata)
-	`, table),
-		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
-		issue.Status, issue.Priority, issue.IssueType, nullString(issue.Assignee), nullInt(issue.EstimatedMinutes),
-		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.ClosedAt, nullStringPtr(issue.ExternalRef), issue.SpecID,
-		issue.CompactionLevel, issue.CompactedAt, nullStringPtr(issue.CompactedAtCommit), nullIntVal(issue.OriginalSize),
-		issue.Sender, issue.Ephemeral, issue.WispType, issue.Pinned, issue.IsTemplate, issue.Crystallizes,
-		issue.MolType, issue.WorkType, issue.QualityScore, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
-		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
-		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), formatJSONStringArray(issue.Waiters),
-		issue.HookBead, issue.RoleBead, issue.AgentState, issue.LastActivity, issue.RoleType, issue.Rig,
-		issue.DueAt, issue.DeferUntil, jsonMetadata(issue.Metadata),
-	)
-	return wrapExecError("insert issue into table", err)
+	return issueops.InsertIssueIntoTable(ctx, tx, table, issue)
 }
 
 // scanIssueFromTable scans a single issue from the specified table.
@@ -99,17 +40,6 @@ func scanIssueFromTable(ctx context.Context, db *sql.DB, table, id string) (*typ
 		return nil, fmt.Errorf("failed to get issue from %s: %w", table, err)
 	}
 	return issue, nil
-}
-
-// recordEventInTable records an event in the specified events table.
-//
-//nolint:gosec // G201: table is a hardcoded constant ("events" or "wisp_events")
-func recordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, newValue string) error {
-	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, table), issueID, eventType, actor, "", newValue)
-	return wrapExecError("record event in table", err)
 }
 
 // generateIssueIDInTable generates a unique ID, checking for collisions
@@ -214,89 +144,6 @@ func wispPrefix(configPrefix string, issue *types.Issue) string {
 	return configPrefix + "-wisp"
 }
 
-// createWisp creates an issue in the wisps table.
-func (s *DoltStore) createWisp(ctx context.Context, issue *types.Issue, actor string) error {
-	issue.Ephemeral = true
-
-	// Fetch custom statuses and types for validation (parity with CreateIssue)
-	customStatuses, err := s.GetCustomStatuses(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom statuses: %w", err)
-	}
-	customTypes, err := s.GetCustomTypes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get custom types: %w", err)
-	}
-
-	now := time.Now().UTC()
-	if issue.CreatedAt.IsZero() {
-		issue.CreatedAt = now
-	} else {
-		issue.CreatedAt = issue.CreatedAt.UTC()
-	}
-	if issue.UpdatedAt.IsZero() {
-		issue.UpdatedAt = now
-	} else {
-		issue.UpdatedAt = issue.UpdatedAt.UTC()
-	}
-
-	if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
-		maxTime := issue.CreatedAt
-		if issue.UpdatedAt.After(maxTime) {
-			maxTime = issue.UpdatedAt
-		}
-		closedAt := maxTime.Add(time.Second)
-		issue.ClosedAt = &closedAt
-	}
-
-	// Validate issue fields (parity with CreateIssue)
-	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	if issue.ContentHash == "" {
-		issue.ContentHash = issue.ComputeContentHash()
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Get prefix from config
-	var configPrefix string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", "issue_prefix").Scan(&configPrefix)
-	if err == sql.ErrNoRows || configPrefix == "" {
-		return fmt.Errorf("database not initialized: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)")
-	} else if err != nil {
-		return fmt.Errorf("failed to get config: %w", err)
-	}
-
-	// Normalize prefix: strip trailing hyphen to prevent double-hyphen IDs (bd-6uly)
-	configPrefix = strings.TrimSuffix(configPrefix, "-")
-
-	// Generate wisp ID if not provided
-	if issue.ID == "" {
-		prefix := wispPrefix(configPrefix, issue)
-		generatedID, err := generateIssueIDInTable(ctx, tx, "wisps", prefix, issue, actor)
-		if err != nil {
-			return fmt.Errorf("failed to generate wisp ID: %w", err)
-		}
-		issue.ID = generatedID
-	}
-
-	if err := insertIssueIntoTable(ctx, tx, "wisps", issue); err != nil {
-		return fmt.Errorf("failed to insert wisp: %w", err)
-	}
-
-	if err := recordEventInTable(ctx, tx, "wisp_events", issue.ID, types.EventCreated, actor, ""); err != nil {
-		return fmt.Errorf("failed to record creation event: %w", err)
-	}
-
-	return wrapTransactionError("commit create wisp", tx.Commit())
-}
-
 // getWisp retrieves an issue from the wisps table.
 func (s *DoltStore) getWisp(ctx context.Context, id string) (*types.Issue, error) {
 	s.mu.RLock()
@@ -336,84 +183,34 @@ func (s *DoltStore) getWispLabels(ctx context.Context, issueID string) ([]string
 }
 
 // updateWisp updates fields on a wisp in the wisps table.
-func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[string]interface{}, _ string) error {
-	// Get old wisp for closed_at auto-management
-	oldWisp, err := s.getWisp(ctx, id)
-	if err != nil {
-		return fmt.Errorf("failed to get wisp for update: %w", err)
-	}
-
-	setClauses := []string{"updated_at = ?"}
-	args := []interface{}{time.Now().UTC()}
-
-	for key, value := range updates {
-		if !isAllowedUpdateField(key) {
-			return fmt.Errorf("invalid field for update: %s", key)
-		}
-		columnName := key
-		if key == "wisp" {
-			columnName = "ephemeral"
-		}
-		setClauses = append(setClauses, fmt.Sprintf("`%s` = ?", columnName))
-		if key == "waiters" {
-			waitersJSON, err := json.Marshal(value)
-			if err != nil {
-				return fmt.Errorf("invalid waiters: %w", err)
-			}
-			args = append(args, string(waitersJSON))
-		} else if key == "metadata" {
-			metadataStr, err := storage.NormalizeMetadataValue(value)
-			if err != nil {
-				return fmt.Errorf("invalid metadata: %w", err)
-			}
-			args = append(args, metadataStr)
-		} else {
-			args = append(args, value)
-		}
-	}
-
-	// Auto-manage closed_at (set on close, clear on reopen)
-	setClauses, args = manageClosedAt(oldWisp, updates, setClauses, args)
-
-	args = append(args, id)
-
-	// nolint:gosec // G201: setClauses contains only column names
-	query := fmt.Sprintf("UPDATE wisps SET %s WHERE id = ?", strings.Join(setClauses, ", "))
-	_, err = s.execContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to update wisp: %w", err)
-	}
-	return nil
-}
-
-// closeWisp closes a wisp in the wisps table.
-func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, actor string, session string) error {
-	now := time.Now().UTC()
-
+// Delegates SQL work to issueops.UpdateIssueInTx; no Dolt versioning needed
+// since wisps live in dolt_ignored tables.
+func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, `
-		UPDATE wisps SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
-		WHERE id = ?
-	`, types.StatusClosed, now, now, reason, session, id)
-	if err != nil {
-		return fmt.Errorf("failed to close wisp: %w", err)
+	if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
+		return err
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("wisp not found: %s", id)
-	}
+	return wrapTransactionError("commit update wisp", tx.Commit())
+}
 
-	if err := recordEventInTable(ctx, tx, "wisp_events", id, types.EventClosed, actor, reason); err != nil {
-		return fmt.Errorf("failed to record event: %w", err)
+// closeWisp closes a wisp in the wisps table.
+// Delegates SQL work to issueops.CloseIssueInTx; no Dolt versioning needed
+// since wisps live in dolt_ignored tables.
+func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, actor string, session string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
+		return err
 	}
 
 	return wrapTransactionError("commit close wisp", tx.Commit())
@@ -547,40 +344,17 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 }
 
 // claimWisp atomically claims a wisp.
+// Delegates SQL work to issueops.ClaimIssueInTx; no Dolt versioning needed
+// since wisps live in dolt_ignored tables.
 func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) error {
-	now := time.Now().UTC()
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, `
-		UPDATE wisps
-		SET assignee = ?, status = 'in_progress', updated_at = ?
-		WHERE id = ? AND (assignee = '' OR assignee IS NULL)
-	`, actor, now, id)
-	if err != nil {
-		return fmt.Errorf("failed to claim wisp: %w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		var currentAssignee string
-		err := tx.QueryRowContext(ctx, `SELECT assignee FROM wisps WHERE id = ?`, id).Scan(&currentAssignee)
-		if err != nil {
-			return fmt.Errorf("failed to get current assignee: %w", err)
-		}
-		return fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, currentAssignee)
-	}
-
-	if err := recordEventInTable(ctx, tx, "wisp_events", id, "claimed", actor, ""); err != nil {
-		return fmt.Errorf("failed to record claim event: %w", err)
+	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
+		return err
 	}
 
 	return wrapTransactionError("commit claim wisp", tx.Commit())
@@ -811,23 +585,6 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 	return wrapTransactionError("commit add wisp dependency", tx.Commit())
 }
 
-// removeWispDependency removes a dependency from wisp_dependencies.
-func (s *DoltStore) removeWispDependency(ctx context.Context, issueID, dependsOnID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM wisp_dependencies WHERE issue_id = ? AND depends_on_id = ?
-	`, issueID, dependsOnID); err != nil {
-		return fmt.Errorf("failed to remove wisp dependency: %w", err)
-	}
-
-	return wrapTransactionError("commit remove wisp dependency", tx.Commit())
-}
-
 // getWispDependencies retrieves issues that a wisp depends on.
 func (s *DoltStore) getWispDependencies(ctx context.Context, issueID string) ([]*types.Issue, error) {
 	rows, err := s.queryContext(ctx, `
@@ -943,107 +700,6 @@ func (s *DoltStore) getWispDependenciesWithMetadata(ctx context.Context, issueID
 		})
 	}
 	return results, nil
-}
-
-// getWispDependentsWithMetadata returns wisp dependents with metadata.
-func (s *DoltStore) getWispDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
-	rows, err := s.queryContext(ctx, `
-		SELECT issue_id, type FROM wisp_dependencies WHERE depends_on_id = ?
-	`, issueID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get wisp dependents with metadata: %w", err)
-	}
-
-	type depMeta struct {
-		depID, depType string
-	}
-	var deps []depMeta
-	for rows.Next() {
-		var depID, depType string
-		if err := rows.Scan(&depID, &depType); err != nil {
-			_ = rows.Close()
-			return nil, wrapScanError("scan wisp dependent metadata", err)
-		}
-		deps = append(deps, depMeta{depID: depID, depType: depType})
-	}
-	_ = rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, wrapQueryError("iterate wisp dependents", err)
-	}
-
-	if len(deps) == 0 {
-		return nil, nil
-	}
-
-	ids := make([]string, len(deps))
-	for i, d := range deps {
-		ids[i] = d.depID
-	}
-	issues, err := s.GetIssuesByIDs(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	issueMap := make(map[string]*types.Issue, len(issues))
-	for _, iss := range issues {
-		issueMap[iss.ID] = iss
-	}
-
-	var results []*types.IssueWithDependencyMetadata
-	for _, d := range deps {
-		issue, ok := issueMap[d.depID]
-		if !ok {
-			continue
-		}
-		results = append(results, &types.IssueWithDependencyMetadata{
-			Issue:          *issue,
-			DependencyType: types.DependencyType(d.depType),
-		})
-	}
-	return results, nil
-}
-
-// addWispLabel adds a label to a wisp in the wisp_labels table.
-func (s *DoltStore) addWispLabel(ctx context.Context, issueID, label, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_labels (issue_id, label) VALUES (?, ?)
-	`, issueID, label)
-	if err != nil {
-		return fmt.Errorf("failed to add wisp label: %w", err)
-	}
-
-	if err := recordEventInTable(ctx, tx, "wisp_events", issueID, types.EventLabelAdded, actor, "Added label: "+label); err != nil {
-		return fmt.Errorf("failed to record wisp label event: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// removeWispLabel removes a label from a wisp.
-func (s *DoltStore) removeWispLabel(ctx context.Context, issueID, label, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	_, err = tx.ExecContext(ctx, `
-		DELETE FROM wisp_labels WHERE issue_id = ? AND label = ?
-	`, issueID, label)
-	if err != nil {
-		return fmt.Errorf("failed to remove wisp label: %w", err)
-	}
-
-	if err := recordEventInTable(ctx, tx, "wisp_events", issueID, types.EventLabelRemoved, actor, "Removed label: "+label); err != nil {
-		return fmt.Errorf("failed to record wisp label event: %w", err)
-	}
-
-	return tx.Commit()
 }
 
 // FindWispDependentsRecursive finds all wisp dependents of the given IDs,

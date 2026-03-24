@@ -31,7 +31,7 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 		// Direct storage access
 		if store == nil {
 			FatalErrorWithHint("database not initialized",
-				"run 'bd init' to create a database")
+				"run 'bd doctor' to diagnose, or 'bd init' to create a new database")
 		}
 		for _, id := range args {
 			fullID, err := utils.ResolvePartialID(ctx, store, id)
@@ -80,6 +80,14 @@ This is more explicit than 'bd update --status open' and emits a Reopened event.
 				fmt.Printf("%s Reopened %s%s\n", ui.RenderAccent("↻"), fullID, reasonMsg)
 			}
 		}
+
+		// Embedded mode: flush Dolt commit.
+		if isEmbeddedDolt && store != nil {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
+				FatalErrorRespectJSON("failed to commit: %v", err)
+			}
+		}
+
 		if jsonOutput && len(reopenedIssues) > 0 {
 			outputJSON(reopenedIssues)
 		}

@@ -104,15 +104,15 @@ func isRedirectExpectedLocation(beadsDir string) bool {
 	grandparentName := filepath.Base(grandparent)
 	parentName := filepath.Base(parent)
 
-	// Pattern: */polecats/*/.beads/
+	// Pattern: */polecats/*/.beads/ (orchestrator worker — backwards compat)
 	if grandparentName == "polecats" {
 		return true
 	}
-	// Pattern: */crew/*/.beads/
+	// Pattern: */crew/*/.beads/ (orchestrator assistant — backwards compat)
 	if grandparentName == "crew" {
 		return true
 	}
-	// Pattern: */refinery/rig/.beads/
+	// Pattern: */refinery/rig/.beads/ (orchestrator processor — backwards compat)
 	if parentName == "rig" && grandparentName == "refinery" {
 		return true
 	}
@@ -139,7 +139,6 @@ func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
 	// Safe to delete (not the primary data source)
 	safeFiles := []string{
 		"issues.jsonl.new",
-		"beads.left.jsonl",
 	}
 
 	for _, name := range safeFiles {

@@ -2,17 +2,17 @@
 // It provides transparent auto-start so that `bd init` and `bd <command>` work
 // without manual server management.
 //
-// The default port is 3307 (configfile.DefaultDoltServerPort),
-// matching shared Homebrew Dolt servers. If another project's Dolt server already
-// occupies port 3307, Start falls back to DerivePort for per-project isolation
-// (hash-derived, range 13307–14306). Users with explicit port config in
-// metadata.json or BEADS_DOLT_SERVER_PORT env var always use that port instead.
+// Port assignment uses OS-assigned ephemeral ports by default. When no explicit
+// port is configured (env var, config.yaml, metadata.json), Start() asks the OS
+// for a free port via net.Listen(":0"), passes it to dolt sql-server, and writes
+// the actual port to dolt-server.port. This eliminates the birthday-problem
+// collisions that plagued the old hash-derived port scheme (GH#2098, GH#2372).
 //
-// Anti-proliferation: the server enforces one-server-one-port. If the canonical
-// port is busy, the server identifies and handles the occupant rather than
-// silently starting on another port.
+// Users with explicit port config via BEADS_DOLT_SERVER_PORT env var or
+// config.yaml always use that port instead, with conflict detection via
+// reclaimPort.
 //
-// Server state files (PID, log, lock) live in the .beads/ directory.
+// Server state files (PID, port, log, lock) live in the .beads/ directory.
 package doltserver
 
 import (
@@ -20,7 +20,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"net"
 	"os"
 	"os/exec"
@@ -33,18 +32,135 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/lockfile"
 )
 
-// Port range for auto-derived ports.
+// ErrServerNotRunning is returned by Stop when the Dolt server is not running.
+// Callers can use errors.Is to distinguish this expected condition from real
+// failures (GH#2670).
+var ErrServerNotRunning = errors.New("dolt server is not running")
+
+// IgnoreNotRunning strips ErrServerNotRunning from err and returns any
+// remaining errors (typically cleanup failures). If the only error was the
+// sentinel, it returns nil. Handles both errors.Join (multi-unwrap) and
+// standard fmt.Errorf wrapping (single-unwrap).
+//
+// IMPORTANT: call directly on Stop()/StopWithForce() return values only.
+// Do not wrap the error before passing it here — wrapping may hide joined
+// cleanup errors from the multi-unwrap path.
+func IgnoreNotRunning(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrServerNotRunning) {
+		return err // unrelated error, pass through
+	}
+	// Multi-error from errors.Join: filter out the sentinel, keep the rest.
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var remaining []error
+		for _, e := range joined.Unwrap() {
+			if e != nil && !errors.Is(e, ErrServerNotRunning) {
+				remaining = append(remaining, e)
+			}
+		}
+		return errors.Join(remaining...)
+	}
+	// Single-wrapped error (e.g., fmt.Errorf("%w", ErrServerNotRunning)):
+	// the sentinel is the only meaningful content, so treat as pure sentinel.
+	return nil
+}
+
+// PIDFileName and PortFileName are the canonical state file names used by the
+// Dolt server lifecycle. They are exported so cross-package tests can reference
+// the same names as the production code.
 const (
-	portRangeBase = 13307
-	portRangeSize = 1000
+	PIDFileName  = "dolt-server.pid"
+	PortFileName = "dolt-server.port"
 )
 
+// maxEphemeralPortAttempts is the number of times Start() retries ephemeral
+// port allocation when the TOCTOU race causes a bind failure.
+const maxEphemeralPortAttempts = 10
+
+// DefaultSharedServerPort is the default port for shared server mode.
+// Uses 3308 to avoid conflict with the orchestrator which uses 3307.
+const DefaultSharedServerPort = 3308
+
+// IsSharedServerMode returns true if shared server mode is enabled.
+// Checks (in priority order):
+//  1. BEADS_DOLT_SHARED_SERVER env var ("1" or "true")
+//  2. dolt.shared-server in config.yaml
+//
+// Shared server mode means all projects on this machine share a single
+// dolt sql-server process at SharedServerDir(), each using its own
+// database (already unique via prefix-based naming in bd init).
+func IsSharedServerMode() bool {
+	if v := os.Getenv("BEADS_DOLT_SHARED_SERVER"); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	return config.GetBool("dolt.shared-server")
+}
+
+// IsAutoStartDisabled returns true if the dolt server should NOT be
+// auto-started or managed by bd. When true, KillStaleServers and
+// auto-start are suppressed — the server is externally managed (e.g.,
+// by systemd).
+//
+// Either source can disable auto-start independently — there is no way
+// to force-enable via env when the config file says disabled. Accepted
+// disable values (case-insensitive): "0", "false", "off".
+//
+// This is used by KillStaleServers and Start to avoid killing or
+// interfering with externally-managed dolt processes (GH#2641).
+func IsAutoStartDisabled() bool {
+	if v := strings.ToLower(os.Getenv("BEADS_DOLT_AUTO_START")); v == "0" || v == "false" || v == "off" {
+		return true
+	}
+	v := strings.ToLower(config.GetString("dolt.auto-start"))
+	return v == "false" || v == "0" || v == "off"
+}
+
+// SharedServerDir returns the directory for shared server state files.
+// Returns ~/.beads/shared-server/ (created on first use).
+func SharedServerDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	dir := filepath.Join(home, ".beads", "shared-server")
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", fmt.Errorf("cannot create shared server directory %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// SharedDoltDir returns the dolt data directory for the shared server.
+// Returns ~/.beads/shared-server/dolt/ (created on first use).
+func SharedDoltDir() (string, error) {
+	serverDir, err := SharedServerDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(serverDir, "dolt")
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", fmt.Errorf("cannot create shared dolt directory %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
 // resolveServerDir returns the canonical server directory for dolt state files.
-// Returns beadsDir unchanged.
+// In shared server mode, returns ~/.beads/shared-server/ instead of the
+// project's .beads/ directory.
 func resolveServerDir(beadsDir string) string {
+	if IsSharedServerMode() {
+		dir, err := SharedServerDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: shared server directory unavailable, using per-project mode: %v\n", err)
+			return beadsDir
+		}
+		return dir
+	}
 	return beadsDir
 }
 
@@ -63,6 +179,16 @@ func ResolveServerDir(beadsDir string) string {
 // to avoid triggering the config.json → metadata.json migration side effect,
 // which would create files in the .beads/ directory unexpectedly.
 func ResolveDoltDir(beadsDir string) string {
+	// Shared server mode: use centralized dolt data directory
+	if IsSharedServerMode() {
+		dir, err := SharedDoltDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: shared dolt directory unavailable, using per-project mode: %v\n", err)
+		} else {
+			return dir
+		}
+	}
+
 	// Check env var first (highest priority)
 	if d := os.Getenv("BEADS_DOLT_DATA_DIR"); d != "" {
 		if filepath.IsAbs(d) {
@@ -82,9 +208,10 @@ func ResolveDoltDir(beadsDir string) string {
 
 // Config holds the server configuration.
 type Config struct {
-	BeadsDir string // Path to .beads/ directory
-	Port     int    // MySQL protocol port (0 = use DefaultDoltServerPort 3307)
-	Host     string // Bind address (default: 127.0.0.1)
+	BeadsDir string     // Path to .beads/ directory
+	Port     int        // MySQL protocol port (0 = allocate ephemeral port on Start)
+	Host     string     // Bind address (default: 127.0.0.1)
+	Mode     ServerMode // Server ownership mode (Owned, External, Embedded)
 }
 
 // State holds runtime information about a managed server.
@@ -96,14 +223,10 @@ type State struct {
 }
 
 // file paths within .beads/
-func pidPath(beadsDir string) string      { return filepath.Join(beadsDir, "dolt-server.pid") }
-func logPath(beadsDir string) string      { return filepath.Join(beadsDir, "dolt-server.log") }
-func lockPath(beadsDir string) string     { return filepath.Join(beadsDir, "dolt-server.lock") }
-func portPath(beadsDir string) string     { return filepath.Join(beadsDir, "dolt-server.port") }
-func activityPath(beadsDir string) string { return filepath.Join(beadsDir, "dolt-server.activity") }
-func monitorPidPath(beadsDir string) string {
-	return filepath.Join(beadsDir, "dolt-monitor.pid")
-}
+func pidPath(beadsDir string) string  { return filepath.Join(beadsDir, PIDFileName) }
+func logPath(beadsDir string) string  { return filepath.Join(beadsDir, "dolt-server.log") }
+func lockPath(beadsDir string) string { return filepath.Join(beadsDir, "dolt-server.lock") }
+func portPath(beadsDir string) string { return filepath.Join(beadsDir, PortFileName) }
 
 // MaxDoltServers is the hard ceiling on concurrent dolt sql-server processes.
 // Allows up to 3 (e.g., multiple projects).
@@ -111,35 +234,18 @@ func maxDoltServers() int {
 	return 3
 }
 
-// ErrPortOccupiedByOtherProject is returned by reclaimPort when the canonical
-// port is held by another beads project's Dolt server (different data dir).
-// Start uses this to fall back to DerivePort for per-project isolation.
-var ErrPortOccupiedByOtherProject = fmt.Errorf("port occupied by another project's dolt server")
-
-// fallbackPort returns the DerivePort value for a beadsDir, used when the
-// default port (3307) is occupied by another project's Dolt server.
-func fallbackPort(beadsDir string) int {
-	return DerivePort(beadsDir)
-}
-
-// DerivePort computes a stable port from the beadsDir path.
-// Maps to range 13307–14306 (1000 ports) to avoid common service ports.
-// The port is deterministic: same path always yields the same port.
-//
-// The 1000-port hash space means collisions become likely around 9+
-// concurrent projects (~3.9% probability via the birthday paradox with
-// fnv32a % 1000). This is acceptable because reclaimPort() in Start()
-// detects when another project's server already occupies the derived
-// port and falls back gracefully — hash collisions cause a retry, not
-// a failure.
-func DerivePort(beadsDir string) int {
-	abs, err := filepath.Abs(beadsDir)
+// allocateEphemeralPort asks the OS for a free TCP port on host.
+// It binds to port 0, reads the assigned port, and closes the listener.
+// The caller should pass the returned port to dolt sql-server promptly
+// to minimize the TOCTOU window.
+func allocateEphemeralPort(host string) (int, error) {
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
-		abs = beadsDir
+		return 0, fmt.Errorf("allocating ephemeral port: %w", err)
 	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(abs))
-	return portRangeBase + int(h.Sum32()%uint32(portRangeSize))
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port, nil
 }
 
 // isPortAvailable checks if a TCP port is available for binding.
@@ -153,11 +259,12 @@ func isPortAvailable(host string, port int) bool {
 	return true
 }
 
-// reclaimPort ensures the canonical port is available for use.
+// reclaimPort ensures an explicit (user-configured) port is available for use.
+// Only called for explicit ports (env var, config.yaml, metadata.json).
 // If the port is busy:
 //   - If our dolt server (same data dir) → return its PID for adoption
 //   - If a stale/orphan dolt sql-server holds it → kill it and reclaim
-//   - If a non-dolt process holds it → return error (don't silently use another port)
+//   - If another project's dolt or a non-dolt process → return error
 //
 // Returns (adoptPID, nil) when an existing server should be adopted.
 // Returns (0, nil) when the port is free for a new server.
@@ -194,8 +301,7 @@ func reclaimPort(host string, port int, beadsDir string) (adoptPID int, err erro
 	}
 
 	// Another beads project's Dolt server is on this port.
-	// Don't kill it — return a sentinel so Start can fall back to DerivePort.
-	return 0, ErrPortOccupiedByOtherProject
+	return 0, fmt.Errorf("port %d is in use by another project's dolt server (PID %d).\n\nFree the port or use a different one with: bd dolt set port <port>", port, pid)
 }
 
 // countDoltProcesses returns the number of running dolt sql-server processes.
@@ -230,18 +336,50 @@ func writePortFile(beadsDir string, port int) error {
 	return os.WriteFile(portPath(beadsDir), []byte(strconv.Itoa(port)), 0600)
 }
 
+// EnsurePortFile makes the repo-local port file match the connected server port.
+// This is a best-effort repair path for upgraded repos that are missing
+// .beads/dolt-server.port even though commands can still connect.
+func EnsurePortFile(beadsDir string, port int) error {
+	if beadsDir == "" || port <= 0 {
+		return nil
+	}
+	existing := readPortFile(beadsDir)
+	if existing == port {
+		return nil
+	}
+	if existing > 0 {
+		fmt.Fprintf(os.Stderr, "Info: updating port file %d → %d in %s\n", existing, port, beadsDir)
+	}
+	return writePortFile(beadsDir, port)
+}
+
+// ReadPortFile returns the port from the project's dolt-server.port file,
+// or 0 if the file doesn't exist or is invalid. Exported for use by bd init
+// to detect whether this project has its own running server (GH#2336).
+func ReadPortFile(beadsDir string) int {
+	return readPortFile(beadsDir)
+}
+
 // DefaultConfig returns config with sensible defaults.
-// Priority: env var > metadata.json > config.yaml / global config > port file > DerivePort.
+// Priority: env var > port file > config.yaml / global config > metadata.json.
+// Returns port 0 when no source provides a port, meaning Start() should
+// allocate an ephemeral port from the OS.
 //
 // The port file (dolt-server.port) is written by Start() with the actual port
 // the server is listening on. Consulting it here ensures that commands
-// connecting to an already-running server use the correct port — even when
-// Start() fell back to DerivePort because another project occupied the default
-// port.
+// connecting to an already-running server use the correct port.
 func DefaultConfig(beadsDir string) *Config {
+	// In shared mode, use the shared server directory for port resolution
+	if IsSharedServerMode() {
+		if sharedDir, err := SharedServerDir(); err == nil {
+			beadsDir = sharedDir
+		}
+	}
+
 	cfg := &Config{
 		BeadsDir: beadsDir,
 		Host:     "127.0.0.1",
+		Mode:     ResolveServerMode(beadsDir),
 	}
 
 	// Check env var override first (used by tests and manual overrides)
@@ -287,8 +425,11 @@ func DefaultConfig(beadsDir string) *Config {
 		}
 	}
 
-	if cfg.Port == 0 {
-		cfg.Port = DerivePort(beadsDir)
+	// Port 0 means "no configured port". In shared mode, use the fixed
+	// shared server port. In per-project mode, Start() will allocate an
+	// ephemeral port from the OS (GH#2098, GH#2372).
+	if cfg.Port == 0 && IsSharedServerMode() {
+		cfg.Port = DefaultSharedServerPort // 3308 - avoids orchestrator conflict on 3307
 	}
 
 	return cfg
@@ -307,15 +448,17 @@ func IsRunning(beadsDir string) (*State, error) {
 
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		// Corrupt PID file — clean up
+		// Corrupt PID file implies stale state; clear the port file too.
 		_ = os.Remove(pidPath(beadsDir))
+		_ = os.Remove(portPath(beadsDir))
 		return &State{Running: false}, nil
 	}
 
 	// Check if process is alive
 	if !isProcessAlive(pid) {
-		// Process is dead — stale PID file
+		// Process is dead — clear all tracked state for this server.
 		_ = os.Remove(pidPath(beadsDir))
+		_ = os.Remove(portPath(beadsDir))
 		return &State{Running: false}, nil
 	}
 
@@ -327,11 +470,25 @@ func IsRunning(beadsDir string) (*State, error) {
 		return &State{Running: false}, nil
 	}
 
-	// Read actual port from port file; fall back to config-derived port
+	// Read actual port from port file; fall back to config-derived port.
 	port := readPortFile(beadsDir)
 	if port == 0 {
 		cfg := DefaultConfig(beadsDir)
 		port = cfg.Port
+	}
+	if port == 0 {
+		// Server is running but we can't determine its port (port file
+		// missing, no explicit config). Stop the orphan so that callers
+		// (EnsureRunning) trigger a fresh Start() with a new port file.
+		fmt.Fprintf(os.Stderr, "Dolt server (PID %d) running but port unknown; stopping for restart\n", pid)
+		if err := gracefulStop(pid, 5*time.Second); err != nil {
+			// Best-effort kill
+			if proc, findErr := os.FindProcess(pid); findErr == nil {
+				_ = proc.Kill()
+			}
+		}
+		_ = os.Remove(pidPath(beadsDir))
+		return &State{Running: false}, nil
 	}
 	return &State{
 		Running: true,
@@ -344,30 +501,56 @@ func IsRunning(beadsDir string) (*State, error) {
 // EnsureRunning starts the server if it is not already running.
 // This is the main auto-start entry point. Thread-safe via file lock.
 // Returns the port the server is listening on.
+//
+// When metadata.json specifies an explicit dolt_server_port (indicating an
+// external/shared server, e.g. managed by systemd), EnsureRunning will NOT
+// start a new server. The external server's lifecycle is not bd's
+// responsibility — starting a per-project server would conflict with (or
+// kill) the shared server. See GH#2554.
 func EnsureRunning(beadsDir string) (int, error) {
+	port, _, err := EnsureRunningDetailed(beadsDir)
+	return port, err
+}
+
+// EnsureRunningDetailed is like EnsureRunning but also reports whether a new
+// server was started (startedByUs=true) vs. an already-running server was
+// adopted (startedByUs=false). Callers that need to clean up auto-started
+// servers (e.g. test teardown) should use this variant.
+func EnsureRunningDetailed(beadsDir string) (port int, startedByUs bool, err error) {
 	serverDir := resolveServerDir(beadsDir)
+
+	// Inform when an orchestrator is also running on this machine
+	if IsSharedServerMode() && os.Getenv("GT_ROOT") != "" {
+		fmt.Fprintf(os.Stderr, "Info: Orchestrator detected (GT_ROOT set). Shared server uses port %d to avoid conflict.\n", DefaultSharedServerPort)
+	}
 
 	state, err := IsRunning(serverDir)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if state.Running {
-		// Touch activity file so idle monitor knows we're active
-		touchActivity(serverDir)
-		return state.Port, nil
+		_ = EnsurePortFile(serverDir, state.Port)
+		return state.Port, false, nil
+	}
+
+	// If the server mode is External (explicit port in metadata.json,
+	// shared server mode, etc.), do not start a per-project server —
+	// it would conflict with the external one.
+	mode := ResolveServerMode(beadsDir)
+	if mode == ServerModeExternal {
+		cfg := DefaultConfig(beadsDir)
+		return 0, false, fmt.Errorf("Dolt server is not running on port %d, and auto-start is suppressed "+
+			"because the server is externally managed (dolt.auto-start: false or explicit port configured).\n\n"+
+			"Start the external server, or enable auto-start to allow bd to manage the server.\n"+
+			"  To start manually: bd dolt start\n"+
+			"  To check status: bd dolt status", cfg.Port)
 	}
 
 	s, err := Start(serverDir)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	touchActivity(serverDir)
-	return s.Port, nil
-}
-
-// touchActivity updates the activity file timestamp.
-func touchActivity(beadsDir string) {
-	_ = os.WriteFile(activityPath(beadsDir), []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+	return s.Port, true, nil
 }
 
 // Start explicitly starts a dolt sql-server for the project.
@@ -412,6 +595,15 @@ func Start(beadsDir string) (*State, error) {
 		return state, nil
 	}
 
+	// Clean up orphaned dolt sql-server processes INSIDE the lock.
+	// This MUST happen under the lock to prevent a race where one process
+	// kills a server that another process is in the middle of starting
+	// (PID file not yet written). Without this, concurrent bd processes
+	// can cause journal corruption (GH#2430).
+	if killed, killErr := KillStaleServers(beadsDir); killErr == nil && len(killed) > 0 {
+		fmt.Fprintf(os.Stderr, "Info: cleaned up %d orphaned dolt sql-server process(es)\n", len(killed))
+	}
+
 	// Ensure dolt binary exists
 	doltBin, err := exec.LookPath("dolt")
 	if err != nil {
@@ -434,73 +626,107 @@ func Start(beadsDir string) (*State, error) {
 		return nil, fmt.Errorf("opening log file: %w", err)
 	}
 
-	// Reclaim the canonical port. If another project's Dolt holds it,
-	// fall back to a hash-derived port for per-project isolation.
+	// Resolve the port to use. Explicit ports (env/config) go through
+	// reclaimPort for conflict detection. Port 0 means ephemeral — allocate
+	// a fresh port from the OS with retry for TOCTOU races.
 	actualPort := cfg.Port
-	adoptPID, reclaimErr := reclaimPort(cfg.Host, actualPort, beadsDir)
-	if reclaimErr != nil {
-		if errors.Is(reclaimErr, ErrPortOccupiedByOtherProject) {
-			// Another project's Dolt server is on the default port —
-			// use a hash-derived port for this project instead.
-			fmt.Fprintf(os.Stderr, "Port %d occupied by another project's Dolt server; falling back to port %d\n", actualPort, fallbackPort(beadsDir))
-			actualPort = fallbackPort(beadsDir)
-			adoptPID, reclaimErr = reclaimPort(cfg.Host, actualPort, beadsDir)
-			if reclaimErr != nil {
-				_ = logFile.Close()
-				return nil, fmt.Errorf("cannot start dolt server on fallback port %d: %w", actualPort, reclaimErr)
-			}
-		} else {
+	explicitPort := actualPort > 0
+
+	if explicitPort {
+		// Explicit port: check for conflicts and adopt existing servers.
+		adoptPID, reclaimErr := reclaimPort(cfg.Host, actualPort, beadsDir)
+		if reclaimErr != nil {
 			_ = logFile.Close()
 			return nil, fmt.Errorf("cannot start dolt server on port %d: %w", actualPort, reclaimErr)
 		}
-	}
-	if adoptPID > 0 {
-		// Existing server is ours (same data dir) — adopt it
-		_ = logFile.Close()
-		_ = os.WriteFile(pidPath(beadsDir), []byte(strconv.Itoa(adoptPID)), 0600)
-		_ = writePortFile(beadsDir, actualPort)
-		touchActivity(beadsDir)
-		forkIdleMonitor(beadsDir)
-		return &State{Running: true, PID: adoptPID, Port: actualPort, DataDir: doltDir}, nil
+		if adoptPID > 0 {
+			_ = logFile.Close()
+			_ = os.WriteFile(pidPath(beadsDir), []byte(strconv.Itoa(adoptPID)), 0600)
+			_ = writePortFile(beadsDir, actualPort)
+			return &State{Running: true, PID: adoptPID, Port: actualPort, DataDir: doltDir}, nil
+		}
 	}
 
-	// Start dolt sql-server
-	cmd := exec.Command(doltBin, "sql-server", //nolint:gosec // G702: doltBin is resolved from PATH, not user input
-		"-H", cfg.Host,
-		"-P", strconv.Itoa(actualPort),
-	)
-	cmd.Dir = doltDir
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.Stdin = nil
-	// New process group so server survives bd exit
-	cmd.SysProcAttr = procAttrDetached()
+	// Start dolt sql-server, with retry loop for ephemeral port TOCTOU.
+	var pid int
+	var lastErr error
+	attempts := 1
+	if !explicitPort {
+		attempts = maxEphemeralPortAttempts
+	}
 
-	if err := cmd.Start(); err != nil {
-		_ = logFile.Close()
-		return nil, fmt.Errorf("starting dolt sql-server: %w", err)
+	for i := range attempts {
+		if !explicitPort {
+			p, allocErr := allocateEphemeralPort(cfg.Host)
+			if allocErr != nil {
+				lastErr = allocErr
+				continue
+			}
+			actualPort = p
+		}
+
+		cmd := exec.Command(doltBin, "sql-server", //nolint:gosec // doltBin is resolved from PATH, not user input
+			"-H", cfg.Host,
+			"-P", strconv.Itoa(actualPort),
+		)
+		cmd.Dir = doltDir
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		cmd.Stdin = nil
+		cmd.SysProcAttr = procAttrDetached()
+
+		if startErr := cmd.Start(); startErr != nil {
+			lastErr = startErr
+			if !explicitPort {
+				continue // retry with a new ephemeral port
+			}
+			_ = logFile.Close()
+			return nil, fmt.Errorf("starting dolt sql-server: %w", startErr)
+		}
+
+		pid = cmd.Process.Pid
+		_ = cmd.Process.Release()
+
+		// Quick check: did the process exit immediately (bind failure)?
+		// Give it a moment to fail on port bind before proceeding.
+		time.Sleep(200 * time.Millisecond)
+		if !isProcessAlive(pid) {
+			lastErr = fmt.Errorf("dolt sql-server exited immediately on port %d (attempt %d/%d)", actualPort, i+1, attempts)
+			pid = 0
+			if !explicitPort {
+				continue
+			}
+			_ = logFile.Close()
+			return nil, lastErr
+		}
+
+		lastErr = nil
+		break
 	}
 	_ = logFile.Close()
 
-	pid := cmd.Process.Pid
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to start dolt server after %d attempts: %w\nCheck logs: %s",
+			attempts, lastErr, logPath(beadsDir))
+	}
 
 	// Write PID and port files
 	if err := os.WriteFile(pidPath(beadsDir), []byte(strconv.Itoa(pid)), 0600); err != nil {
-		_ = cmd.Process.Kill()
+		if proc, findErr := os.FindProcess(pid); findErr == nil {
+			_ = proc.Kill()
+		}
 		return nil, fmt.Errorf("writing PID file: %w", err)
 	}
 	if err := writePortFile(beadsDir, actualPort); err != nil {
-		_ = cmd.Process.Kill()
+		if proc, findErr := os.FindProcess(pid); findErr == nil {
+			_ = proc.Kill()
+		}
 		_ = os.Remove(pidPath(beadsDir))
 		return nil, fmt.Errorf("writing port file: %w", err)
 	}
 
-	// Release the process handle so it outlives us
-	_ = cmd.Process.Release()
-
 	// Wait for server to accept connections
 	if err := waitForReady(cfg.Host, actualPort, 10*time.Second); err != nil {
-		// Server started but not responding — clean up
 		if proc, findErr := os.FindProcess(pid); findErr == nil {
 			_ = proc.Kill()
 		}
@@ -509,10 +735,6 @@ func Start(beadsDir string) (*State, error) {
 		return nil, fmt.Errorf("server started (PID %d) but not accepting connections on port %d: %w\nCheck logs: %s",
 			pid, actualPort, err, logPath(beadsDir))
 	}
-
-	// Touch activity and fork idle monitor
-	touchActivity(beadsDir)
-	forkIdleMonitor(beadsDir)
 
 	return &State{
 		Running: true,
@@ -604,6 +826,10 @@ func FlushWorkingSet(host string, port int) error {
 }
 
 // Stop gracefully stops the managed server and its idle monitor.
+// Stop is idempotent: when the server is already stopped it returns
+// ErrServerNotRunning after cleaning up any leftover state files.
+// Callers should use errors.Is(err, ErrServerNotRunning) to distinguish
+// this expected condition from real failures.
 func Stop(beadsDir string) error {
 	return StopWithForce(beadsDir, false)
 }
@@ -616,7 +842,12 @@ func StopWithForce(beadsDir string, force bool) error {
 		return err
 	}
 	if !state.Running {
-		return fmt.Errorf("Dolt server is not running")
+		// Server not running — still clean up any leftover state files
+		// so bd dolt status won't report stale state (GH#2670).
+		// Join cleanup errors with the sentinel so callers can still use
+		// errors.Is(err, ErrServerNotRunning) while operators see filesystem issues.
+		cleanupErr := cleanupStateFiles(beadsDir)
+		return errors.Join(ErrServerNotRunning, cleanupErr)
 	}
 
 	// Flush uncommitted working set changes before stopping the server.
@@ -627,19 +858,24 @@ func StopWithForce(beadsDir string, force bool) error {
 	}
 
 	if err := gracefulStop(state.PID, 5*time.Second); err != nil {
-		cleanupStateFiles(beadsDir)
-		return err
+		return errors.Join(err, cleanupStateFiles(beadsDir))
 	}
-	cleanupStateFiles(beadsDir)
-	return nil
+	return cleanupStateFiles(beadsDir)
 }
 
-// cleanupStateFiles removes all server state files.
-func cleanupStateFiles(beadsDir string) {
-	_ = os.Remove(pidPath(beadsDir))
-	_ = os.Remove(portPath(beadsDir))
-	_ = os.Remove(activityPath(beadsDir))
-	stopIdleMonitor(beadsDir)
+// cleanupStateFiles removes all server state files (PID and port).
+// Returns a joined error for non-NotExist removal failures so callers
+// can surface filesystem problems while still treating "already clean"
+// as success. Logs non-NotExist errors at debug level (GH#2670).
+func cleanupStateFiles(beadsDir string) error {
+	var errs []error
+	for _, path := range []string{pidPath(beadsDir), portPath(beadsDir)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			debug.Logf("failed to remove server state file %s: %v", path, err)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // LogPath returns the path to the server log file.
@@ -647,40 +883,93 @@ func LogPath(beadsDir string) string {
 	return logPath(beadsDir)
 }
 
-// KillStaleServers finds and kills orphan dolt sql-server processes
-// not tracked by the canonical PID file.
-// Returns the PIDs of killed processes.
-func KillStaleServers(beadsDir string) ([]int, error) {
-	allPIDs := listDoltProcessPIDs()
+// killStaleServersForDir finds and kills orphan dolt sql-server processes for
+// the current repo's Dolt data directory that are not tracked by the canonical
+// PID file. Only processes that beads started (tracked via the PID file) are
+// eligible for cleanup. Externally-managed servers are never killed.
+//
+// A process is considered "external" (never kill) when any of:
+//   - ResolveServerMode() returns ServerModeExternal (explicit port, shared server, etc.)
+//   - No PID file exists (beads has no record of starting a server)
+func killStaleServersForDir(beadsDir string, allPIDs []int, inDir func(int, string) bool, kill func(int) error) ([]int, error) {
 	if len(allPIDs) == 0 {
 		return nil, nil
 	}
 
-	// Collect canonical PIDs (ones we should NOT kill)
-	canonicalPIDs := make(map[int]bool)
+	// If auto-start is disabled the server is externally managed (e.g., by
+	// systemd or a manual bd dolt start), so we must not kill any processes.
+	// IsAutoStartDisabled covers the BEADS_DOLT_AUTO_START env var and
+	// dolt.auto-start config; ResolveServerMode covers explicit port/shared
+	// server/embedded configurations. Both indicate "not our server" (GH#2641).
+	if IsAutoStartDisabled() || ResolveServerMode(beadsDir) == ServerModeExternal {
+		return nil, nil
+	}
+
 	serverDir := resolveServerDir(beadsDir)
-	if serverDir != "" {
-		if data, readErr := os.ReadFile(pidPath(serverDir)); readErr == nil {
-			if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && pid > 0 {
-				canonicalPIDs[pid] = true
-			}
+
+	// Read the canonical PID from the PID file. If there is no PID file,
+	// beads has no record of having started a server for this directory,
+	// so there is nothing stale to clean up. This prevents killing
+	// externally-started servers (systemd, other repos sharing a data dir).
+	var canonicalPID int
+	if data, readErr := os.ReadFile(pidPath(serverDir)); readErr == nil {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && pid > 0 {
+			canonicalPID = pid
 		}
 	}
+	if canonicalPID == 0 {
+		// No valid PID file → no beads-owned server to compare against.
+		// Nothing is stale from our perspective.
+		return nil, nil
+	}
+
+	// The canonical PID itself is alive and tracked — never kill it.
+	// Only kill OTHER dolt processes in our data dir (orphans from a
+	// previous beads-started server that lost its PID file tracking).
+	ownedDoltDir := ResolveDoltDir(serverDir)
 
 	var killed []int
 	for _, pid := range allPIDs {
 		if pid == os.Getpid() {
 			continue
 		}
-		if canonicalPIDs[pid] {
+		if pid == canonicalPID {
 			continue // preserve canonical server
 		}
-		if proc, findErr := os.FindProcess(pid); findErr == nil {
-			_ = proc.Kill()
+		if !inDir(pid, ownedDoltDir) {
+			continue // preserve other repos' Dolt servers
+		}
+		if err := kill(pid); err == nil {
 			killed = append(killed, pid)
 		}
 	}
 	return killed, nil
+}
+
+// KillStaleServers finds and kills orphan dolt sql-server processes for the
+// current repo's Dolt data directory that are not tracked by the canonical PID
+// file. Returns the PIDs of killed processes.
+//
+// When auto-start is disabled (BEADS_DOLT_AUTO_START=0 or dolt.auto-start:
+// false), this function is a no-op — the dolt server is externally managed
+// and must not be killed by bd (GH#2641).
+func KillStaleServers(beadsDir string) ([]int, error) {
+	if IsAutoStartDisabled() {
+		return nil, nil
+	}
+	allPIDs := listDoltProcessPIDs()
+	return killStaleServersForDir(
+		beadsDir,
+		allPIDs,
+		isProcessInDir,
+		func(pid int) error {
+			proc, err := os.FindProcess(pid)
+			if err != nil {
+				return err
+			}
+			return proc.Kill()
+		},
+	)
 }
 
 // waitForReady polls TCP until the server accepts connections.
@@ -821,216 +1110,4 @@ func IsPreV56DoltDir(doltDir string) bool {
 	markerPath := filepath.Join(doltDir, bdDoltMarker)
 	_, err := os.Stat(markerPath)
 	return os.IsNotExist(err)
-}
-
-// --- Idle monitor ---
-
-// DefaultIdleTimeout is the default duration before the idle monitor stops the server.
-const DefaultIdleTimeout = 30 * time.Minute
-
-// MonitorCheckInterval is how often the idle monitor checks activity.
-const MonitorCheckInterval = 60 * time.Second
-
-// stopServerProcess stops the Dolt server process without touching the idle
-// monitor's own state. This is used by the idle monitor to avoid killing itself
-// when shutting down an idle server. It flushes the working set, gracefully
-// stops the server, and removes server state files (PID, port) but leaves the
-// monitor PID file and activity file intact so the monitor can continue running
-// as a watchdog.
-func stopServerProcess(beadsDir string) error {
-	state, err := IsRunning(beadsDir)
-	if err != nil {
-		return err
-	}
-	if !state.Running {
-		return nil // already stopped
-	}
-
-	// Flush uncommitted working set changes before stopping.
-	cfg := DefaultConfig(beadsDir)
-	if flushErr := FlushWorkingSet(cfg.Host, state.Port); flushErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not flush working set before stop: %v\n", flushErr)
-	}
-
-	if err := gracefulStop(state.PID, 5*time.Second); err != nil {
-		_ = os.Remove(pidPath(beadsDir))
-		_ = os.Remove(portPath(beadsDir))
-		return err
-	}
-	_ = os.Remove(pidPath(beadsDir))
-	_ = os.Remove(portPath(beadsDir))
-	return nil
-}
-
-// forkIdleMonitor starts the idle monitor as a detached process.
-// It runs `bd dolt idle-monitor --beads-dir=<dir>` in the background.
-func forkIdleMonitor(beadsDir string) {
-	// Don't fork if there's already a monitor running
-	if isMonitorRunning(beadsDir) {
-		return
-	}
-
-	bdBin, err := os.Executable()
-	if err != nil {
-		return // best effort
-	}
-
-	cmd := exec.Command(bdBin, "dolt", "idle-monitor", "--beads-dir", beadsDir)
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = procAttrDetached()
-
-	if err := cmd.Start(); err != nil {
-		return // best effort
-	}
-
-	// Write monitor PID file
-	_ = os.WriteFile(monitorPidPath(beadsDir), []byte(strconv.Itoa(cmd.Process.Pid)), 0600)
-	_ = cmd.Process.Release()
-}
-
-// isMonitorRunning checks if the idle monitor process is alive.
-func isMonitorRunning(beadsDir string) bool {
-	data, err := os.ReadFile(monitorPidPath(beadsDir))
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return false
-	}
-	return isProcessAlive(pid)
-}
-
-// stopIdleMonitor kills the idle monitor process if running.
-func stopIdleMonitor(beadsDir string) {
-	data, err := os.ReadFile(monitorPidPath(beadsDir))
-	if err != nil {
-		return
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		_ = os.Remove(monitorPidPath(beadsDir))
-		return
-	}
-	if process, err := os.FindProcess(pid); err == nil {
-		_ = process.Kill()
-	}
-	_ = os.Remove(monitorPidPath(beadsDir))
-}
-
-// ReadActivityTime reads the last activity timestamp from the activity file.
-// Returns zero time if the file doesn't exist or is unreadable.
-func ReadActivityTime(beadsDir string) time.Time {
-	data, err := os.ReadFile(activityPath(beadsDir))
-	if err != nil {
-		return time.Time{}
-	}
-	ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return time.Time{}
-	}
-	return time.Unix(ts, 0)
-}
-
-// RunIdleMonitor is the main loop for the idle monitor sidecar process.
-// It checks the activity file periodically and stops the server if idle
-// for longer than the configured timeout. After stopping an idle server,
-// the monitor continues running as a watchdog: if new activity appears
-// (e.g. a bd command calls EnsureRunning and touches the activity file),
-// the monitor restarts the server. The monitor only exits after an
-// additional full idle timeout passes with no new activity.
-//
-// If the server crashed but activity is recent, the monitor restarts it
-// (watchdog behavior).
-//
-// idleTimeout of 0 means monitoring is disabled (exits immediately).
-func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
-	if idleTimeout == 0 {
-		return
-	}
-
-	// Single-instance enforcement: acquire an exclusive lock on the monitor
-	// lock file. If another monitor is already running, exit immediately.
-	// This prevents the accumulation bug (GH#2367) where Start() called from
-	// within the monitor's watchdog restart would fork yet another monitor.
-	monitorLockPath := monitorPidPath(beadsDir) + ".lock"
-	var monitorLock *os.File
-	if f, err := os.OpenFile(monitorLockPath, os.O_CREATE|os.O_RDWR, 0600); err == nil { //nolint:gosec // G304: path derived from trusted beadsDir
-		if lockErr := lockfile.FlockExclusiveNonBlocking(f); lockErr != nil {
-			_ = f.Close()
-			return // another monitor holds the lock — exit silently
-		}
-		monitorLock = f
-	}
-	// Keep lock held for lifetime of this process. Clean up on exit.
-	defer func() {
-		_ = os.Remove(monitorPidPath(beadsDir))
-		if monitorLock != nil {
-			_ = lockfile.FlockUnlock(monitorLock)
-			_ = monitorLock.Close()
-			_ = os.Remove(monitorLockPath)
-		}
-	}()
-
-	// Write our PID now that we hold the lock
-	_ = os.WriteFile(monitorPidPath(beadsDir), []byte(strconv.Itoa(os.Getpid())), 0600)
-
-	// Tracks when we stopped the server for idle timeout. Zero means we
-	// haven't performed an idle shutdown (or the server was restarted since).
-	var idleShutdownAt time.Time
-
-	for {
-		time.Sleep(MonitorCheckInterval)
-
-		state, err := IsRunning(beadsDir)
-		if err != nil {
-			continue
-		}
-
-		lastActivity := ReadActivityTime(beadsDir)
-		idleDuration := time.Since(lastActivity)
-
-		if state.Running {
-			idleShutdownAt = time.Time{} // server is up, clear idle-shutdown tracking
-
-			// Server is running — check if idle
-			if !lastActivity.IsZero() && idleDuration > idleTimeout {
-				// Idle too long — stop the server but keep monitoring.
-				// Use stopServerProcess (not Stop) to avoid killing ourselves.
-				_ = stopServerProcess(beadsDir)
-				idleShutdownAt = time.Now()
-			}
-		} else {
-			// Server is NOT running
-			if !idleShutdownAt.IsZero() {
-				// We stopped it for idle timeout. Check for new activity
-				// (e.g. EnsureRunning touched the activity file).
-				if !lastActivity.IsZero() && lastActivity.After(idleShutdownAt) {
-					// New activity since we stopped — restart
-					_, _ = Start(beadsDir)
-					idleShutdownAt = time.Time{}
-					continue
-				}
-				// No new activity yet. If we've been waiting longer than
-				// another full idle timeout since shutdown, give up and exit.
-				if time.Since(idleShutdownAt) > idleTimeout {
-					_ = os.Remove(monitorPidPath(beadsDir))
-					return
-				}
-				// Keep waiting for new activity
-				continue
-			}
-
-			// Server is down but we didn't stop it (crash or external stop)
-			if lastActivity.IsZero() || idleDuration > idleTimeout {
-				// No recent activity — just exit
-				_ = os.Remove(monitorPidPath(beadsDir))
-				return
-			}
-			// Recent activity but server crashed — restart
-			_, _ = Start(beadsDir)
-		}
-	}
 }

@@ -174,17 +174,17 @@ See [LABELS.md](LABELS.md#operational-state-pattern-labels-as-cache) for full pa
 ```bash
 # Query current state value
 bd state <id> <dimension>                    # Output: value
-bd state witness-abc patrol                  # Output: active
-bd state --json witness-abc patrol           # {"issue_id": "...", "dimension": "patrol", "value": "active"}
+bd state agent-abc patrol                  # Output: active
+bd state --json agent-abc patrol           # {"issue_id": "...", "dimension": "patrol", "value": "active"}
 
 # List all state dimensions on an issue
 bd state list <id> --json
-bd state list witness-abc                    # patrol: active, mode: normal, health: healthy
+bd state list agent-abc                    # patrol: active, mode: normal, health: healthy
 
 # Set state (creates event + updates label atomically)
 bd set-state <id> <dimension>=<value> --reason "explanation" --json
-bd set-state witness-abc patrol=muted --reason "Investigating stuck polecat"
-bd set-state witness-abc mode=degraded --reason "High error rate"
+bd set-state agent-abc patrol=muted --reason "Investigating stuck worker"
+bd set-state agent-abc mode=degraded --reason "High error rate"
 ```
 
 **Common dimensions:**
@@ -294,32 +294,6 @@ bd --sandbox <command>
 - Disables auto-sync operations
 
 **When to use:** Sandboxed environments where the Dolt server can't be controlled (permission restrictions), or when auto-detection doesn't trigger.
-
-### Staleness Control
-
-```bash
-# Skip staleness check (emergency escape hatch)
-bd --allow-stale <command>
-
-# Example: access database even if it appears out of sync
-bd --allow-stale ready --json
-bd --allow-stale list --status open --json
-```
-
-**Shows:** `⚠️  Staleness check skipped (--allow-stale), data may be out of sync`
-
-**⚠️ Caution:** May show stale or incomplete data. Use only when stuck and other options fail.
-
-### Force Import
-
-```bash
-# Force metadata update even when DB appears synced
-bd import --force -i .beads/issues.jsonl
-```
-
-**When to use:** `bd import` reports "0 created, 0 updated" but staleness errors persist.
-
-**Shows:** `Metadata updated (database already in sync)`
 
 ### Other Global Flags
 
@@ -587,37 +561,32 @@ bd gate add-waiter <gate-id> <waiter>
 
 ## Database Management
 
-### Import/Export
+### Export / Backup / Bootstrap
 
 ```bash
-# Import issues from JSONL
-bd import -i .beads/issues.jsonl --dry-run      # Preview changes
-bd import -i .beads/issues.jsonl                # Import and update issues
-bd import -i .beads/issues.jsonl --dedupe-after # Import + detect duplicates
+# Export issues to issue JSONL
+bd export -o issues.jsonl
 
-# Handle missing parents during import
-bd import -i issues.jsonl --orphan-handling allow      # Default: import orphans without validation
-bd import -i issues.jsonl --orphan-handling resurrect  # Auto-resurrect deleted parents as tombstones
-bd import -i issues.jsonl --orphan-handling skip       # Skip orphans with warning
-bd import -i issues.jsonl --orphan-handling strict     # Fail if parent is missing
+# Write or restore the supported JSONL backup snapshot
+bd backup
+bd backup restore
+bd backup export-git
+bd backup fetch-git
 
-# Configure default orphan handling behavior
+# Bootstrap a new database from an issue export
+bd init --from-jsonl                            # Reads .beads/issues.jsonl
+
+# Configure orphan handling for pulls and bootstrapping
 bd config set import.orphan_handling "resurrect"
-bd sync  # Now uses resurrect mode by default
+bd dolt pull  # Respects import.orphan_handling setting
 ```
 
-**Orphan handling modes:**
+**Orphan handling modes** (apply to `bd dolt pull` and `bd init --from-jsonl`):
 
 - **`allow` (default)** - Import orphaned children without parent validation. Most permissive, ensures no data loss even if hierarchy is temporarily broken.
-- **`resurrect`** - Search JSONL history for deleted parents and recreate them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
+- **`resurrect`** - Search for deleted parents and recreate them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data.
 - **`skip`** - Skip orphaned children with warning. Partial import succeeds but some issues are excluded.
-- **`strict`** - Fail import immediately if a child's parent is missing. Use when database integrity is critical.
-
-**When to use:**
-- Use `allow` (default) for daily imports and auto-sync
-- Use `resurrect` when importing from databases with deleted parents
-- Use `strict` for controlled imports requiring guaranteed parent existence
-- Use `skip` rarely - only for selective imports
+- **`strict`** - Fail immediately if a child's parent is missing. Use when database integrity is critical.
 
 See [CONFIG.md](CONFIG.md#example-import-orphan-handling) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#import-fails-with-missing-parent-errors) for more details.
 
@@ -685,7 +654,7 @@ bd migrate sync beads-sync --orphan                    # Delete and recreate as 
 
 **After setup:**
 
-- `bd sync` commits beads changes to the sync branch via worktree
+- `bd dolt push` commits beads changes to the sync branch via worktree
 - Your working branch stays clean of beads commits
 - Essential for multi-clone setups where clones work independently
 
@@ -698,14 +667,15 @@ bd migrate sync beads-sync --orphan                    # Delete and recreate as 
 ### Sync Operations
 
 ```bash
-# Manual sync (force immediate commit/push)
-bd sync
+# Manual sync (push changes to remote)
+bd dolt push
 
-# What it does:
-# 1. Commit pending changes to Dolt
-# 2. Pull from remote
-# 3. Merge any updates
-# 4. Push to remote
+# Pull changes from remote
+bd dolt pull
+
+# What these do:
+# bd dolt push - Commit pending changes to Dolt and push to remote
+# bd dolt pull - Pull from remote and merge any updates
 ```
 
 ### Key-Value Store
@@ -754,6 +724,8 @@ bd kv list --json                      # Machine-readable output
 
 ## Issue Statuses
 
+### Built-in Statuses
+
 - `open` - Ready to be worked on
 - `in_progress` - Currently being worked on
 - `blocked` - Cannot proceed (waiting on dependencies)
@@ -763,6 +735,44 @@ bd kv list --json                      # Machine-readable output
 - `pinned` - Stays open indefinitely (used for hooks, anchors)
 
 **Note:** The `pinned` status is used by orchestrators for hook management and persistent work items that should never be auto-closed or cleaned up.
+
+### Custom Statuses
+
+Define custom statuses with optional **categories** that control behavior in `bd ready` and `bd list`:
+
+```bash
+# Simple format (backward compatible — statuses get no category)
+bd config set status.custom "in_review,qa_testing,on_hold"
+
+# Category-annotated format
+bd config set status.custom "in_review:active,qa_testing:wip,on_hold:frozen"
+
+# Mixed format (some with categories, some without)
+bd config set status.custom "in_review:active,legacy_status,archived:done"
+```
+
+**Categories:**
+
+| Category | `bd ready` | Default `bd list` | Icon | Description |
+|----------|-----------|-------------------|------|-------------|
+| `active` | ✓ included | ✓ included | ○ | Ready for work (like `open`) |
+| `wip` | ✗ excluded | ✓ included | ◐ | Work-in-progress (like `in_progress`) |
+| `done` | ✗ excluded | ✗ excluded | ✓ | Terminal state (like `closed`) |
+| `frozen` | ✗ excluded | ✗ excluded | ❄ | On hold (like `deferred`) |
+| *(none)* | ✗ excluded | ✓ included | ◇ | No category — backward compatible default |
+
+**List all statuses** (built-in and custom):
+
+```bash
+bd statuses          # Human-readable table
+bd statuses --json   # JSON output for programmatic use
+```
+
+**Rules:**
+- Status names must match `[a-z][a-z0-9_-]*` (lowercase, letter-first)
+- Cannot collide with built-in status names (case-insensitive)
+- Maximum 50 custom statuses
+- All custom statuses work with `bd list --status <name>`
 
 ## Priorities
 
@@ -884,10 +894,10 @@ bd update bd-42 --claim --json
 # ... work ...
 
 # End of session (IMPORTANT!)
-bd sync  # Force immediate sync, bypass debounce
+bd dolt push  # Force immediate sync, bypass debounce
 ```
 
-**ALWAYS run `bd sync` at end of agent sessions** to ensure changes are committed/pushed immediately.
+**ALWAYS run `bd dolt push` at end of agent sessions** to ensure changes are committed/pushed immediately.
 
 ## Editor Integration
 
@@ -898,7 +908,8 @@ bd sync  # Force immediate sync, bypass debounce
 bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md (universal standard)
 bd setup codex    # Codex CLI - creates/updates AGENTS.md
 bd setup mux      # Mux - creates/updates AGENTS.md
-bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
+bd setup claude   # Claude Code - installs hooks + manages CLAUDE.md (minimal profile)
+bd setup gemini   # Gemini CLI - installs hooks + manages GEMINI.md (minimal profile)
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
 
@@ -907,6 +918,7 @@ bd setup factory --check
 bd setup codex --check
 bd setup mux --check
 bd setup claude --check
+bd setup gemini --check
 bd setup cursor --check
 bd setup aider --check
 
@@ -915,6 +927,7 @@ bd setup factory --remove
 bd setup codex --remove
 bd setup mux --remove
 bd setup claude --remove
+bd setup gemini --remove
 bd setup cursor --remove
 bd setup aider --remove
 ```
@@ -924,17 +937,23 @@ bd setup aider --remove
 bd setup claude              # Install globally (~/.claude/settings.json)
 bd setup claude --project    # Install for this project only
 bd setup claude --stealth    # Use stealth mode (flush only, no git operations)
+bd setup gemini              # Install globally (~/.gemini/settings.json)
+bd setup gemini --project    # Install for this project only
+bd setup gemini --stealth    # Use stealth mode (flush only, no git operations)
 bd setup mux --project       # Also install .mux/AGENTS.md workspace layer
 bd setup mux --global        # Also install ~/.mux/AGENTS.md global layer
 ```
 
 **What each setup does:**
-- **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (works with multiple AI tools using the AGENTS.md standard)
-- **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex
-- **Mux** (`bd setup mux`): Creates or updates AGENTS.md with beads workflow instructions for Mux workspaces
-- **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events
+- **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (full profile — works with multiple AI tools using the AGENTS.md standard)
+- **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex (full profile)
+- **Mux** (`bd setup mux`): Creates or updates AGENTS.md with beads workflow instructions for Mux workspaces (full profile)
+- **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events and manages a minimal-profile beads section in `CLAUDE.md`
+- **Gemini CLI** (`bd setup gemini`): Adds hooks to Gemini's settings.json that run `bd prime` on SessionStart and PreCompress events and manages a minimal-profile beads section in `GEMINI.md`
 - **Cursor** (`bd setup cursor`): Creates `.cursor/rules/beads.mdc` with workflow instructions
 - **Aider** (`bd setup aider`): Creates `.aider.conf.yml` with bd workflow instructions
+
+**`--check` behavior:** For section-based integrations (including Claude/Gemini instruction files), reports status as `current` (up to date), `stale` (legacy or hash mismatch — run setup to update), or `missing` (no beads section). Stale and missing return non-zero exit codes.
 
 See also:
 - [INSTALLING.md](INSTALLING.md#ide-and-editor-integrations) - Installation guide

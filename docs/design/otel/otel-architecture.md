@@ -166,7 +166,7 @@ defer telemetry.Shutdown(ctx)
 - `host`: system hostname
 - `os`: system OS info
 
-**Custom resource attributes** (via `OTEL_RESOURCE_ATTRIBUTES` env var or `BD_ACTOR`):
+**Custom resource attributes** (via `OTEL_RESOURCE_ATTRIBUTES` env var or `BEADS_ACTOR`):
 - `bd.actor`: Actor identity (from git config or env) — set after actor resolution
 - `bd.command`: Current command name
 - `bd.args`: Full arguments passed to command
@@ -293,7 +293,7 @@ OTel SDK uses dot-notation internally. Prometheus-compatible backends (VictoriaM
 
 | Variable | Source | Used By |
 |-----------|--------|----------|
-| `BD_ACTOR` | Git config / env var | Actor identity for audit trails |
+| `BEADS_ACTOR` | Git config / env var | Actor identity for audit trails (BD_ACTOR still works as deprecated alias) |
 | `BD_NAME` | Environment | Binary name override (for multi-instance setups) |
 | `OTEL_RESOURCE_ATTRIBUTES` | Operator | Custom resource attributes for all spans |
 
@@ -304,7 +304,7 @@ OTel SDK uses dot-notation internally. Prometheus-compatible backends (VictoriaM
 | `BEADS_DOLT_PASSWORD` | Server mode password |
 | `BEADS_DOLT_SERVER_MODE` | Enable server mode |
 | `BEADS_DOLT_SERVER_HOST` | Server host (default: 127.0.0.1) |
-| `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307 or derived) |
+| `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307, 3308 in shared mode, or derived) |
 | `BEADS_DOLT_SERVER_TLS` | Enable TLS for server connections |
 | `BEADS_DOLT_SERVER_USER` | MySQL connection user |
 | `DOLT_REMOTE_USER` | Push/pull auth user |

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/subosito/gotenv"
+
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -24,6 +26,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/utils"
@@ -34,7 +37,7 @@ import (
 var (
 	dbPath     string
 	actor      string
-	store      *dolt.DoltStore
+	store      storage.DoltStorage
 	jsonOutput bool
 
 	// Signal-aware context for graceful cancellation
@@ -116,8 +119,66 @@ func isReadOnlyCommand(cmdName string) bool {
 	return readOnlyCommands[cmdName]
 }
 
+// loadBeadsEnvFile loads .beads/.env into process environment for per-project
+// Dolt credentials (GH#2520). Uses gotenv.Load which is non-overriding —
+// existing shell env vars always take precedence.
+// Safe to call with an empty beadsDir (no-op).
+func loadBeadsEnvFile(beadsDir string) {
+	if beadsDir == "" {
+		return
+	}
+	envFile := filepath.Join(beadsDir, ".env")
+	if _, err := os.Stat(envFile); err != nil {
+		return
+	}
+	_ = gotenv.Load(envFile)
+}
+
+// loadEnvironment runs the lightweight, always-needed environment setup that
+// must happen before the noDbCommands early return. This ensures commands like
+// "bd doctor --server" pick up per-project Dolt credentials from .beads/.env.
+//
+// This function intentionally does NOT do any store initialization, auto-migrate,
+// or telemetry setup — those belong in the store-init phase that runs after the
+// noDbCommands check.
+func loadEnvironment() {
+	// FindBeadsDir is lightweight (filesystem walk, no git subprocesses)
+	// and resolves BEADS_DIR, redirects, and worktree paths.
+	if beadsDir := beads.FindBeadsDir(); beadsDir != "" {
+		loadBeadsEnvFile(beadsDir)
+	}
+}
+
+// resolveCommandBeadsDir maps a discovered Dolt data path back to the owning
+// .beads directory. filepath.Dir(dbPath) only works when the Dolt data lives
+// under .beads/dolt; custom dolt_data_dir values can place it elsewhere.
+func resolveCommandBeadsDir(dbPath string) string {
+	if dbPath == "" {
+		return ""
+	}
+
+	// BEADS_DB is an explicit database override, so preserve its legacy
+	// filepath.Dir behavior instead of trying to rediscover a repo-local .beads.
+	if os.Getenv("BEADS_DB") != "" {
+		return filepath.Dir(dbPath)
+	}
+
+	// Use the same validated candidate logic as the helper/reopen path
+	// (GH#2627). This checks filepath.Dir, canonicalized paths, AND
+	// FindBeadsDir — but only returns a candidate whose metadata.json
+	// actually points to dbPath, preventing CWD discovery from overriding
+	// an explicit --db flag.
+	if beadsDir := resolveBeadsDirForDBPath(dbPath); beadsDir != "" {
+		return beadsDir
+	}
+
+	// No candidate matched — fall back to parent directory of the db path.
+	// This handles bootstrap/init where no metadata.json exists yet.
+	return filepath.Dir(dbPath)
+}
+
 // getActorWithGit returns the actor for audit trails with git config fallback.
-// Priority: --actor flag > BD_ACTOR env > BEADS_ACTOR env > git config user.name > $USER > "unknown"
+// Priority: --actor flag > BEADS_ACTOR env > BD_ACTOR env (deprecated) > git config user.name > $USER > "unknown"
 // This provides a sensible default for developers: their git identity is used unless
 // explicitly overridden
 func getActorWithGit() string {
@@ -126,14 +187,14 @@ func getActorWithGit() string {
 		return actor
 	}
 
-	// Check BD_ACTOR env var (primary env override)
-	if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-		return bdActor
-	}
-
-	// Check BEADS_ACTOR env var (alias for MCP/integration compatibility)
+	// Check BEADS_ACTOR env var (primary env override)
 	if beadsActor := os.Getenv("BEADS_ACTOR"); beadsActor != "" {
 		return beadsActor
+	}
+
+	// Check BD_ACTOR env var (deprecated alias, kept for backwards compatibility)
+	if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+		return bdActor
 	}
 
 	// Try git config user.name - the natural default for a git-native tool
@@ -180,15 +241,13 @@ func init() {
 
 	// Register persistent flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
-	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BD_ACTOR, git user.name, $USER)")
+	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BEADS_ACTOR, git user.name, $USER)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().String("format", "", "Output format (json). Alias for --json")
+	_ = rootCmd.PersistentFlags().MarkHidden("format") // Hidden alias for CLI ergonomics
 	rootCmd.PersistentFlags().BoolVar(&sandboxMode, "sandbox", false, "Sandbox mode: disables auto-sync")
-	rootCmd.PersistentFlags().Bool("allow-stale", false, "No-op (kept for gt compatibility)")
-	if err := rootCmd.PersistentFlags().MarkHidden("allow-stale"); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to hide allow-stale flag: %v\n", err)
-	}
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
-	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd sync / bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit")
+	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit")
 	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
 	rootCmd.PersistentFlags().BoolVarP(&quietFlag, "quiet", "q", false, "Suppress non-essential output (errors only)")
@@ -276,8 +335,15 @@ var rootCmd = &cobra.Command{
 			WasSet bool
 		})
 
+		// Handle --format json alias (desire-path from GH#2612)
+		if cmd.Root().PersistentFlags().Changed("format") {
+			format, _ := cmd.Root().PersistentFlags().GetString("format")
+			if strings.EqualFold(format, "json") {
+				jsonOutput = true
+			}
+		}
 		// If flag wasn't explicitly set, use viper value
-		if !cmd.Flags().Changed("json") {
+		if !cmd.Root().PersistentFlags().Changed("json") && !cmd.Root().PersistentFlags().Changed("format") {
 			jsonOutput = config.GetBool("json")
 		} else {
 			flagOverrides["json"] = struct {
@@ -285,7 +351,7 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{jsonOutput, true}
 		}
-		if !cmd.Flags().Changed("readonly") {
+		if !cmd.Root().PersistentFlags().Changed("readonly") {
 			readonlyMode = config.GetBool("readonly")
 		} else {
 			flagOverrides["readonly"] = struct {
@@ -293,25 +359,25 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{readonlyMode, true}
 		}
-		if !cmd.Flags().Changed("db") && dbPath == "" {
+		if !cmd.Root().PersistentFlags().Changed("db") && dbPath == "" {
 			dbPath = config.GetString("db")
-		} else if cmd.Flags().Changed("db") {
+		} else if cmd.Root().PersistentFlags().Changed("db") {
 			flagOverrides["db"] = struct {
 				Value  interface{}
 				WasSet bool
 			}{dbPath, true}
 		}
-		if !cmd.Flags().Changed("actor") && actor == "" {
+		if !cmd.Root().PersistentFlags().Changed("actor") && actor == "" {
 			actor = config.GetString("actor")
-		} else if cmd.Flags().Changed("actor") {
+		} else if cmd.Root().PersistentFlags().Changed("actor") {
 			flagOverrides["actor"] = struct {
 				Value  interface{}
 				WasSet bool
 			}{actor, true}
 		}
-		if !cmd.Flags().Changed("dolt-auto-commit") && strings.TrimSpace(doltAutoCommit) == "" {
+		if !cmd.Root().PersistentFlags().Changed("dolt-auto-commit") && strings.TrimSpace(doltAutoCommit) == "" {
 			doltAutoCommit = config.GetString("dolt.auto-commit")
-		} else if cmd.Flags().Changed("dolt-auto-commit") {
+		} else if cmd.Root().PersistentFlags().Changed("dolt-auto-commit") {
 			flagOverrides["dolt-auto-commit"] = struct {
 				Value  interface{}
 				WasSet bool
@@ -331,6 +397,10 @@ var rootCmd = &cobra.Command{
 			FatalError("%v", err)
 		}
 
+		// GH#2677: Load .beads/.env before the noDbCommands early return so that
+		// commands like "bd doctor --server" pick up per-project Dolt credentials.
+		loadEnvironment()
+
 		// GH#1093: Check noDbCommands BEFORE expensive operations
 		// to avoid spawning git subprocesses for simple commands
 		// like "bd version" that don't need database access.
@@ -338,7 +408,9 @@ var rootCmd = &cobra.Command{
 			"__complete",       // Cobra's internal completion command (shell completions work without db)
 			"__completeNoDesc", // Cobra's completion without descriptions (used by fish)
 			"bash",
+			"bootstrap",
 			"completion",
+			"context", // reads config files directly, does not need DB open
 			"doctor",
 			"dolt", // bare "bd dolt" shows help only; subcommands handled below
 			"fish",
@@ -353,9 +425,7 @@ var rootCmd = &cobra.Command{
 			"powershell",
 			"prime",
 			"quickstart",
-			"resolve-conflicts",
 			"setup",
-			"sync", // deprecated no-op, prints message only
 			"version",
 			"zsh",
 		}
@@ -410,10 +480,30 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Auto-detect sandboxed environment (Phase 2 for GH #353)
-		if !cmd.Flags().Changed("sandbox") {
+		if !cmd.Root().PersistentFlags().Changed("sandbox") {
 			if isSandboxed() {
 				sandboxMode = true
 				fmt.Fprintf(os.Stderr, "ℹ️  Sandbox detected, using direct mode\n")
+			}
+		}
+
+		// Capture redirect info BEFORE FindDatabasePath() follows the redirect.
+		// When .beads/redirect points to a shared directory with a different
+		// dolt_database, the source's database name would be lost. Capture it
+		// early and set BEADS_DOLT_SERVER_DATABASE so all store opens use it.
+		redirectInfo := beads.GetRedirectInfo()
+		var sourceDoltDatabase string
+		if redirectInfo.IsRedirected && redirectInfo.LocalDir != "" {
+			rInfo := beads.ResolveRedirect(redirectInfo.LocalDir)
+			sourceDoltDatabase = rInfo.SourceDatabase
+		}
+		// Set env var early so ALL store opens (main + routed) use the correct
+		// database. Redirects may resolve to a shared .beads dir that serves
+		// multiple databases; the env var ensures the right one is selected.
+		if sourceDoltDatabase != "" && os.Getenv("BEADS_DOLT_SERVER_DATABASE") == "" {
+			_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", sourceDoltDatabase)
+			if os.Getenv("BD_DEBUG_ROUTING") != "" {
+				fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", sourceDoltDatabase)
 			}
 		}
 
@@ -437,7 +527,7 @@ var rootCmd = &cobra.Command{
 				if cmd.Name() != "import" && cmd.Name() != "setup" && !isYamlOnlyConfigOp {
 					// No database found - provide context-aware error message
 					fmt.Fprintf(os.Stderr, "Error: no beads database found\n")
-					fmt.Fprintf(os.Stderr, "Hint: run 'bd init' to create a database in the current directory\n")
+					fmt.Fprintf(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database\n")
 					fmt.Fprintf(os.Stderr, "      or set BEADS_DIR to point to your .beads directory\n")
 					os.Exit(1)
 				}
@@ -478,7 +568,7 @@ var rootCmd = &cobra.Command{
 		// opens its own store connection, writes the version metadata, commits it,
 		// and closes BEFORE the main store is opened. This ensures bd doctor and
 		// read-only commands see the correct version after a CLI upgrade.
-		beadsDir := filepath.Dir(dbPath)
+		beadsDir := resolveCommandBeadsDir(dbPath)
 
 		autoMigrateOnVersionBump(beadsDir)
 
@@ -495,32 +585,31 @@ var rootCmd = &cobra.Command{
 
 		// Load config to get database name and server connection settings
 		cfg, cfgErr := configfile.Load(beadsDir)
-		if cfgErr == nil && cfg != nil {
+		if cfgErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to load beads config from %s: %v\n", beadsDir, cfgErr)
+		}
+		if cfg != nil {
 			// Always set database name (needed for bootstrap to find
 			// prefix-based databases like "beads_hq"; see #1669)
 			doltCfg.Database = cfg.GetDoltDatabase()
 
 			doltCfg.ServerHost = cfg.GetDoltServerHost()
-			// cfg.GetDoltServerPort() falls back to 3307 which is wrong for
-			// standalone mode where the port is hash-derived from the beadsDir
-			// path. Use doltserver.DefaultConfig() which checks metadata.json,
-			// env vars, and falls back to the hash-derived port.
+			// Use doltserver.DefaultConfig for port resolution (env > port file >
+			// config.yaml). Port 0 is fine here — auto-start will resolve it.
 			doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
 			doltCfg.ServerUser = cfg.GetDoltServerUser()
 			doltCfg.ServerPassword = cfg.GetDoltServerPassword()
 			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
+		} else if cfgErr == nil {
+			// Load returned (nil, nil) — no config file found.
+			// Log so silent fallback to default DB is visible.
+			fmt.Fprintf(os.Stderr, "warning: no beads configuration found in %s; database name may default incorrectly\n", beadsDir)
 		}
 		doltCfg.SyncGitRemote = config.GetString("sync.git-remote")
 
-		// Auto-start: enabled by default.
-		// Can be disabled by explicit config or env var.
-		doltCfg.AutoStart = true
-		if os.Getenv("BEADS_DOLT_AUTO_START") == "0" {
-			doltCfg.AutoStart = false
-		}
-		if v := config.GetString("dolt.auto-start"); v == "false" || v == "0" || v == "off" {
-			doltCfg.AutoStart = false
-		}
+		// Keep standalone CLI auto-start behavior centralized so doctor and
+		// other helper paths stay in lockstep with the main command path.
+		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
 		// Server mode defaults auto-commit to OFF because the server handles
 		// commits via its own transaction lifecycle; firing DOLT_COMMIT after
@@ -534,11 +623,14 @@ var rootCmd = &cobra.Command{
 		// Pre-flight: clean stale noms LOCK files left by crashed Dolt processes.
 		// These prevent the Dolt server from opening databases (SIGSEGV or
 		// "database is locked"). Safe because we haven't connected yet.
-		if removed, _ := dolt.CleanStaleNomsLocks(doltPath); removed > 0 {
-			debug.Logf("cleaned %d stale noms LOCK file(s) from %s", removed, doltPath)
+		// NOTE: Intentionally skipped for embedded mode.
+		if !isEmbeddedDolt {
+			if removed, _ := dolt.CleanStaleNomsLocks(doltPath); removed > 0 {
+				debug.Logf("cleaned %d stale noms LOCK file(s) from %s", removed, doltPath)
+			}
 		}
 
-		store, err = dolt.New(rootCtx, doltCfg)
+		store, err = newDoltStore(rootCtx, doltCfg)
 
 		// Track final read-only state for staleness checks (GH#1089)
 		storeIsReadOnly = doltCfg.ReadOnly
@@ -555,6 +647,12 @@ var rootCmd = &cobra.Command{
 		storeMutex.Lock()
 		storeActive = true
 		storeMutex.Unlock()
+
+		// Validate workspace identity for write commands (GH#2438, GH#2372)
+		// Skip for read-only commands since they can't corrupt data
+		if !useReadOnly && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
+			validateWorkspaceIdentity(rootCtx, beadsDir)
+		}
 
 		// Initialize hook runner
 		// dbPath is .beads/something.db, so workspace root is parent of .beads
@@ -733,6 +831,51 @@ func flushBatchCommitOnShutdown() {
 		fmt.Fprintf(os.Stderr, "\nWarning: failed to flush batch commit on shutdown: %v\n", commitErr)
 	} else if committed {
 		fmt.Fprintf(os.Stderr, "\nFlushed pending batch commit on shutdown\n")
+	}
+}
+
+// validateWorkspaceIdentity checks that the project identity from metadata.json
+// matches the database's stored project_id. A mismatch indicates configuration
+// drift — the CLI may be pointing at the wrong database (GH#2438, GH#2372).
+//
+// This check only runs for write commands because:
+// 1. Read commands are safe even against wrong databases (no data mutation)
+// 2. The check requires an open store connection
+// 3. New databases won't have _project_id yet (bootstrap case)
+func validateWorkspaceIdentity(ctx context.Context, beadsDir string) {
+	if store == nil {
+		return // No store connection, nothing to validate
+	}
+
+	// Load project_id from metadata.json
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return // No config, skip validation (fresh init)
+	}
+	configProjectID := cfg.ProjectID
+	if configProjectID == "" {
+		return // No project_id in config (pre-identity era)
+	}
+
+	// Get project_id from database
+	dbProjectID, err := store.GetMetadata(ctx, "_project_id")
+	if err != nil || dbProjectID == "" {
+		return // No project_id in DB (new or pre-identity database)
+	}
+
+	// Compare: mismatch means drift
+	if configProjectID != dbProjectID {
+		fmt.Fprintf(os.Stderr, "Error: workspace identity mismatch detected\n\n")
+		fmt.Fprintf(os.Stderr, "  metadata.json project_id: %s\n", configProjectID)
+		fmt.Fprintf(os.Stderr, "  database _project_id:     %s\n\n", dbProjectID)
+		fmt.Fprintf(os.Stderr, "This means the CLI config and database belong to different projects.\n")
+		fmt.Fprintf(os.Stderr, "Possible causes:\n")
+		fmt.Fprintf(os.Stderr, "  • BEADS_DIR points to a different project's .beads/\n")
+		fmt.Fprintf(os.Stderr, "  • Dolt server endpoint changed and now serves a different database\n")
+		fmt.Fprintf(os.Stderr, "  • metadata.json was copied from another project\n\n")
+		fmt.Fprintf(os.Stderr, "To diagnose: bd context --json\n")
+		fmt.Fprintf(os.Stderr, "To override: set BEADS_SKIP_IDENTITY_CHECK=1\n")
+		os.Exit(1)
 	}
 }
 

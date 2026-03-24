@@ -17,6 +17,24 @@ jobs:
       - name: Check all versions match
         run: ./scripts/check-versions.sh
 
+  # Check documentation references match actual CLI flags
+  check-doc-flags:
+    name: Check doc flags freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build bd
+        run: CGO_ENABLED=0 go build -o bd ./cmd/bd/
+
+      - name: Validate docs against CLI
+        run: ./scripts/check-doc-flags.sh ./bd
+
   # Fast check to catch accidental .beads/issues.jsonl changes from contributors
   check-no-beads-changes:
     name: Check for .beads changes
@@ -123,6 +141,39 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           report_type: test_results
           fail_ci_if_error: false
+
+  # Embedded Dolt tests - runs the embeddeddolt build tag tests
+  # These test the in-process Dolt engine (no server required)
+  test-embedded-dolt:
+    name: Test (Embedded Dolt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install ICU4C
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "CI Bot"
+          git config --global user.email "ci@beads.test"
+
+      - name: Test (embedded dolt - storage)
+        env:
+          BEADS_TEST_EMBEDDED_DOLT: "1"
+        run: go test -tags embeddeddolt -v -race -count=1 ./internal/storage/embeddeddolt/
+
+      - name: Test (embedded dolt - cmd)
+        env:
+          BEADS_TEST_EMBEDDED_DOLT: "1"
+        run: go test -tags embeddeddolt -v -race -count=1 -timeout 20m -run TestEmbedded ./cmd/bd/
 
   # Windows smoke tests only - full test suite times out (see bd-bmev)
   # Linux/macOS run comprehensive tests; Windows just verifies binary works

@@ -43,9 +43,8 @@ func TestInitCancel_E2E(t *testing.T) {
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stdoutW
-	cmd.Env = append(filteredEnv("BEADS_DB", "BEADS_DIR", "BEADS_NO_DAEMON", "HOME", "XDG_CONFIG_HOME"),
+	cmd.Env = append(filteredEnv("BEADS_DB", "BEADS_DIR", "HOME", "XDG_CONFIG_HOME"),
 		"BEADS_DB=",
-		"BEADS_NO_DAEMON=1",
 		"HOME="+tmpDir,
 		"XDG_CONFIG_HOME="+filepath.Join(tmpDir, "xdg-config"),
 	)
@@ -135,6 +134,16 @@ func TestInitCancel_E2E(t *testing.T) {
 	}
 	if !strings.Contains(getOutput(), "Setup canceled.") {
 		t.Fatalf("expected cancel message, got:\n%s", getOutput())
+	}
+}
+
+func runGitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed in %s: %v\n%s", args, dir, err, output)
 	}
 }
 

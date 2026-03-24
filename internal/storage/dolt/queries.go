@@ -9,100 +9,28 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// SearchIssues finds issues matching query and filters
+// SearchIssues finds issues matching query and filters.
+// Delegates to issueops.SearchIssuesInTx for shared query logic.
 func (s *DoltStore) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
-	// Route ephemeral-only queries to wisps table, falling through to
-	// issues table if wisps table doesn't exist (pre-migration databases).
-	if filter.Ephemeral != nil && *filter.Ephemeral {
-		results, err := s.searchWisps(ctx, query, filter)
-		if err != nil && !isTableNotExistError(err) {
-			return nil, fmt.Errorf("search wisps (ephemeral filter): %w", err)
-		}
-		if len(results) > 0 {
-			return results, nil
-		}
-		// Fall through: wisps table doesn't exist or returned no results
-	}
-
-	// If searching by IDs that are all ephemeral, try wisps table first,
-	// falling through to the issues table if not found (handles pre-migration
-	// databases where ephemeral rows live in issues with ephemeral=1).
-	if len(filter.IDs) > 0 && allEphemeral(filter.IDs) {
-		results, err := s.searchWisps(ctx, query, filter)
-		if err != nil && !isTableNotExistError(err) {
-			return nil, fmt.Errorf("search wisps (ephemeral IDs): %w", err)
-		}
-		if len(results) > 0 {
-			return results, nil
-		}
-		// Fall through: wisps table doesn't exist or IDs may be in issues table
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	whereClauses, args, err := buildIssueFilterClauses(query, filter, issuesFilterTables)
-	if err != nil {
-		return nil, err
-	}
-
-	whereSQL := ""
-	if len(whereClauses) > 0 {
-		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
-	}
-
-	limitSQL := ""
-	if filter.Limit > 0 {
-		limitSQL = fmt.Sprintf(" LIMIT %d", filter.Limit)
-	}
-
-	// nolint:gosec // G201: whereSQL contains column comparisons with ?, limitSQL is a safe integer
-	querySQL := fmt.Sprintf(`
-		SELECT id FROM issues
-		%s
-		ORDER BY priority ASC, created_at DESC, id ASC
-		%s
-	`, whereSQL, limitSQL)
-
-	rows, err := s.queryContext(ctx, querySQL, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search issues: %w", err)
-	}
-	defer rows.Close()
-
-	doltResults, err := s.scanIssueIDs(ctx, rows)
-	if err != nil {
-		return nil, err
-	}
-
-	// When filter.Ephemeral is nil (search everything), also search the wisps
-	// table and merge results. This ensures ephemeral beads appear in queries.
-	if filter.Ephemeral == nil {
-		wispResults, wispErr := s.searchWisps(ctx, query, filter)
-		if wispErr != nil && !isTableNotExistError(wispErr) {
-			return nil, fmt.Errorf("search wisps (merge): %w", wispErr)
-		}
-		if len(wispResults) > 0 {
-			// Deduplicate by ID (prefer Dolt version if exists in both)
-			seen := make(map[string]bool, len(doltResults))
-			for _, issue := range doltResults {
-				seen[issue.ID] = true
-			}
-			for _, issue := range wispResults {
-				if !seen[issue.ID] {
-					doltResults = append(doltResults, issue)
-				}
-			}
-		}
-	}
-
-	return doltResults, nil
+	var result []*types.Issue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.SearchIssuesInTx(ctx, tx, query, filter)
+		return err
+	})
+	return result, err
 }
 
-// GetReadyWork returns issues that are ready to work on (not blocked)
+// GetReadyWork returns issues that are ready to work on (not blocked).
+//
+// Blocking semantics are unified through computeBlockedIDs, which is the
+// canonical source of truth for both GetReadyWork and GetBlockedIssues.
+// The molecule subgraph analysis (analyzeMoleculeParallel) uses equivalent
+// logic scoped to an in-memory subgraph rather than the full database.
 func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -137,7 +65,7 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 	} else {
 		// Exclude workflow/identity types from ready work by default.
 		// These are internal items, not actionable work for agents to claim:
-		// - merge-request: processed by Refinery
+		// - merge-request: processed by automation
 		// - gate: async wait conditions
 		// - molecule: workflow containers
 		// - message: mail/communication items
@@ -145,6 +73,10 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 		// - role: agent role definitions (reference metadata)
 		// - rig: rig identity beads (reference metadata)
 		excludeTypes := []string{"merge-request", "gate", "molecule", "message", "agent", "role", "rig"}
+		// Append caller-supplied exclusions (e.g., from --exclude-type flag).
+		for _, t := range filter.ExcludeTypes {
+			excludeTypes = append(excludeTypes, string(t))
+		}
 		placeholders := make([]string, len(excludeTypes))
 		for i, t := range excludeTypes {
 			placeholders[i] = "?"
@@ -479,180 +411,24 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 
 // GetEpicsEligibleForClosure returns epics whose children are all closed
 func (s *DoltStore) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error) {
-	// Use separate single-table queries to avoid Dolt's joinIter panic
-	// (join_iters.go:192) which triggers on multi-table JOINs.
-
-	// Step 1: Get open epic IDs (single-table scan)
-	epicRows, err := s.queryContext(ctx, `
-		SELECT id FROM issues
-		WHERE issue_type = 'epic'
-		  AND status != 'closed'
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get epics: %w", err)
-	}
-	var epicIDs []string
-	for epicRows.Next() {
-		var id string
-		if err := epicRows.Scan(&id); err != nil {
-			_ = epicRows.Close() // Best effort cleanup on error path
-			return nil, wrapScanError("get epics eligible for closure", err)
-		}
-		epicIDs = append(epicIDs, id)
-	}
-	_ = epicRows.Close() // Redundant close for safety (rows already iterated)
-
-	if len(epicIDs) == 0 {
-		return nil, nil
-	}
-
-	// Step 2: Get parent-child dependencies (single-table scan)
-	depRows, err := s.queryContext(ctx, `
-		SELECT depends_on_id, issue_id FROM dependencies
-		WHERE type = 'parent-child'
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get parent-child deps: %w", err)
-	}
-	// Map: parent_id -> list of child IDs
-	epicChildMap := make(map[string][]string)
-	epicSet := make(map[string]bool, len(epicIDs))
-	for _, id := range epicIDs {
-		epicSet[id] = true
-	}
-	for depRows.Next() {
-		var parentID, childID string
-		if err := depRows.Scan(&parentID, &childID); err != nil {
-			_ = depRows.Close() // Best effort cleanup on error path
-			return nil, wrapScanError("get epics: scan parent-child dep", err)
-		}
-		if epicSet[parentID] {
-			epicChildMap[parentID] = append(epicChildMap[parentID], childID)
-		}
-	}
-	_ = depRows.Close() // Redundant close for safety (rows already iterated)
-
-	// Step 3: Batch-fetch statuses for all child issues across all epics
-	allChildIDs := make([]string, 0)
-	for _, children := range epicChildMap {
-		allChildIDs = append(allChildIDs, children...)
-	}
-	childStatusMap := make(map[string]string)
-	if len(allChildIDs) > 0 {
-		// Check both issues and wisps tables for child statuses (bd-w2w)
-		// Uses batched IN clauses (queryBatchSize) to avoid full table scans on Dolt.
-		for _, table := range []string{"issues", "wisps"} {
-			for start := 0; start < len(allChildIDs); start += queryBatchSize {
-				end := start + queryBatchSize
-				if end > len(allChildIDs) {
-					end = len(allChildIDs)
-				}
-				batch := allChildIDs[start:end]
-				placeholders, args := doltBuildSQLInClause(batch)
-
-				// nolint:gosec // G201: table is hardcoded, placeholders contains only ? markers
-				statusQuery := fmt.Sprintf("SELECT id, status FROM %s WHERE id IN (%s)", table, placeholders)
-				statusRows, err := s.queryContext(ctx, statusQuery, args...)
-				if err != nil {
-					if isTableNotExistError(err) {
-						break // wisps table may not exist on pre-migration databases (GH#2271)
-					}
-					return nil, fmt.Errorf("failed to batch-fetch child statuses from %s: %w", table, err)
-				}
-				for statusRows.Next() {
-					var id, status string
-					if err := statusRows.Scan(&id, &status); err != nil {
-						_ = statusRows.Close()
-						return nil, wrapScanError("get epics: scan child status", err)
-					}
-					childStatusMap[id] = status
-				}
-				_ = statusRows.Close()
-			}
-		}
-	}
-
-	// Step 4: Batch-fetch all epic issues
-	epicsWithChildren := make([]string, 0)
-	for _, epicID := range epicIDs {
-		if len(epicChildMap[epicID]) > 0 {
-			epicsWithChildren = append(epicsWithChildren, epicID)
-		}
-	}
-	epicIssues, err := s.GetIssuesByIDs(ctx, epicsWithChildren)
-	if err != nil {
-		return nil, fmt.Errorf("failed to batch-fetch epic issues: %w", err)
-	}
-	epicIssueMap := make(map[string]*types.Issue, len(epicIssues))
-	for _, issue := range epicIssues {
-		epicIssueMap[issue.ID] = issue
-	}
-
-	// Step 5: Build results from cached data
-	var results []*types.EpicStatus
-	for _, epicID := range epicIDs {
-		children := epicChildMap[epicID]
-		if len(children) == 0 {
-			continue
-		}
-
-		issue, ok := epicIssueMap[epicID]
-		if !ok || issue == nil {
-			continue
-		}
-
-		totalChildren := len(children)
-		closedChildren := 0
-		for _, childID := range children {
-			if status, ok := childStatusMap[childID]; ok && types.Status(status) == types.StatusClosed {
-				closedChildren++
-			}
-		}
-
-		results = append(results, &types.EpicStatus{
-			Epic:             issue,
-			TotalChildren:    totalChildren,
-			ClosedChildren:   closedChildren,
-			EligibleForClose: totalChildren > 0 && totalChildren == closedChildren,
-		})
-	}
-
-	return results, nil
+	var result []*types.EpicStatus
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetEpicsEligibleForClosureInTx(ctx, tx)
+		return err
+	})
+	return result, err
 }
 
 // GetStaleIssues returns issues that haven't been updated recently
 func (s *DoltStore) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
-	cutoff := time.Now().UTC().AddDate(0, 0, -filter.Days)
-
-	statusClause := "status IN ('open', 'in_progress')"
-	if filter.Status != "" {
-		statusClause = "status = ?"
-	}
-
-	// nolint:gosec // G201: statusClause contains only literal SQL or a single ? placeholder
-	query := fmt.Sprintf(`
-		SELECT id FROM issues
-		WHERE updated_at < ?
-		  AND %s
-		  AND (ephemeral = 0 OR ephemeral IS NULL)
-		ORDER BY updated_at ASC
-	`, statusClause)
-	args := []interface{}{cutoff}
-	if filter.Status != "" {
-		args = append(args, filter.Status)
-	}
-
-	if filter.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", filter.Limit)
-	}
-
-	rows, err := s.queryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get stale issues: %w", err)
-	}
-	defer rows.Close()
-
-	return s.scanIssueIDs(ctx, rows)
+	var result []*types.Issue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetStaleIssuesInTx(ctx, tx, filter)
+		return err
+	})
+	return result, err
 }
 
 // GetStatistics returns summary statistics
@@ -1320,51 +1096,14 @@ func (s *DoltStore) GetMoleculeLastActivity(ctx context.Context, moleculeID stri
 	return result, nil
 }
 
-// GetNextChildID returns the next available child ID for a parent
+// GetNextChildID returns the next available child ID for a parent.
+// Delegates SQL work to issueops.GetNextChildIDTx.
 func (s *DoltStore) GetNextChildID(ctx context.Context, parentID string) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", wrapTransactionError("get next child ID: begin", err)
-	}
-	defer tx.Rollback()
-
-	var lastChild int
-	err = tx.QueryRowContext(ctx, "SELECT last_child FROM child_counters WHERE parent_id = ?", parentID).Scan(&lastChild)
-	if err == sql.ErrNoRows {
-		lastChild = 0
-	} else if err != nil {
-		return "", wrapQueryError("get next child ID: read counter", err)
-	}
-
-	// Check existing children to prevent overwrites after JSONL import (GH#2166).
-	// The counter may be stale if issues were imported without reconciling child_counters.
-	var maxExisting sql.NullInt64
-	err = tx.QueryRowContext(ctx, `
-		SELECT MAX(CAST(SUBSTRING_INDEX(id, '.', -1) AS UNSIGNED))
-		FROM issues
-		WHERE id LIKE CONCAT(?, '.%')
-		  AND id NOT LIKE CONCAT(?, '.%.%')
-	`, parentID, parentID).Scan(&maxExisting)
-	if err != nil {
-		return "", wrapQueryError("get next child ID: scan existing children", err)
-	}
-	if maxExisting.Valid && int(maxExisting.Int64) > lastChild {
-		lastChild = int(maxExisting.Int64)
-	}
-
-	nextChild := lastChild + 1
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE last_child = ?
-	`, parentID, nextChild, nextChild)
-	if err != nil {
-		return "", wrapExecError("get next child ID: update counter", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return "", wrapTransactionError("get next child ID: commit", err)
-	}
-
-	return fmt.Sprintf("%s.%d", parentID, nextChild), nil
+	var childID string
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		childID, err = issueops.GetNextChildIDTx(ctx, tx, parentID)
+		return err
+	})
+	return childID, err
 }

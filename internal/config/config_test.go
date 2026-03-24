@@ -124,7 +124,6 @@ func TestConfigFile(t *testing.T) {
 	// Create a config file
 	configContent := `
 json: true
-no-daemon: true
 actor: configuser
 `
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -159,10 +158,6 @@ actor: configuser
 		t.Errorf("GetBool(json) = %v, want true", got)
 	}
 
-	if got := GetBool("no-daemon"); got != true {
-		t.Errorf("GetBool(no-daemon) = %v, want true", got)
-	}
-
 	if got := GetString("actor"); got != "configuser" {
 		t.Errorf("GetString(actor) = %q, want \"configuser\"", got)
 	}
@@ -185,7 +180,6 @@ func TestLocalConfigOverride(t *testing.T) {
 	// Create main config file with some settings
 	configContent := `
 json: false
-no-daemon: false
 actor: project-user
 `
 	configPath := filepath.Join(beadsDir, "config.yaml")
@@ -195,7 +189,6 @@ actor: project-user
 
 	// Create local config file that overrides some settings
 	localConfigContent := `
-no-daemon: true
 actor: local-user
 `
 	localConfigPath := filepath.Join(beadsDir, "config.local.yaml")
@@ -212,10 +205,6 @@ actor: local-user
 	}
 
 	// Test that local config values override project config values
-	if got := GetBool("no-daemon"); got != true {
-		t.Errorf("GetBool(no-daemon) = %v, want true (local override)", got)
-	}
-
 	if got := GetString("actor"); got != "local-user" {
 		t.Errorf("GetString(actor) = %q, want \"local-user\" (local override)", got)
 	}
@@ -591,8 +580,8 @@ func TestGetExternalProjects(t *testing.T) {
 
 	// Test with Set
 	Set("external_projects", map[string]string{
-		"beads":   "../beads",
-		"gastown": "/absolute/path/to/gastown",
+		"beads":         "../beads",
+		"other-project": "/absolute/path/to/other-project",
 	})
 
 	got = GetExternalProjects()
@@ -602,8 +591,8 @@ func TestGetExternalProjects(t *testing.T) {
 	if got["beads"] != "../beads" {
 		t.Errorf("GetExternalProjects()[beads] = %q, want \"../beads\"", got["beads"])
 	}
-	if got["gastown"] != "/absolute/path/to/gastown" {
-		t.Errorf("GetExternalProjects()[gastown] = %q, want \"/absolute/path/to/gastown\"", got["gastown"])
+	if got["other-project"] != "/absolute/path/to/other-project" {
+		t.Errorf("GetExternalProjects()[other-project] = %q, want \"/absolute/path/to/other-project\"", got["other-project"])
 	}
 }
 
@@ -615,7 +604,7 @@ func TestGetExternalProjectsFromConfig(t *testing.T) {
 	configContent := `
 external_projects:
   beads: ../beads
-  gastown: /path/to/gastown
+  other-project: /path/to/other-project
   other: ./relative/path
 `
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -645,8 +634,8 @@ external_projects:
 	if got["beads"] != "../beads" {
 		t.Errorf("GetExternalProjects()[beads] = %q, want \"../beads\"", got["beads"])
 	}
-	if got["gastown"] != "/path/to/gastown" {
-		t.Errorf("GetExternalProjects()[gastown] = %q, want \"/path/to/gastown\"", got["gastown"])
+	if got["other-project"] != "/path/to/other-project" {
+		t.Errorf("GetExternalProjects()[other-project] = %q, want \"/path/to/other-project\"", got["other-project"])
 	}
 	if got["other"] != "./relative/path" {
 		t.Errorf("GetExternalProjects()[other] = %q, want \"./relative/path\"", got["other"])
@@ -1114,26 +1103,6 @@ validation:
 	}
 }
 
-// Tests for sync mode configuration (hq-ew1mbr.3)
-
-func TestSyncModeConstants(t *testing.T) {
-	if SyncModeDoltNative != "dolt-native" {
-		t.Errorf("SyncModeDoltNative = %q, want \"dolt-native\"", SyncModeDoltNative)
-	}
-}
-
-func TestSyncTriggerConstants(t *testing.T) {
-	if SyncTriggerPush != "push" {
-		t.Errorf("SyncTriggerPush = %q, want \"push\"", SyncTriggerPush)
-	}
-	if SyncTriggerChange != "change" {
-		t.Errorf("SyncTriggerChange = %q, want \"change\"", SyncTriggerChange)
-	}
-	if SyncTriggerPull != "pull" {
-		t.Errorf("SyncTriggerPull = %q, want \"pull\"", SyncTriggerPull)
-	}
-}
-
 func TestSovereigntyConstants(t *testing.T) {
 	if SovereigntyT1 != "T1" {
 		t.Errorf("SovereigntyT1 = %q, want \"T1\"", SovereigntyT1)
@@ -1146,34 +1115,6 @@ func TestSovereigntyConstants(t *testing.T) {
 	}
 	if SovereigntyT4 != "T4" {
 		t.Errorf("SovereigntyT4 = %q, want \"T4\"", SovereigntyT4)
-	}
-}
-
-func TestSyncConfigDefaults(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Test sync mode default
-	if got := GetSyncMode(); got != SyncModeDoltNative {
-		t.Errorf("GetSyncMode() = %q, want %q", got, SyncModeDoltNative)
-	}
-
-	// Test sync config defaults
-	cfg := GetSyncConfig()
-	if cfg.Mode != SyncModeDoltNative {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", cfg.Mode, SyncModeDoltNative)
-	}
-	if cfg.ExportOn != SyncTriggerPush {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", cfg.ExportOn, SyncTriggerPush)
-	}
-	if cfg.ImportOn != SyncTriggerPull {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", cfg.ImportOn, SyncTriggerPull)
 	}
 }
 
@@ -1198,17 +1139,12 @@ func TestFederationConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestSyncConfigFromFile(t *testing.T) {
+func TestFederationConfigFromFile(t *testing.T) {
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
 
-	// Create a config file with sync settings
+	// Create a config file with federation settings
 	configContent := `
-sync:
-  mode: dolt-native
-  export_on: change
-  import_on: change
-
 federation:
   remote: dolthub://myorg/beads
   sovereignty: T2
@@ -1231,18 +1167,6 @@ federation:
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	// Test sync config
-	syncCfg := GetSyncConfig()
-	if syncCfg.Mode != SyncModeDoltNative {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", syncCfg.Mode, SyncModeDoltNative)
-	}
-	if syncCfg.ExportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", syncCfg.ExportOn, SyncTriggerChange)
-	}
-	if syncCfg.ImportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", syncCfg.ImportOn, SyncTriggerChange)
-	}
-
 	// Test federation config
 	fedCfg := GetFederationConfig()
 	if fedCfg.Remote != "dolthub://myorg/beads" {
@@ -1250,23 +1174,6 @@ federation:
 	}
 	if fedCfg.Sovereignty != SovereigntyT2 {
 		t.Errorf("GetFederationConfig().Sovereignty = %q, want %q", fedCfg.Sovereignty, SovereigntyT2)
-	}
-}
-
-func TestGetSyncModeInvalid(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Set invalid mode - always returns dolt-native now
-	Set("sync.mode", "invalid-mode")
-	if got := GetSyncMode(); got != SyncModeDoltNative {
-		t.Errorf("GetSyncMode() with invalid mode = %q, want %q", got, SyncModeDoltNative)
 	}
 }
 
@@ -1385,122 +1292,6 @@ func TestGetCustomTypesFromYAML_NilViper(t *testing.T) {
 	got := GetCustomTypesFromYAML()
 	if got != nil {
 		t.Errorf("GetCustomTypesFromYAML() with nil viper = %v, want nil", got)
-	}
-}
-
-func TestGetAgentRoles(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Create a temporary directory with a .beads/config.yaml
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create .beads directory: %v", err)
-	}
-
-	// Write a config file with agent_roles
-	configContent := `
-agent_roles:
-  town_level: "mayor,deacon"
-  rig_level: "witness,refinery"
-  named: "crew,polecat"
-`
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("failed to write config file: %v", err)
-	}
-
-	// Change to tmp directory so config is found
-	t.Chdir(tmpDir)
-
-	// Reset and initialize viper
-	ResetForTesting()
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	t.Run("town_level_roles", func(t *testing.T) {
-		got := GetTownLevelRoles()
-		expected := []string{"mayor", "deacon"}
-		if len(got) != len(expected) {
-			t.Errorf("GetTownLevelRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetTownLevelRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
-
-	t.Run("rig_level_roles", func(t *testing.T) {
-		got := GetRigLevelRoles()
-		expected := []string{"witness", "refinery"}
-		if len(got) != len(expected) {
-			t.Errorf("GetRigLevelRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetRigLevelRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
-
-	t.Run("named_roles", func(t *testing.T) {
-		got := GetNamedRoles()
-		expected := []string{"crew", "polecat"}
-		if len(got) != len(expected) {
-			t.Errorf("GetNamedRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetNamedRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
-}
-
-func TestGetAgentRoles_NotSet(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Create a temporary directory with a .beads/config.yaml WITHOUT agent_roles
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create .beads directory: %v", err)
-	}
-
-	// Write a config file without agent_roles
-	configContent := `
-sync:
-  mode: dolt-native
-`
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("failed to write config file: %v", err)
-	}
-
-	// Change to tmp directory so config is found
-	t.Chdir(tmpDir)
-
-	// Reset and initialize viper
-	ResetForTesting()
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// All role functions should return nil when not configured
-	if got := GetTownLevelRoles(); got != nil {
-		t.Errorf("GetTownLevelRoles() = %v, want nil when not set", got)
-	}
-	if got := GetRigLevelRoles(); got != nil {
-		t.Errorf("GetRigLevelRoles() = %v, want nil when not set", got)
-	}
-	if got := GetNamedRoles(); got != nil {
-		t.Errorf("GetNamedRoles() = %v, want nil when not set", got)
 	}
 }
 

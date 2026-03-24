@@ -12,7 +12,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/compact"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -45,7 +46,7 @@ actively referenced. This is permanent graceful decay - original content is disc
 Modes:
   - Analyze: Export candidates for agent review (no API key needed)
   - Apply: Accept agent-provided summary (no API key needed)
-  - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY, legacy)
+  - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY or ai.api_key, legacy)
   - Dolt: Run Dolt garbage collection (for Dolt-backend repositories)
 
 Tiers:
@@ -122,7 +123,7 @@ Examples:
 		if compactAnalyze {
 			if err := ensureDirectMode("compact --analyze requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: Ensure a beads database is initialized (run 'bd init')\n")
+				fmt.Fprintf(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database\n")
 				os.Exit(1)
 			}
 			runCompactAnalyze(ctx, store)
@@ -133,7 +134,7 @@ Examples:
 		if compactApply {
 			if err := ensureDirectMode("compact --apply requires direct database access"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Hint: Ensure a beads database is initialized (run 'bd init')\n")
+				fmt.Fprintf(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database\n")
 				os.Exit(1)
 			}
 			if compactID == "" {
@@ -166,18 +167,21 @@ Examples:
 
 			// Direct mode
 			apiKey := os.Getenv("ANTHROPIC_API_KEY")
+			if apiKey == "" {
+				apiKey = config.GetString("ai.api_key")
+			}
 			if apiKey == "" && !compactDryRun {
-				fmt.Fprintf(os.Stderr, "Error: --auto mode requires ANTHROPIC_API_KEY environment variable\n")
+				fmt.Fprintf(os.Stderr, "Error: --auto mode requires ANTHROPIC_API_KEY environment variable or ai.api_key in config\n")
 				os.Exit(1)
 			}
 
-			config := &compact.Config{
+			compactCfg := &compact.Config{
 				APIKey:      apiKey,
 				Concurrency: compactWorkers,
 				DryRun:      compactDryRun,
 			}
 
-			compactor, err := compact.New(store, apiKey, config)
+			compactor, err := compact.New(store, apiKey, compactCfg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to create compactor: %v\n", err)
 				os.Exit(1)
@@ -193,7 +197,7 @@ Examples:
 	},
 }
 
-func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore, issueID string) {
+func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store storage.DoltStorage, issueID string) {
 	start := time.Now()
 
 	if !compactForce {
@@ -281,7 +285,7 @@ func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *
 	fmt.Printf("  Time: %v\n", elapsed)
 }
 
-func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dolt.DoltStore) {
+func runCompactAll(ctx context.Context, compactor *compact.Compactor, store storage.DoltStorage) {
 	start := time.Now()
 
 	var candidates []string
@@ -402,7 +406,7 @@ func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *dol
 	}
 }
 
-func runCompactStats(ctx context.Context, store *dolt.DoltStore) {
+func runCompactStats(ctx context.Context, store storage.DoltStorage) {
 	tier1, err := store.GetTier1Candidates(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to get Tier 1 candidates: %v\n", err)
@@ -456,7 +460,7 @@ func runCompactStats(ctx context.Context, store *dolt.DoltStore) {
 	}
 }
 
-func runCompactAnalyze(ctx context.Context, store *dolt.DoltStore) {
+func runCompactAnalyze(ctx context.Context, store storage.DoltStorage) {
 	type Candidate struct {
 		ID                 string `json:"id"`
 		Title              string `json:"title"`
@@ -561,7 +565,7 @@ func runCompactAnalyze(ctx context.Context, store *dolt.DoltStore) {
 	fmt.Printf("Total: %d candidates\n", len(candidates))
 }
 
-func runCompactApply(ctx context.Context, store *dolt.DoltStore) {
+func runCompactApply(ctx context.Context, store storage.DoltStorage) {
 	start := time.Now()
 
 	// Read summary

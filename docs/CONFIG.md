@@ -31,10 +31,7 @@ Tool-level settings you can configure:
 | Setting | Flag | Environment Variable | Default | Description |
 |---------|------|---------------------|---------|-------------|
 | `json` | `--json` | `BD_JSON` | `false` | Output in JSON format |
-| `no-push` | `--no-push` | `BD_NO_PUSH` | `false` | Skip pushing to remote in bd sync |
-| `sync.mode` | - | `BD_SYNC_MODE` | `git-portable` | Sync mode (see below) |
-| `sync.export_on` | - | `BD_SYNC_EXPORT_ON` | `push` | When to export: `push`, `change` |
-| `sync.import_on` | - | `BD_SYNC_IMPORT_ON` | `pull` | When to import: `pull`, `change` |
+| `no-push` | `--no-push` | `BD_NO_PUSH` | `false` | Skip pushing to remote in `bd dolt push` |
 | `federation.remote` | - | `BD_FEDERATION_REMOTE` | (none) | Dolt remote URL for federation |
 | `federation.sovereignty` | - | `BD_FEDERATION_SOVEREIGNTY` | (none) | Data sovereignty tier: `T1`, `T2`, `T3`, `T4` |
 | `dolt.auto-commit` | `--dolt-auto-commit` | `BD_DOLT_AUTO_COMMIT` | `on` | (Dolt backend) Automatically create a Dolt commit after successful write commands |
@@ -50,8 +47,10 @@ Tool-level settings you can configure:
 | `backup.git-push` | - | `BD_BACKUP_GIT_PUSH` | `false` | Auto git-add + commit + push after export |
 | `dolt.auto-push` | - | `BD_DOLT_AUTO_PUSH` | (auto) | Auto-push to Dolt remote after writes (auto-enabled when origin exists) |
 | `dolt.auto-push-interval` | - | `BD_DOLT_AUTO_PUSH_INTERVAL` | `5m` | Minimum time between auto-pushes |
+| `dolt.shared-server` | `--shared-server` | `BEADS_DOLT_SHARED_SERVER` | `false` | Share a single Dolt server across all projects at `~/.beads/shared-server/` |
+| `dolt.idle-timeout` | - | - | `30m` | Idle auto-stop timeout (`"0"` disables) |
 | `db` | `--db` | `BD_DB` | (auto-discover) | Database path |
-| `actor` | `--actor` | `BD_ACTOR` | `git config user.name` | Actor name for audit trail (see below) |
+| `actor` | `--actor` | `BEADS_ACTOR` | `git config user.name` | Actor name for audit trail (see below) |
 
 **Backend note:** Dolt is the primary storage backend. SQLite remains supported for simple single-user setups. See [DOLT.md](DOLT.md) for Dolt-specific configuration.
 
@@ -133,17 +132,17 @@ dolt:
 The actor name (used for `created_by` in issues and audit trails) is resolved in this order:
 
 1. `--actor` flag (explicit override)
-2. `BD_ACTOR` environment variable
-3. `BEADS_ACTOR` environment variable (alias for MCP/integration compatibility)
+2. `BEADS_ACTOR` environment variable
+3. `BD_ACTOR` environment variable (deprecated alias, kept for backwards compatibility)
 4. `git config user.name`
 5. `$USER` environment variable (system username fallback)
 6. `"unknown"` (final fallback)
 
 For most developers, no configuration is needed - beads will use your git identity automatically. This ensures your issue authorship matches your commit authorship.
 
-To override, set `BD_ACTOR` in your shell profile:
+To override, set `BEADS_ACTOR` in your shell profile:
 ```bash
-export BD_ACTOR="my-github-handle"
+export BEADS_ACTOR="my-github-handle"
 ```
 
 ### Sync Mode Configuration
@@ -152,7 +151,7 @@ The sync mode controls how beads synchronizes data with git and/or Dolt remotes.
 
 #### Sync Mode
 
-Beads uses `dolt-native` sync mode exclusively. Dolt remotes handle sync directly with cell-level merge. Manual `bd import` / `bd export` are available for migration and portability.
+Beads uses `dolt-native` sync mode exclusively. Dolt remotes handle sync directly with cell-level merge. Use `bd export` for issue portability, `bd backup` / `bd backup restore` for supported JSONL backup snapshots, and `bd backup export-git` / `bd backup fetch-git` to move those snapshots through a git branch.
 
 #### Sync Triggers
 
@@ -234,7 +233,7 @@ output:
 # Paths can be relative (from cwd) or absolute
 external_projects:
   beads: ../beads
-  gastown: /path/to/gastown
+  other-project: /path/to/other-project
 ```
 
 ### Why Two Systems?
@@ -362,7 +361,35 @@ Use these namespaces for external integrations:
 - `jira.*` - Jira integration settings
 - `linear.*` - Linear integration settings
 - `github.*` - GitHub integration settings
+- `ado.*` - Azure DevOps integration settings
 - `custom.*` - Custom integration settings
+
+### Status and Type Customization
+
+- `status.custom` - Custom issue statuses with optional categories (comma-separated)
+- `types.custom` - Custom issue types (comma-separated)
+
+**Custom statuses** support category annotations that control behavior:
+
+```bash
+# Format: name:category (category is optional)
+bd config set status.custom "in_review:active,qa_testing:wip,on_hold:frozen,archived:done"
+
+# Categories: active, wip, done, frozen
+# - active: shows in bd ready, included in default bd list
+# - wip: excluded from bd ready, included in default bd list
+# - done: excluded from bd ready AND default bd list (terminal)
+# - frozen: excluded from bd ready AND default bd list (on hold)
+# - (none): excluded from bd ready, included in default bd list (backward compatible)
+```
+
+**Custom types:**
+
+```bash
+bd config set types.custom "agent,molecule,event"
+```
+
+See `bd statuses` and `bd types` commands to list all configured statuses and types.
 
 ### Example: Sequential Counter IDs (issue_id_mode=counter)
 
@@ -509,7 +536,7 @@ bd config set auto_export.error_policy "best-effort"
 
 **Context-specific behavior:**
 
-User-initiated exports (`bd sync`, manual export commands) use `export.error_policy` (default: `strict`).
+User-initiated exports (`bd dolt push`, manual export commands) use `export.error_policy` (default: `strict`).
 
 Auto-exports (git hook sync) use `auto_export.error_policy` (default: `best-effort`), falling back to `export.error_policy` if not set.
 
@@ -549,25 +576,24 @@ bd config set import.orphan_handling "allow"
 
 **Mode details:**
 
-- **`strict`** - Import fails immediately if a child's parent is missing. Use when database integrity is critical.
-- **`resurrect`** - Searches the full JSONL file for missing parents and recreates them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
+- **`strict`** - Fails immediately if a child's parent is missing. Use when database integrity is critical.
+- **`resurrect`** - Searches for missing parents and recreates them as tombstones (Status=Closed, Priority=4). Preserves hierarchy with minimal data. Dependencies are also resurrected on best-effort basis.
 - **`skip`** - Skips orphaned children with a warning. Partial import succeeds but some issues are excluded.
-- **`allow`** - Imports orphans without parent validation. Most permissive, works around import bugs. **This is the default** because it ensures all data is imported even if hierarchy is temporarily broken.
+- **`allow`** - Imports orphans without parent validation. Most permissive. **This is the default** because it ensures all data is imported even if hierarchy is temporarily broken.
 
-**Override per command:**
+These modes apply when bootstrapping a database with `bd init --from-jsonl` or when `bd dolt pull` merges remote data:
+
 ```bash
-# Override config for a single import
-bd import -i issues.jsonl --orphan-handling strict
-
-# Auto-import (sync) uses config value
-bd sync  # Respects import.orphan_handling setting
+# Override config for a single pull
+bd config set import.orphan_handling "resurrect"
+bd dolt pull  # Respects import.orphan_handling setting
 ```
 
 **When to use each mode:**
 
-- Use `allow` (default) for daily imports and auto-sync - ensures no data loss
-- Use `resurrect` when importing from another database that had parent deletions
-- Use `strict` only for controlled imports where you need to guarantee parent existence
+- Use `allow` (default) for daily sync - ensures no data loss
+- Use `resurrect` when pulling from remotes that had parent deletions
+- Use `strict` only when you need to guarantee parent existence
 - Use `skip` rarely - only when you want to selectively import a subset
 
 ### Example: Sync Safety Options
@@ -580,7 +606,7 @@ bd config set sync.branch beads-sync
 
 # Enable mass deletion protection (optional, default: false)
 # When enabled, if >50% of issues vanish during a merge AND more than 5
-# issues existed before the merge, bd sync will:
+# issues existed before the merge, bd dolt push will:
 # 1. Show forensic info about vanished issues
 # 2. Prompt for confirmation before pushing
 bd config set sync.require_confirmation_on_mass_delete "true"
@@ -733,6 +759,134 @@ bd config set github.token "YOUR_TOKEN"
 bd config set github.label_map.bug "bug"
 bd config set github.label_map.feature "enhancement"
 ```
+
+### Example: Azure DevOps (ADO) Integration
+
+Azure DevOps integration provides bidirectional sync between bd and ADO work items.
+
+**Required configuration:**
+
+```bash
+# Personal access token (can also use AZURE_DEVOPS_PAT environment variable)
+bd config set ado.pat "YOUR_PAT"
+
+# Organization name (can also use AZURE_DEVOPS_ORG environment variable)
+bd config set ado.org "myorg"
+
+# Project name (can also use AZURE_DEVOPS_PROJECT environment variable)
+bd config set ado.project "MyProject"
+```
+
+**Optional configuration:**
+
+```bash
+# Custom base URL for Azure DevOps Server (on-prem) instances
+# (can also use AZURE_DEVOPS_URL environment variable)
+# When set, ado.org is not required — the URL replaces the default dev.azure.com base.
+bd config set ado.url "https://ado.internal.example.com/DefaultCollection"
+```
+
+**Getting your Azure DevOps PAT:**
+
+1. Go to Azure DevOps → User Settings (top-right icon) → Personal access tokens
+2. Click "New Token"
+3. Select the organization and set an expiration
+4. Grant **Work Items: Read & Write** scope (minimum for sync)
+5. Copy the token — it is only shown once
+
+**State mapping (ADO Agile template defaults → Beads statuses):**
+
+ADO uses process-template-specific states (Agile, Scrum, CMMI). The defaults
+use the Agile template. Override with `ado.state_map.*` for your process:
+
+```bash
+# Default Agile mapping (built-in, no config needed):
+#   New      → open
+#   Active   → in_progress
+#   Resolved → closed
+#   Closed   → closed
+#   Removed  → deferred
+
+# Override for Scrum template:
+bd config set ado.state_map.open "New"
+bd config set ado.state_map.in_progress "Committed"
+bd config set ado.state_map.blocked "Committed"
+bd config set ado.state_map.deferred "Removed"
+bd config set ado.state_map.closed "Done"
+```
+
+**Type mapping (ADO work item types ↔ Beads issue types):**
+
+```bash
+# Default mapping (built-in, no config needed):
+#   Bug               → bug
+#   User Story        → feature
+#   Product Backlog Item → feature
+#   Task              → task
+#   Epic              → epic
+
+# Override for your process template:
+bd config set ado.type_map.bug "Bug"
+bd config set ado.type_map.feature "Feature"
+bd config set ado.type_map.task "Task"
+bd config set ado.type_map.epic "Epic"
+bd config set ado.type_map.chore "Task"
+```
+
+**Priority mapping (ADO 1-4 → Beads 0-4):**
+
+ADO uses a 1-4 scale; Beads uses 0-4. The mapping is:
+- ADO 1 (Critical) → Beads 0 (Critical)
+- ADO 2 (High) → Beads 1 (High)
+- ADO 3 (Medium) → Beads 2 (Medium)
+- ADO 4 (Low) → Beads 3 (Low)
+- Beads 4 (Backlog) → ADO 4 (lossy: backlog collapses to low)
+
+Priority mapping is not configurable — it is handled automatically.
+
+**Environment variables:**
+
+All ADO config keys have environment variable equivalents:
+
+| Config Key    | Environment Variable     |
+|---------------|--------------------------|
+| `ado.pat`     | `AZURE_DEVOPS_PAT`       |
+| `ado.org`     | `AZURE_DEVOPS_ORG`       |
+| `ado.project` | `AZURE_DEVOPS_PROJECT`   |
+| `ado.url`     | `AZURE_DEVOPS_URL`       |
+
+Environment variables take effect when the corresponding `bd config` key is not set.
+
+**Sync commands:**
+
+```bash
+# Bidirectional sync (pull then push, with conflict resolution)
+bd ado sync
+
+# Pull only (import from Azure DevOps)
+bd ado sync --pull-only
+
+# Push only (export to Azure DevOps)
+bd ado sync --push-only
+
+# Dry run (preview without changes)
+bd ado sync --dry-run
+
+# Conflict resolution options
+bd ado sync --prefer-local    # Local version wins on conflicts
+bd ado sync --prefer-ado      # Azure DevOps version wins on conflicts
+bd ado sync --prefer-newer    # Most recent version wins (default)
+
+# Check sync status and configuration
+bd ado status
+
+# List accessible projects (useful for finding your project name)
+bd ado projects --json
+```
+
+**Automatic sync tracking:**
+
+The `ado.last_sync` config key is automatically updated after each sync, enabling incremental sync (only fetch work items updated since last sync).
 
 ## Use in Scripts
 

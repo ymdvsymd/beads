@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -58,9 +57,9 @@ func runMolBurn(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 
-	// mol burn requires direct store access (daemon auto-bypassed for wisp ops)
+	// mol burn requires direct store access
 	if store == nil {
-		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
+		FatalErrorWithHint("no database connection", "run 'bd doctor' to diagnose, or 'bd init' to create a new database")
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -384,7 +383,7 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 
 // burnWisps deletes all wisp issues atomically within a single transaction.
 // If any delete fails, the entire operation is rolled back to prevent partial deletion.
-func burnWisps(ctx context.Context, s *dolt.DoltStore, ids []string) (*BurnResult, error) {
+func burnWisps(ctx context.Context, s storage.DoltStorage, ids []string) (*BurnResult, error) {
 	result := &BurnResult{
 		DeletedIDs: make([]string, 0, len(ids)),
 	}

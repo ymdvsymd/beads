@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**beads** (command: `bd`) is a git-backed issue tracker for AI-supervised coding workflows. We dogfood our own tool.
+**beads** (command: `bd`) is a Dolt-powered issue tracker for AI-supervised coding workflows. Git integration is optional — see `BEADS_DIR` + `--stealth` for git-free operation. We dogfood our own tool.
 
 **IMPORTANT**: See [AGENTS.md](../AGENTS.md) for complete workflow instructions, bd commands, and development guidelines.
 
@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 3. **CLI Layer** (`cmd/bd/`)
    - Cobra-based commands (one file per command: `create.go`, `list.go`, etc.)
-   - Direct database access (embedded mode for standalone, server mode for Gas Town)
+   - Direct database access (embedded mode for standalone, server mode for orchestrator)
    - All commands support `--json` for programmatic use
    - Main entry point in `main.go`
 
@@ -41,14 +41,13 @@ Remote (Dolt remotes: DoltHub, S3, GCS, etc.)
 
 - **Write path**: CLI → Dolt → auto-commit to Dolt history
 - **Read path**: Direct SQL queries against Dolt
-- **Sync**: Dolt handles versioning and sync natively; `bd import`/`bd export` available for migration
+- **Sync**: Dolt handles versioning and sync natively; `bd export` available for data portability, `bd init --from-jsonl` for bootstrapping
 - **Hash-based IDs**: Automatic collision prevention (v0.20+)
 
 Core implementation:
 - Dolt storage: `internal/storage/dolt/`
 - Export: `cmd/bd/export.go`
-- Import: `cmd/bd/import.go`
-- Sync: `cmd/bd/sync_helpers.go`, `cmd/bd/sync_git.go`
+- Sync: `cmd/bd/sync_git.go`
 
 ### Key Data Types
 

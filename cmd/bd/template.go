@@ -9,7 +9,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/formula"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -68,7 +67,7 @@ var bondedIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 // =============================================================================
 
 // loadTemplateSubgraph loads a template epic and all its descendants
-func loadTemplateSubgraph(ctx context.Context, s *dolt.DoltStore, templateID string) (*TemplateSubgraph, error) {
+func loadTemplateSubgraph(ctx context.Context, s storage.DoltStorage, templateID string) (*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -88,8 +87,9 @@ func loadTemplateSubgraph(ctx context.Context, s *dolt.DoltStore, templateID str
 		IssueMap: map[string]*types.Issue{root.ID: root},
 	}
 
-	// Recursively load all children
-	if err := loadDescendants(ctx, s, subgraph, root.ID); err != nil {
+	// Recursively load all children (with cycle detection, GH#2719)
+	visited := map[string]bool{root.ID: true}
+	if err := loadDescendants(ctx, s, subgraph, root.ID, visited); err != nil {
 		return nil, err
 	}
 
@@ -110,51 +110,48 @@ func loadTemplateSubgraph(ctx context.Context, s *dolt.DoltStore, templateID str
 	return subgraph, nil
 }
 
-// loadDescendants recursively loads all child issues
+// loadDescendants recursively loads all child issues.
 // It uses two strategies to find children:
 // 1. Check dependency records for parent-child relationships
 // 2. Check for hierarchical IDs (parent.N) to catch children with missing/wrong deps
-func loadDescendants(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateSubgraph, parentID string) error {
+//
+// The visited set tracks IDs already expanded to detect cycles (GH#2719).
+// Without this, cyclic parent-child dependencies cause unbounded recursion leading to OOM.
+func loadDescendants(ctx context.Context, s storage.DoltStorage, subgraph *TemplateSubgraph, parentID string, visited map[string]bool) error {
 	// Track children we've already added to avoid duplicates
 	addedChildren := make(map[string]bool)
 
-	// Strategy 1: GetDependents returns issues that depend on parentID
-	dependents, err := s.GetDependents(ctx, parentID)
+	// Strategy 1: Get direct parent-child dependents with relationship metadata.
+	dependents, err := s.GetDependentsWithMetadata(ctx, parentID)
 	if err != nil {
 		return fmt.Errorf("failed to get dependents of %s: %w", parentID, err)
 	}
 
-	// Check each dependent to see if it's a child (has parent-child relationship)
+	// Only keep explicit parent-child relationships.
 	for _, dependent := range dependents {
+		if dependent.DependencyType != types.DepParentChild {
+			continue
+		}
+
 		if _, exists := subgraph.IssueMap[dependent.ID]; exists {
 			continue // Already in subgraph
 		}
 
-		// Check if this dependent has a parent-child relationship with parentID
-		depRecs, err := s.GetDependencyRecords(ctx, dependent.ID)
-		if err != nil {
+		// Cycle detection (GH#2719)
+		if visited[dependent.ID] {
 			continue
 		}
 
-		isChild := false
-		for _, depRec := range depRecs {
-			if depRec.DependsOnID == parentID && depRec.Type == types.DepParentChild {
-				isChild = true
-				break
-			}
-		}
-
-		if !isChild {
-			continue
-		}
+		child := dependent.Issue
 
 		// Add to subgraph
-		subgraph.Issues = append(subgraph.Issues, dependent)
-		subgraph.IssueMap[dependent.ID] = dependent
-		addedChildren[dependent.ID] = true
+		subgraph.Issues = append(subgraph.Issues, &child)
+		subgraph.IssueMap[child.ID] = &child
+		addedChildren[child.ID] = true
 
-		// Recurse to get children of this child
-		if err := loadDescendants(ctx, s, subgraph, dependent.ID); err != nil {
+		// Mark visited before recursing
+		visited[child.ID] = true
+		if err := loadDescendants(ctx, s, subgraph, child.ID, visited); err != nil {
 			return err
 		}
 	}
@@ -176,13 +173,36 @@ func loadDescendants(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateS
 			continue // Already in subgraph
 		}
 
+		// Cycle detection (GH#2719)
+		if visited[child.ID] {
+			continue
+		}
+
+		// Check if this hierarchical child has been reparented to a different parent (GH#2476).
+		// If it has an explicit parent-child dependency pointing elsewhere, skip it —
+		// the ID pattern match is stale and the child belongs to another molecule.
+		depRecs, err := s.GetDependencyRecords(ctx, child.ID)
+		if err == nil {
+			reparented := false
+			for _, dep := range depRecs {
+				if dep.Type == types.DepParentChild && dep.DependsOnID != parentID {
+					reparented = true
+					break
+				}
+			}
+			if reparented {
+				continue
+			}
+		}
+
 		// Add to subgraph
 		subgraph.Issues = append(subgraph.Issues, child)
 		subgraph.IssueMap[child.ID] = child
 		addedChildren[child.ID] = true
 
-		// Recurse to get children of this child
-		if err := loadDescendants(ctx, s, subgraph, child.ID); err != nil {
+		// Mark visited before recursing
+		visited[child.ID] = true
+		if err := loadDescendants(ctx, s, subgraph, child.ID, visited); err != nil {
 			return err
 		}
 	}
@@ -192,27 +212,18 @@ func loadDescendants(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateS
 
 // findHierarchicalChildren finds issues with IDs that match the pattern parentID.N
 // This catches hierarchical children that may be missing parent-child dependencies.
-func findHierarchicalChildren(ctx context.Context, s *dolt.DoltStore, parentID string) ([]*types.Issue, error) {
-	// Look for issues with IDs starting with "parentID."
-	// We need to query by ID pattern, which requires listing issues
+func findHierarchicalChildren(ctx context.Context, s storage.DoltStorage, parentID string) ([]*types.Issue, error) {
 	pattern := parentID + "."
-
-	// Use the storage's search capability with a filter
-	allIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{})
+	candidates, err := s.SearchIssues(ctx, "", types.IssueFilter{IDPrefix: pattern})
 	if err != nil {
 		return nil, err
 	}
 
 	var children []*types.Issue
-	for _, issue := range allIssues {
-		// Check if ID starts with pattern and is a direct child (no further dots after the pattern)
-		if len(issue.ID) > len(pattern) && issue.ID[:len(pattern)] == pattern {
-			// Check it's a direct child, not a grandchild
-			// e.g., "parent.1" is a child, "parent.1.2" is a grandchild
-			remaining := issue.ID[len(pattern):]
-			if !strings.Contains(remaining, ".") {
-				children = append(children, issue)
-			}
+	for _, issue := range candidates {
+		_, directParentID, depth := types.ParseHierarchicalID(issue.ID)
+		if depth > 0 && directParentID == parentID {
+			children = append(children, issue)
 		}
 	}
 
@@ -227,7 +238,7 @@ func findHierarchicalChildren(ctx context.Context, s *dolt.DoltStore, parentID s
 // It first tries to resolve as an ID (via ResolvePartialID).
 // If that fails, it searches for protos with matching titles.
 // Returns the proto ID if found, or an error if not found or ambiguous.
-func resolveProtoIDOrTitle(ctx context.Context, s *dolt.DoltStore, input string) (string, error) {
+func resolveProtoIDOrTitle(ctx context.Context, s storage.DoltStorage, input string) (string, error) {
 	// Strategy 1: Try to resolve as an ID
 	protoID, err := utils.ResolvePartialID(ctx, s, input)
 	if err == nil {
@@ -469,7 +480,7 @@ func getRelativeID(oldID, rootID string) string {
 
 // cloneSubgraph creates new issues from the template with variable substitution.
 // Uses CloneOptions to control all spawn/bond behavior including dynamic bonding.
-func cloneSubgraph(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateSubgraph, opts CloneOptions) (*InstantiateResult, error) {
+func cloneSubgraph(ctx context.Context, s storage.DoltStorage, subgraph *TemplateSubgraph, opts CloneOptions) (*InstantiateResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -570,17 +581,25 @@ func cloneSubgraph(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateSub
 	return &InstantiateResult{
 		NewEpicID: idMapping[subgraph.Root.ID],
 		IDMapping: idMapping,
-		Created:   len(subgraph.Issues),
+		Created:   len(idMapping),
 	}, nil
 }
 
-// printTemplateTree prints the template structure as a tree
+// printTemplateTree prints the template structure as a tree.
+// Uses a visited set to detect cycles (GH#2719) and avoid infinite recursion.
 func printTemplateTree(subgraph *TemplateSubgraph, parentID string, depth int, isRoot bool) {
+	visited := make(map[string]bool)
+	printTemplateTreeVisited(subgraph, parentID, depth, isRoot, visited)
+}
+
+// printTemplateTreeVisited is the internal recursive implementation with cycle tracking.
+func printTemplateTreeVisited(subgraph *TemplateSubgraph, parentID string, depth int, isRoot bool, visited map[string]bool) {
 	indent := strings.Repeat("  ", depth)
 
 	// Print root
 	if isRoot {
 		fmt.Printf("%s   %s (root)\n", indent, subgraph.Root.Title)
+		visited[parentID] = true
 	}
 
 	// Find children of this parent
@@ -604,7 +623,14 @@ func printTemplateTree(subgraph *TemplateSubgraph, parentID string, depth int, i
 		if len(vars) > 0 {
 			varStr = fmt.Sprintf(" [%s]", strings.Join(vars, ", "))
 		}
+
+		// Cycle detection (GH#2719)
+		if visited[child.ID] {
+			fmt.Printf("%s   %s %s%s (cycle detected, skipping)\n", indent, connector, child.Title, varStr)
+			continue
+		}
 		fmt.Printf("%s   %s %s%s\n", indent, connector, child.Title, varStr)
-		printTemplateTree(subgraph, child.ID, depth+1, false)
+		visited[child.ID] = true
+		printTemplateTreeVisited(subgraph, child.ID, depth+1, false, visited)
 	}
 }

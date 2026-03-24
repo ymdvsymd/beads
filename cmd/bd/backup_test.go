@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +29,6 @@ func TestBackupStateRoundTrip(t *testing.T) {
 
 	// Save and reload
 	state.LastDoltCommit = "abc123"
-	state.LastEventID = 42
 	state.Timestamp = time.Date(2026, 2, 26, 12, 0, 0, 0, time.UTC)
 	state.Counts.Issues = 10
 	state.Counts.Events = 100
@@ -43,9 +43,6 @@ func TestBackupStateRoundTrip(t *testing.T) {
 	}
 	if loaded.LastDoltCommit != "abc123" {
 		t.Errorf("commit = %q, want abc123", loaded.LastDoltCommit)
-	}
-	if loaded.LastEventID != 42 {
-		t.Errorf("event ID = %d, want 42", loaded.LastEventID)
 	}
 	if loaded.Counts.Issues != 10 {
 		t.Errorf("issues = %d, want 10", loaded.Counts.Issues)
@@ -161,6 +158,12 @@ func TestBackupExport(t *testing.T) {
 		t.Fatalf("insert event: %v", err)
 	}
 
+	depMetadata := `{"gate":"any-children","spawner_id":"test-1"}`
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
+		"test-2", "test-1", "blocks", "tester", depMetadata); err != nil {
+		t.Fatalf("insert dependency: %v", err)
+	}
+
 	// Commit so GetCurrentCommit returns something
 	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'test data')"); err != nil {
 		t.Fatalf("dolt commit: %v", err)
@@ -181,13 +184,16 @@ func TestBackupExport(t *testing.T) {
 	if state.Counts.Events != 1 {
 		t.Errorf("events = %d, want 1", state.Counts.Events)
 	}
+	if state.Counts.Dependencies != 1 {
+		t.Errorf("dependencies = %d, want 1", state.Counts.Dependencies)
+	}
 	if state.LastDoltCommit == "" {
 		t.Error("expected non-empty dolt commit")
 	}
 
 	// Verify files exist
 	backupPath := filepath.Join(beadsDir, "backup")
-	for _, file := range []string{"issues.jsonl", "events.jsonl", "labels.jsonl", "config.jsonl", "backup_state.json"} {
+	for _, file := range []string{"issues.jsonl", "events.jsonl", "dependencies.jsonl", "labels.jsonl", "config.jsonl", "backup_state.json"} {
 		path := filepath.Join(backupPath, file)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			t.Errorf("expected file %s to exist", file)
@@ -202,6 +208,29 @@ func TestBackupExport(t *testing.T) {
 	lines := splitJSONL(issuesData)
 	if len(lines) != 2 {
 		t.Errorf("issues.jsonl has %d lines, want 2", len(lines))
+	}
+
+	depsData, err := os.ReadFile(filepath.Join(backupPath, "dependencies.jsonl"))
+	if err != nil {
+		t.Fatalf("read dependencies.jsonl: %v", err)
+	}
+	depLines := splitJSONL(depsData)
+	if len(depLines) != 1 {
+		t.Fatalf("dependencies.jsonl has %d lines, want 1", len(depLines))
+	}
+	var depRow struct {
+		IssueID     string `json:"issue_id"`
+		DependsOnID string `json:"depends_on_id"`
+		Metadata    string `json:"metadata"`
+	}
+	if err := json.Unmarshal(depLines[0], &depRow); err != nil {
+		t.Fatalf("unmarshal dependency row: %v", err)
+	}
+	if depRow.IssueID != "test-2" || depRow.DependsOnID != "test-1" {
+		t.Fatalf("dependency row = %s -> %s, want test-2 -> test-1", depRow.IssueID, depRow.DependsOnID)
+	}
+	if depRow.Metadata != depMetadata {
+		t.Errorf("dependency metadata = %q, want %q", depRow.Metadata, depMetadata)
 	}
 
 	// Second export with no changes should be a no-op
@@ -303,6 +332,115 @@ func TestBackupIncremental(t *testing.T) {
 	lines := splitJSONL(eventsData)
 	if len(lines) != 2 {
 		t.Errorf("events.jsonl has %d lines, want 2", len(lines))
+	}
+}
+
+func TestBackupExportFiltersByIssuePrefix(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+	if testutil.DoltContainerCrashed() {
+		t.Skipf("Dolt test server crashed: %v", testutil.DoltContainerCrashError())
+	}
+
+	ensureTestMode(t)
+	saved := saveAndRestoreGlobals(t)
+	_ = saved
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	origWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWd) })
+
+	dbName := uniqueTestDBName(t)
+	testDBPath := filepath.Join(beadsDir, "dolt")
+	writeTestMetadata(t, testDBPath, dbName)
+	s := newTestStoreWithPrefix(t, testDBPath, "alpha")
+	store = s
+	storeMutex.Lock()
+	storeActive = true
+	storeMutex.Unlock()
+	t.Cleanup(func() {
+		store = nil
+		storeMutex.Lock()
+		storeActive = false
+		storeMutex.Unlock()
+	})
+
+	ctx := context.Background()
+
+	for _, issueID := range []string{"alpha-1", "beta-1"} {
+		if _, err := s.DB().ExecContext(ctx, `INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			issueID, issueID+" title", "desc", "", "", "", "open", 2, "task"); err != nil {
+			t.Fatalf("insert issue %s: %v", issueID, err)
+		}
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO labels (issue_id, label) VALUES (?, ?)`, "alpha-1", "keep"); err != nil {
+		t.Fatalf("insert alpha label: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO labels (issue_id, label) VALUES (?, ?)`, "beta-1", "drop"); err != nil {
+		t.Fatalf("insert beta label: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
+		"alpha-1", "alpha-root", "blocks", "tester", `{}`); err != nil {
+		t.Fatalf("insert alpha dependency: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
+		"beta-1", "beta-root", "blocks", "tester", `{}`); err != nil {
+		t.Fatalf("insert beta dependency: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'mixed prefix test data')"); err != nil {
+		t.Fatalf("dolt commit: %v", err)
+	}
+
+	state, err := runBackupExport(ctx, true)
+	if err != nil {
+		t.Fatalf("runBackupExport: %v", err)
+	}
+
+	if state.Counts.Issues != 1 {
+		t.Fatalf("exported issues = %d, want 1", state.Counts.Issues)
+	}
+	if state.Counts.Labels != 1 {
+		t.Fatalf("exported labels = %d, want 1", state.Counts.Labels)
+	}
+	if state.Counts.Dependencies != 1 {
+		t.Fatalf("exported dependencies = %d, want 1", state.Counts.Dependencies)
+	}
+
+	backupPath := filepath.Join(beadsDir, "backup")
+	issuesData, err := os.ReadFile(filepath.Join(backupPath, "issues.jsonl"))
+	if err != nil {
+		t.Fatalf("read issues.jsonl: %v", err)
+	}
+	if strings.Contains(string(issuesData), `"id":"beta-1"`) {
+		t.Fatalf("issues.jsonl should not contain beta issue:\n%s", issuesData)
+	}
+	if !strings.Contains(string(issuesData), `"id":"alpha-1"`) {
+		t.Fatalf("issues.jsonl missing alpha issue:\n%s", issuesData)
+	}
+
+	labelsData, err := os.ReadFile(filepath.Join(backupPath, "labels.jsonl"))
+	if err != nil {
+		t.Fatalf("read labels.jsonl: %v", err)
+	}
+	if strings.Contains(string(labelsData), `"issue_id":"beta-1"`) {
+		t.Fatalf("labels.jsonl should not contain beta label:\n%s", labelsData)
+	}
+
+	depsData, err := os.ReadFile(filepath.Join(backupPath, "dependencies.jsonl"))
+	if err != nil {
+		t.Fatalf("read dependencies.jsonl: %v", err)
+	}
+	if strings.Contains(string(depsData), `"issue_id":"beta-1"`) {
+		t.Fatalf("dependencies.jsonl should not contain beta dependency:\n%s", depsData)
 	}
 }
 

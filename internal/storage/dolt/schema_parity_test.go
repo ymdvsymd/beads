@@ -233,10 +233,12 @@ func TestSearchWispsFilterParity(t *testing.T) {
 	now := time.Now().UTC()
 	past := now.Add(-24 * time.Hour)
 	future := now.Add(24 * time.Hour)
+	externalRef := "https://linear.app/example-org/issue/EX-1"
 	wisp := &types.Issue{
 		Title:       "test wisp for filter parity",
 		Description: "description text here",
 		Notes:       "some notes content",
+		ExternalRef: &externalRef,
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   "task",
@@ -245,12 +247,12 @@ func TestSearchWispsFilterParity(t *testing.T) {
 		DueAt:       &future,
 		DeferUntil:  &future,
 	}
-	if err := store.createWisp(ctx, wisp, "test-actor"); err != nil {
+	if err := store.CreateIssue(ctx, wisp, "test-actor"); err != nil {
 		t.Fatalf("failed to create test wisp: %v", err)
 	}
 
 	// Add a label to the wisp
-	if err := store.addWispLabel(ctx, wisp.ID, "test-label", "test-actor"); err != nil {
+	if err := store.AddLabel(ctx, wisp.ID, "test-label", "test-actor"); err != nil {
 		t.Fatalf("failed to add wisp label: %v", err)
 	}
 
@@ -293,6 +295,7 @@ func TestSearchWispsFilterParity(t *testing.T) {
 	search("TitleContains", types.IssueFilter{TitleContains: "parity"})
 	search("DescriptionContains", types.IssueFilter{DescriptionContains: "description"})
 	search("NotesContains", types.IssueFilter{NotesContains: "notes"})
+	search("ExternalRefContains", types.IssueFilter{ExternalRefContains: "linear"})
 	search("Labels", types.IssueFilter{Labels: []string{"test-label"}})
 	search("LabelsAny", types.IssueFilter{LabelsAny: []string{"test-label", "other"}})
 	search("Pinned true", types.IssueFilter{Pinned: &boolTrue})

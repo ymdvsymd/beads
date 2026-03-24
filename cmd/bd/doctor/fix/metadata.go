@@ -57,7 +57,7 @@ func FixMissingMetadata(path string, bdVersion string) error {
 
 	// Check and repair repo_id
 	if val, err := store.GetMetadata(ctx, "repo_id"); err == nil && val == "" {
-		repoID, err := beads.ComputeRepoID()
+		repoID, err := beads.ComputeRepoIDForPath(path)
 		if err != nil {
 			// Non-git environment: warn and skip (FR-015)
 			fmt.Printf("  Warning: could not compute repo_id (not in a git repo?): %v\n", err)
@@ -71,7 +71,7 @@ func FixMissingMetadata(path string, bdVersion string) error {
 
 	// Check and repair clone_id
 	if val, err := store.GetMetadata(ctx, "clone_id"); err == nil && val == "" {
-		cloneID, err := beads.GetCloneID()
+		cloneID, err := beads.GetCloneIDForPath(path)
 		if err != nil {
 			// Non-standard environment: warn and skip (FR-016)
 			fmt.Printf("  Warning: could not compute clone_id: %v\n", err)
@@ -88,6 +88,76 @@ func FixMissingMetadata(path string, bdVersion string) error {
 		fmt.Printf("  Repaired %d metadata field(s): %s\n", len(repaired), strings.Join(repaired, ", "))
 	}
 
+	return nil
+}
+
+// FixProjectIdentity generates a project_id UUID and backfills it into both
+// metadata.json and the database metadata table. For pre-GH#2372 projects that
+// lack cross-project identity verification.
+func FixProjectIdentity(path string) error {
+	if err := validateBeadsWorkspace(path); err != nil {
+		return err
+	}
+
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		return fmt.Errorf("failed to load metadata.json: %w", err)
+	}
+	if cfg == nil {
+		return fmt.Errorf("no metadata.json found")
+	}
+	if cfg.GetBackend() != configfile.BackendDolt {
+		return nil // Not a Dolt backend
+	}
+
+	ctx := context.Background()
+
+	store, err := dolt.NewFromConfig(ctx, beadsDir)
+	if err != nil {
+		return fmt.Errorf("failed to open store: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Check current state
+	hasLocalID := cfg.ProjectID != ""
+	dbID, _ := store.GetMetadata(ctx, "_project_id")
+	hasDBID := dbID != ""
+
+	if hasLocalID && hasDBID {
+		return nil // Both already set
+	}
+
+	// Determine the ID to use: prefer an existing one, otherwise generate new
+	projectID := cfg.ProjectID
+	if projectID == "" {
+		projectID = dbID
+	}
+	if projectID == "" {
+		projectID = configfile.GenerateProjectID()
+	}
+
+	var repaired []string
+
+	// Backfill metadata.json
+	if !hasLocalID {
+		cfg.ProjectID = projectID
+		if err := cfg.Save(beadsDir); err != nil {
+			return fmt.Errorf("failed to save project_id to metadata.json: %w", err)
+		}
+		repaired = append(repaired, "metadata.json")
+	}
+
+	// Backfill database
+	if !hasDBID {
+		if err := store.SetMetadata(ctx, "_project_id", projectID); err != nil {
+			return fmt.Errorf("failed to write _project_id to database: %w", err)
+		}
+		repaired = append(repaired, "database")
+	}
+
+	fmt.Printf("  Backfilled project_id %s into: %s\n", projectID, strings.Join(repaired, ", "))
 	return nil
 }
 

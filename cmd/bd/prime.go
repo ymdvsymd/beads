@@ -23,6 +23,26 @@ var (
 	primeExportMode  bool
 )
 
+// resolveGlobalPrimePath returns the path to ~/.config/beads/PRIME.md if it
+// exists. configDirOverride is used for testing; pass "" for production.
+func resolveGlobalPrimePath(configDirOverride string) string {
+	var configDir string
+	if configDirOverride != "" {
+		configDir = configDirOverride
+	} else {
+		var err error
+		configDir, err = os.UserConfigDir()
+		if err != nil {
+			return ""
+		}
+	}
+	p := filepath.Join(configDir, "beads", "PRIME.md")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
+}
+
 var primeCmd = &cobra.Command{
 	Use:     "prime",
 	GroupID: "setup",
@@ -85,6 +105,14 @@ Workflow customization:
 			if content, err := os.ReadFile(redirectedPrimePath); err == nil {
 				fmt.Print(string(content))
 				return
+			}
+			// Fall back to global config (~/.config/beads/PRIME.md)
+			// #nosec G304 -- path constructed from UserConfigDir which we control
+			if globalPath := resolveGlobalPrimePath(""); globalPath != "" {
+				if content, err := os.ReadFile(globalPath); err == nil {
+					fmt.Print(string(content))
+					return
+				}
 			}
 		}
 
@@ -414,7 +442,7 @@ git push                    # Push to remote
 ### Creating & Updating
 - ` + "`bd create --title=\"Summary of this issue\" --description=\"Why this issue exists and what needs to be done\" --type=task|bug|feature --priority=2`" + ` - New issue
   - Priority: 0-4 or P0-P4 (0=critical, 2=medium, 4=backlog). NOT "high"/"medium"/"low"
-- ` + "`bd update <id> --status=in_progress`" + ` - Claim work
+- ` + "`bd update <id> --claim`" + ` - Claim work
 - ` + "`bd update <id> --assignee=username`" + ` - Assign to someone
 - ` + "`bd update <id> --title/--description/--notes/--design`" + ` - Update fields inline
 - ` + "`bd close <id>`" + ` - Mark complete
@@ -433,6 +461,28 @@ git push                    # Push to remote
 ### Project Health
 - ` + "`bd stats`" + ` - Project statistics (open/closed/blocked counts)
 - ` + "`bd doctor`" + ` - Check for issues (sync problems, missing hooks)
+- ` + "`bd doctor --check=conventions`" + ` - Check for convention drift (lint, stale, orphans)
+
+### Quality Tools
+- ` + "`bd create --validate`" + ` - Check description has required sections
+- ` + "`bd create --acceptance=\"criteria\"`" + ` - Set acceptance criteria (checked by --validate)
+- ` + "`bd create --design=\"decisions\"`" + ` - Record design decisions
+- ` + "`bd create --notes=\"context\"`" + ` - Add supplementary notes
+- ` + "`bd config set validation.on-create warn`" + ` - Auto-validate on every create
+- ` + "`bd lint`" + ` - Check existing issues for missing sections
+
+### Lifecycle & Hygiene
+- ` + "`bd defer <id> --until=\"date\"`" + ` - Defer work to a future date
+- ` + "`bd supersede <id> --with=<new-id>`" + ` - Mark issue as superseded
+- ` + "`bd close <id> --suggest-next`" + ` - Show newly unblocked issues after closing
+- ` + "`bd stale`" + ` - Find issues with no recent activity
+- ` + "`bd orphans`" + ` - Find issues with broken dependencies
+- ` + "`bd preflight`" + ` - Pre-PR checks (lint, stale, orphans)
+- ` + "`bd human <id>`" + ` - Flag for human decision (list/respond/dismiss)
+
+### Structured Workflows
+- ` + "`bd formula list`" + ` - See available workflow templates
+- ` + "`bd mol pour <name>`" + ` - Start structured workflow from formula
 
 ## Common Workflows
 
@@ -440,7 +490,7 @@ git push                    # Push to remote
 ` + "```bash" + `
 bd ready           # Find available work
 bd show <id>       # Review issue details
-bd update <id> --status=in_progress  # Claim it
+bd update <id> --claim  # Claim it
 ` + "```" + `
 
 ` + completingWorkflow + `

@@ -890,9 +890,9 @@ If given a single issue (not an epic), it will be auto-wrapped:
 - Then creates the swarm molecule for that epic
 
 Examples:
-  bd swarm create gt-epic-123                          # Create swarm for epic
-  bd swarm create gt-epic-123 --coordinator=witness/   # With specific coordinator
-  bd swarm create gt-task-456                          # Auto-wrap single issue`,
+  bd swarm create bd-epic-123                          # Create swarm for epic
+  bd swarm create bd-epic-123 --coordinator=observer/   # With specific coordinator
+  bd swarm create bd-task-456                          # Auto-wrap single issue`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("swarm create")
@@ -1037,6 +1037,12 @@ Examples:
 			FatalErrorRespectJSON("failed to link swarm to epic: %v", err)
 		}
 
+		if isEmbeddedDolt && store != nil {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
+				FatalErrorRespectJSON("failed to commit: %v", err)
+			}
+		}
+
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"swarm_id":    swarmMol.ID,
@@ -1175,7 +1181,7 @@ Examples:
 
 func init() {
 	swarmValidateCmd.Flags().Bool("verbose", false, "Include detailed issue graph in output")
-	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., gastown/witness)")
+	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., my-project/witness)")
 	swarmCreateCmd.Flags().Bool("force", false, "Create new swarm even if one already exists")
 
 	swarmCmd.AddCommand(swarmValidateCmd)

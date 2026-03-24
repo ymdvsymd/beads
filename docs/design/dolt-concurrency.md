@@ -2,21 +2,20 @@
 
 > **Status**: Implemented — all-on-main is live, branch-per-worker retired
 > **Date**: 2026-02-22 (implemented 2026-02-24)
-> **Authors**: Steve Yegge, crew max
+> **Authors**: Steve Yegge
 > **Input**: Tim Sehn (Dolt co-founder), DoltHub blog 2026-02-18
-> **Scope**: Beads (primary), Gas Town (operational), Wasteland (federation)
+> **Scope**: Beads (primary), orchestrator (operational), Wasteland (federation)
 
 ---
 
 ## Problem Statement
 
-Beads is the universal data plane for Gas Town. Every agent — polecats, mayor,
-witness, refinery, deacon, crew, dogs — reads and writes beads as their primary
+Beads is the universal data plane for multi-agent systems. Every agent role —
+workers, coordinators, observers, processors, patrols — reads and writes beads as their primary
 means of coordination. The Dolt concurrency model must serve **all** of them,
-not just polecats.
+not just individual workers.
 
-Gas Town currently uses a **branch-per-worker** strategy for Dolt concurrency
-(historically called "branch-per-polecat," though the issue affects all agents):
+The system currently uses a **branch-per-worker** strategy for Dolt concurrency:
 workers get their own Dolt branches, write in isolation, and merge to main later.
 
 This was designed to eliminate optimistic lock contention between concurrent
@@ -28,8 +27,8 @@ rate in tests. But the concurrency wins are **illusory** because:
    cross-agent visibility for dispatching, dependency tracking, and status queries.
 
 2. **Shared state must live on main.** Beads is the coordination layer for the
-   entire town. Every role — polecats doing work, mayor dispatching, witness
-   monitoring, refinery validating, crew assisting — needs the same view of
+   entire system. Every role — workers doing tasks, coordinators dispatching, observers
+   monitoring, processors validating, assistants helping — needs the same view of
    bead state. Branch isolation is the opposite of what a shared data plane
    requires.
 
@@ -38,7 +37,7 @@ rate in tests. But the concurrency wins are **illusory** because:
    a continuous shared view.
 
 4. **Branch proliferation.** Each sling creates a branch; cleanup relies on
-   `gt done` or `gt polecat nuke`. Orphaned branches accumulate. The
+   `bd done` or branch cleanup. Orphaned branches accumulate. The
    BD_BRANCH safety analysis (#1796) adds code complexity across the codebase.
 
 Tim Sehn's guidance (2026-02-21): **"It is far simpler to use one branch, so
@@ -232,23 +231,27 @@ should use transaction-scoped commits.
 dead code for the normal write path. Retain for federation use cases
 (DoltHub remote merge) and standalone Beads.
 
-### What Changes in Gas Town
+### What Changes in the Orchestrator
 
-#### `gt sling`: Stop Creating Branches
+> **Note:** The following sections reference the orchestrator's internal commands
+> (`gt sling`, `gt done`). These are documented here for historical context as
+> this design was originally written for the orchestrator migration.
 
-Currently `gt sling` creates a Dolt branch and injects `BD_BRANCH` into
+#### Worker Dispatch: Stop Creating Branches
+
+The orchestrator's worker dispatch previously created a Dolt branch and injected `BD_BRANCH` into
 the worker environment. After migration:
-- No branch creation at sling time
+- No branch creation at dispatch time
 - No `BD_BRANCH` env var
 - All agents use the same main-branch connection pool
 
-#### `gt done`: Stop Merging Branches
+#### Task Completion: Stop Merging Branches
 
-Currently `gt done` checks out main, merges the worker's branch, and
-deletes it. After migration:
+The orchestrator's task completion previously checked out main, merged the worker's branch, and
+deleted it. After migration:
 - No merge step
 - No branch deletion
-- `gt done` simply closes the bead (already on main, already visible)
+- Task completion simply closes the bead (already on main, already visible)
 
 #### `BD_BRANCH` Safety Infrastructure (#1796)
 
@@ -271,8 +274,8 @@ db.SetMaxIdleConns(5)      // Keep warm connections
 db.SetConnMaxLifetime(5 * time.Minute)
 ```
 
-The exact numbers depend on the rig's concurrency level. A typical Gas Town
-rig with 6 polecats + mayor + witness + refinery + deacon + crew = ~11
+The exact numbers depend on the rig's concurrency level. A typical orchestrator
+rig with 6 workers + coordinator + observer + processor + patrol = ~10
 concurrent agents, each potentially holding a connection.
 
 ### Wisps: No Change Needed
@@ -303,7 +306,7 @@ but rare due to Dolt's cell-level merge semantics:
 
 The "same field of same bead" case is rare in practice — beads are typically
 owned by one agent at a time (assigned via sling). The main risk is
-concurrent status updates (e.g., a polecat closes a bead while the witness
+concurrent status updates (e.g., one agent closes a bead while another
 also updates it). Mitigation: use optimistic concurrency checks where needed
 (check expected status before update).
 
@@ -320,13 +323,13 @@ This works regardless of branch-per-worker — it's strictly additive safety.
 - Keep `maybeAutoCommit` as fallback for bare writes
 - **Test**: Existing concurrent_test.go should still pass
 
-### Phase 2: Remove Branch-Per-Worker (Gas Town)
+### Phase 2: Remove Branch-Per-Worker (Orchestrator)
 
 Conditional on Phase 1 being stable in production.
 
-- Remove `BD_BRANCH` injection from `polecat_spawn.go` and `session_manager.go`
-- Remove branch creation from `gt sling`
-- Remove branch merge from `gt done`
+- Remove `BD_BRANCH` injection from worker spawn and session management
+- Remove branch creation from worker dispatch
+- Remove branch merge from task completion
 - Remove `BD_BRANCH` env var handling from `store.go`
 - Clean up `OnMain()`, `StripBdBranch()`, analyzer infrastructure
 - **Test**: Deploy with 2-3 agents, verify cross-agent bead visibility
@@ -337,7 +340,7 @@ Conditional on Phase 1 being stable in production.
 - Remove `BD_BRANCH` references from documentation
 - Update `dolt-storage.md` design doc
 - Clean up orphaned branches from existing installations
-- **Test**: Full swarm (6+ polecats), stress test with concurrent writes
+- **Test**: Full swarm (6+ agents), stress test with concurrent writes
 
 ## Implications for Federation (Wasteland)
 
@@ -351,8 +354,8 @@ The move to all-on-main **simplifies** federation:
   was hard to reason about when syncing with DoltHub remotes. All-on-main
   produces a cleaner commit history.
 
-- **Cross-town bead visibility is immediate.** When town A pushes to DoltHub,
-  town B pulls and sees all beads. No branch reconciliation needed.
+- **Cross-rig bead visibility is immediate.** When rig A pushes to DoltHub,
+  rig B pulls and sees all beads. No branch reconciliation needed.
 
 - **Federation transactions.** The same `BEGIN` ... `DOLT_COMMIT` pattern
   applies to federation sync: pull remote changes, resolve conflicts, commit.
@@ -371,7 +374,7 @@ Wisps are `dolt_ignore`-d and never pushed. This is correct:
 ## Implications for Standalone Beads
 
 The `bd` CLI supports both embedded Dolt and server mode. This design
-applies to **server mode only** (Gas Town's deployment). Embedded mode
+applies to **server mode only** (the orchestrator's deployment). Embedded mode
 is single-process and doesn't have the multi-connection concurrency
 concerns described here.
 
@@ -385,13 +388,13 @@ For standalone `bd` with embedded Dolt:
 Tim's guidance: **hundreds of transactions per second on a single branch.**
 
 Our workload:
-- Typical Gas Town: 6-12 concurrent agents (all roles combined)
+- Typical orchestrator rig: 6-12 concurrent agents (all roles combined)
 - Write patterns: create/update/close beads, ~1-10 writes per agent per minute
 - Read patterns: status queries, bead lookups, ~10-100 reads per agent per minute
 - Total: ~60-120 writes/minute, ~600-1200 reads/minute at peak
 
 This is well within Dolt's single-branch capacity. Even at 10x scale (60+
-agents across a large town), we'd hit ~1200 writes/minute = ~20 writes/second,
+agents across a large rig), we'd hit ~1200 writes/minute = ~20 writes/second,
 far below the hundreds-per-second ceiling.
 
 ## Open Questions
@@ -409,7 +412,7 @@ far below the hundreds-per-second ceiling.
    (e.g., `WHERE updated_at = ? AND status = ?`) for high-contention
    fields like `status` and `assignee`?
 
-4. **Existing branch cleanup.** Production Gas Towns have accumulated
+4. **Existing branch cleanup.** Production orchestrator rigs have accumulated
    worker branches. Need a migration script to merge-or-delete these
    before switching to all-on-main.
 
@@ -425,8 +428,7 @@ far below the hundreds-per-second ceiling.
 - `beads/internal/storage/dolt/store.go` — DoltStore, branch-per-worker init
 - `beads/internal/storage/dolt/transaction.go` — RunInTransaction
 - `beads/cmd/bd/dolt_autocommit.go` — auto-commit wrapper
-- `gastown/internal/cmd/done.go` — gt done merge flow
-- `gastown/internal/polecat/session_manager.go` — BD_BRANCH injection
-- `gastown/docs/design/dolt-storage.md` — current architecture doc
-- `gastown/internal/analysis/bdbranch/` — BD_BRANCH safety analyzer
-- Gas Town issue `gt-4j1g7p`: "Remove Dolt branch-per-polecat entirely" (predates this design)
+- (Historical) Orchestrator `done.go` — merge flow (removed)
+- (Historical) Orchestrator `session_manager.go` — BD_BRANCH injection (removed)
+- (Historical) Orchestrator `bdbranch/` — BD_BRANCH safety analyzer (removed)
+- (Historical) Orchestrator issue: "Remove Dolt branch-per-worker entirely" (predates this design)

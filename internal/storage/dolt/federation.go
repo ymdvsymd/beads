@@ -3,7 +3,9 @@ package dolt
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 )
 
 // FederatedStorage implementation for DoltStore
-// These methods enable peer-to-peer synchronization between Gas Towns.
+// These methods enable peer-to-peer synchronization between workspaces.
 
 // PushTo pushes commits to a specific peer remote.
 // If credentials are stored for this peer, they are used automatically.
@@ -24,6 +26,11 @@ func (s *DoltStore) PushTo(ctx context.Context, peer string) error {
 		})
 	}
 	return s.withPeerCredentials(ctx, peer, func(creds *remoteCredentials) error {
+		// Credential CLI routing: when peer has credentials and server is external,
+		// route through CLI subprocess (same rationale as store.go Push).
+		if s.shouldUseCLIForPeerCredentials(ctx, peer, creds) {
+			return s.doltCLIPushToPeer(ctx, peer, creds)
+		}
 		return withEnvCredentials(creds, func() error {
 			if err := s.execWithLongTimeout(ctx, "CALL DOLT_PUSH(?, ?)", peer, s.branch); err != nil {
 				return fmt.Errorf("failed to push to peer %s: %w", peer, err)
@@ -38,6 +45,16 @@ func (s *DoltStore) PushTo(ctx context.Context, peer string) error {
 // For git-protocol remotes, uses CLI `dolt pull` to avoid MySQL connection timeouts.
 // Returns any merge conflicts if present.
 func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Conflict, error) {
+	// GH#2474: Auto-commit pending changes before pull to prevent
+	// "cannot merge with uncommitted changes" errors.
+	if !s.readOnly {
+		if err := s.Commit(ctx, "auto-commit before pull"); err != nil {
+			if !isDoltNothingToCommit(err) {
+				return nil, fmt.Errorf("failed to commit pending changes before pull: %w", err)
+			}
+		}
+	}
+
 	var conflicts []storage.Conflict
 	if s.isPeerGitProtocolRemote(ctx, peer) {
 		err := s.withPeerCredentials(ctx, peer, func(creds *remoteCredentials) error {
@@ -54,6 +71,18 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 		return conflicts, err
 	}
 	err := s.withPeerCredentials(ctx, peer, func(creds *remoteCredentials) error {
+		// Credential CLI routing: mirrors git-protocol peer pull path.
+		if s.shouldUseCLIForPeerCredentials(ctx, peer, creds) {
+			if pullErr := s.doltCLIPullFromPeer(ctx, peer, creds); pullErr != nil {
+				c, conflictErr := s.GetConflicts(ctx)
+				if conflictErr == nil && len(c) > 0 {
+					conflicts = c
+					return nil
+				}
+				return fmt.Errorf("failed to pull from peer %s: %w", peer, pullErr)
+			}
+			return nil
+		}
 		return withEnvCredentials(creds, func() error {
 			if pullErr := s.execWithLongTimeout(ctx, "CALL DOLT_PULL(?)", peer); pullErr != nil {
 				c, conflictErr := s.GetConflicts(ctx)
@@ -79,6 +108,10 @@ func (s *DoltStore) Fetch(ctx context.Context, peer string) error {
 		})
 	}
 	return s.withPeerCredentials(ctx, peer, func(creds *remoteCredentials) error {
+		// Credential CLI routing: route fetch through CLI subprocess.
+		if s.shouldUseCLIForPeerCredentials(ctx, peer, creds) {
+			return s.doltCLIFetchFromPeer(ctx, peer, creds)
+		}
 		return withEnvCredentials(creds, func() error {
 			if err := s.execWithLongTimeout(ctx, "CALL DOLT_FETCH(?)", peer); err != nil {
 				return fmt.Errorf("failed to fetch from peer %s: %w", peer, err)
@@ -105,6 +138,83 @@ func (s *DoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, erro
 		remotes = append(remotes, r)
 	}
 	return remotes, rows.Err()
+}
+
+// syncCLIRemotesToSQL re-registers CLI-level remotes into the SQL server.
+// After a server restart, dolt_remotes (in-memory) is empty while CLI remotes
+// (persisted in .dolt/config) survive. This is best-effort: errors are silently
+// ignored because a missing remote will surface a clear error at push/pull time.
+//
+// GH#2118: Also checks the server root directory (dbPath) for remotes that were
+// added there instead of the database subdirectory (CLIDir). Users commonly run
+// `dolt remote add` in .beads/dolt/ (server root) rather than .beads/dolt/<db>/
+// (database dir). When found, these remotes are propagated to the database CLI
+// directory so that CLI push/pull can find them.
+//
+// See GH#2315.
+func (s *DoltStore) syncCLIRemotesToSQL(ctx context.Context) {
+	dir := s.CLIDir()
+	if dir == "" {
+		return
+	}
+	cliRemotes, err := doltutil.ListCLIRemotes(dir)
+	if err != nil {
+		cliRemotes = nil
+	}
+
+	// GH#2118: If the database directory has no remotes (or doesn't exist),
+	// check the server root directory. Users often run `dolt remote add` in
+	// .beads/dolt/ (server root) instead of .beads/dolt/<database>/.
+	if len(cliRemotes) == 0 {
+		cliRemotes = s.migrateServerRootRemotes(dir)
+	}
+
+	if len(cliRemotes) == 0 {
+		return
+	}
+	sqlRemotes, err := s.ListRemotes(ctx)
+	if err != nil {
+		return
+	}
+	sqlMap := doltutil.ToRemoteNameMap(sqlRemotes)
+	for _, r := range cliRemotes {
+		if _, exists := sqlMap[r.Name]; !exists {
+			_ = s.AddRemote(ctx, r.Name, r.URL)
+		}
+	}
+}
+
+// migrateServerRootRemotes checks the dolt server root directory (dbPath) for
+// remotes that should be propagated to the database CLI directory (CLIDir).
+// This handles GH#2118: users run `dolt remote add` in .beads/dolt/ (server root)
+// instead of .beads/dolt/<database>/ (where CLI push/pull actually runs).
+//
+// Returns the combined CLI remotes after migration, or nil if nothing to migrate.
+func (s *DoltStore) migrateServerRootRemotes(cliDir string) []storage.RemoteInfo {
+	rootDir := s.dbPath
+	if rootDir == "" || rootDir == cliDir {
+		return nil
+	}
+	// Server root must have .dolt/ (from dolt init)
+	if _, err := os.Stat(filepath.Join(rootDir, ".dolt")); err != nil {
+		return nil
+	}
+	rootRemotes, err := doltutil.ListCLIRemotes(rootDir)
+	if err != nil || len(rootRemotes) == 0 {
+		return nil
+	}
+	// Database dir must have .dolt/ to accept CLI remotes
+	if _, err := os.Stat(filepath.Join(cliDir, ".dolt")); err != nil {
+		return nil
+	}
+	// Propagate server-root remotes to the database directory
+	for _, r := range rootRemotes {
+		if existing := doltutil.FindCLIRemote(cliDir, r.Name); existing == "" {
+			_ = doltutil.AddCLIRemote(cliDir, r.Name, r.URL)
+		}
+	}
+	combined, _ := doltutil.ListCLIRemotes(cliDir)
+	return combined
 }
 
 // RemoveRemote removes a configured remote.
@@ -268,12 +378,12 @@ func (s *DoltStore) isPeerGitProtocolRemote(ctx context.Context, peer string) bo
 				if !doltutil.IsGitProtocolURL(r.URL) {
 					return false
 				}
-				return s.cliDir() != "" && doltutil.FindCLIRemote(s.cliDir(), peer) != ""
+				return s.CLIDir() != "" && doltutil.FindCLIRemote(s.CLIDir(), peer) != ""
 			}
 		}
 	}
-	if s.cliDir() != "" {
-		if url := doltutil.FindCLIRemote(s.cliDir(), peer); url != "" {
+	if s.CLIDir() != "" {
+		if url := doltutil.FindCLIRemote(s.CLIDir(), peer); url != "" {
 			return doltutil.IsGitProtocolURL(url)
 		}
 	}
@@ -285,7 +395,7 @@ func (s *DoltStore) isPeerGitProtocolRemote(ctx context.Context, peer string) bo
 // Credentials are set on the subprocess environment only via cmd.Env.
 func (s *DoltStore) doltCLIPushToPeer(ctx context.Context, peer string, creds *remoteCredentials) error {
 	cmd := exec.CommandContext(ctx, "dolt", "push", peer, s.branch) // #nosec G204 -- fixed command with validated peer/branch
-	cmd.Dir = s.cliDir()
+	cmd.Dir = s.CLIDir()
 	creds.applyToCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -299,7 +409,7 @@ func (s *DoltStore) doltCLIPushToPeer(ctx context.Context, peer string, creds *r
 // Credentials are set on the subprocess environment only via cmd.Env.
 func (s *DoltStore) doltCLIPullFromPeer(ctx context.Context, peer string, creds *remoteCredentials) error {
 	cmd := exec.CommandContext(ctx, "dolt", "pull", peer, s.branch) // #nosec G204 -- fixed command with validated peer/branch
-	cmd.Dir = s.cliDir()
+	cmd.Dir = s.CLIDir()
 	creds.applyToCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -313,7 +423,7 @@ func (s *DoltStore) doltCLIPullFromPeer(ctx context.Context, peer string, creds 
 // Credentials are set on the subprocess environment only via cmd.Env.
 func (s *DoltStore) doltCLIFetchFromPeer(ctx context.Context, peer string, creds *remoteCredentials) error {
 	cmd := exec.CommandContext(ctx, "dolt", "fetch", peer) // #nosec G204 -- fixed command with validated peer
-	cmd.Dir = s.cliDir()
+	cmd.Dir = s.CLIDir()
 	creds.applyToCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -7,7 +7,7 @@ slug: /
 
 # Beads Documentation
 
-**Beads** (`bd`) is a git-backed issue tracker designed for AI-supervised coding workflows.
+**Beads** (`bd`) is a Dolt-powered issue tracker designed for AI-supervised coding workflows.
 
 ## Why Beads?
 
@@ -63,8 +63,8 @@ bd show bd-42 --json
 bd create "Found bug in auth" --description="Details..." \
   --deps discovered-from:bd-100 --json
 
-# Sync at end of session
-bd sync
+# Push changes at end of session
+bd dolt push
 ```
 
 See the [Claude Code integration](/integrations/claude-code) for detailed agent instructions.

@@ -11,12 +11,16 @@ import (
 	"github.com/steveyegge/beads/internal/ui"
 )
 
-// addAgentsInstructions creates or updates AGENTS.md with embedded template content.
+// addAgentsInstructions creates or updates the agents file with embedded template content.
+// agentFile is the target filename (e.g. "AGENTS.md" or "BEADS.md").
 // If templatePath is non-empty, the custom template file is used instead of the embedded default.
-func addAgentsInstructions(verbose bool, templatePath string) {
-	agentFile := "AGENTS.md"
+// profile controls which template variant to render (full or minimal); defaults to minimal.
+func addAgentsInstructions(agentFile string, verbose bool, templatePath string, profile agents.Profile) {
+	if profile == "" {
+		profile = agents.ProfileMinimal
+	}
 
-	if err := updateAgentFile(agentFile, verbose, templatePath); err != nil {
+	if err := updateAgentFile(agentFile, verbose, templatePath, profile); err != nil {
 		// Non-fatal - continue with other files
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Warning: failed to update %s: %v\n", agentFile, err)
@@ -25,9 +29,13 @@ func addAgentsInstructions(verbose bool, templatePath string) {
 }
 
 // updateAgentFile creates or updates an agent instructions file with embedded template content.
-func updateAgentFile(filename string, verbose bool, templatePath string) error {
+// When a beads section already exists (legacy or current), it is updated to the latest
+// versioned format so that `bd init` never silently locks in stale sections.
+// If the file already has a full profile and a minimal profile is requested, the full
+// profile is preserved to avoid information loss.
+func updateAgentFile(filename string, verbose bool, templatePath string, profile agents.Profile) error {
 	// Check if file exists
-	//nolint:gosec // G304: filename comes from hardcoded list in addAgentsInstructions
+	//nolint:gosec // G304: filename validated by config.ValidateAgentsFile or defaulted to AGENTS.md
 	content, err := os.ReadFile(filename)
 	if os.IsNotExist(err) {
 		// File doesn't exist - create from template
@@ -41,6 +49,15 @@ func updateAgentFile(filename string, verbose bool, templatePath string) error {
 			newContent = string(data)
 		} else {
 			newContent = agents.EmbeddedDefault()
+		}
+
+		// Replace the beads section with the requested profile.
+		// EmbeddedDefault() ships with profile:full; swap to the requested profile
+		// (which defaults to minimal). Also handles legacy markers without profile metadata.
+		if strings.Contains(newContent, "BEGIN BEADS INTEGRATION") {
+			if replaced, changed, err := agents.ReplaceSection(newContent, profile); err == nil && changed {
+				newContent = replaced
+			}
 		}
 
 		// #nosec G306 - markdown needs to be readable
@@ -60,19 +77,42 @@ func updateAgentFile(filename string, verbose bool, templatePath string) error {
 	hasBeads := strings.Contains(contentStr, "BEGIN BEADS INTEGRATION")
 
 	if hasBeads {
-		if verbose {
-			fmt.Printf("  %s already has agent instructions\n", filename)
+		// Preserve existing full profile when minimal is requested (avoid information loss)
+		effectiveProfile := profile
+		existingMeta := agents.ParseMarker(contentStr[strings.Index(contentStr, "<!-- BEGIN BEADS INTEGRATION"):])
+		if existingMeta != nil && existingMeta.Profile == agents.ProfileFull && profile == agents.ProfileMinimal {
+			effectiveProfile = agents.ProfileFull
+			if verbose {
+				fmt.Printf("  ℹ %s already has full profile; preserving (higher-information) content\n", filename)
+			}
+		}
+
+		// Update existing section to latest versioned format (upgrades legacy markers)
+		updated, changed, replaceErr := agents.ReplaceSection(contentStr, effectiveProfile)
+		if replaceErr != nil {
+			return fmt.Errorf("failed to update beads section in %s: %w", filename, replaceErr)
+		}
+		if changed {
+			// #nosec G306 - markdown needs to be readable
+			if err := os.WriteFile(filename, []byte(updated), 0644); err != nil {
+				return fmt.Errorf("failed to update %s: %w", filename, err)
+			}
+			if verbose {
+				fmt.Printf("  %s Updated beads section in %s to latest format\n", ui.RenderPass("✓"), filename)
+			}
+		} else if verbose {
+			fmt.Printf("  %s already has current agent instructions\n", filename)
 		}
 		return nil
 	}
 
-	// Append beads section (includes landing-the-plane)
+	// Append beads section with profile metadata
 	newContent := contentStr
 	if !strings.HasSuffix(newContent, "\n") {
 		newContent += "\n"
 	}
 
-	newContent += "\n" + agents.EmbeddedBeadsSection()
+	newContent += "\n" + agents.RenderSection(profile)
 
 	// #nosec G306 - markdown needs to be readable
 	if err := os.WriteFile(filename, []byte(newContent), 0644); err != nil {

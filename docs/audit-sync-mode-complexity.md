@@ -50,7 +50,7 @@ v.SetDefault("sync.import_on", SyncTriggerPull)   // pull | change
 
 These config keys (`sync.export_on`, `sync.import_on`) still exist with two trigger values each (`push`/`change` for export, `pull`/`change` for import). They are read into `SyncConfig` via `GetSyncConfig()`.
 
-**Assessment:** These triggers remain meaningful for controlling when Dolt sync operations fire. However, since `bd sync` is now a no-op (v0.51 changelog), and Dolt handles persistence directly, it is worth verifying whether these triggers are still consumed by any runtime code path. If they are only used in the hook system (`internal/hooks/`), they may still be relevant. If not, they are dead config.
+**Assessment:** These triggers remain meaningful for controlling when Dolt sync operations fire. However, since `bd sync` was removed (v0.51+, replaced by `bd dolt push`/`bd dolt pull`), and Dolt handles persistence directly, it is worth verifying whether these triggers are still consumed by any runtime code path. If they are only used in the hook system (`internal/hooks/`), they may still be relevant. If not, they are dead config.
 
 **Recommendation: Audit callers.** If `sync.export_on` and `sync.import_on` have no runtime consumers, remove them. If they are consumed, document which code paths use them.
 
@@ -122,15 +122,14 @@ A shared sync engine for external trackers (Linear, GitLab, Jira) with `PullHook
 
 **Recommendation: No changes needed.** This is separate from Dolt sync mode and is already well-factored.
 
-### Auto-Increment Reset After Pull (Workaround)
+### Auto-Increment Reset After Pull (Resolved)
 
-**File:** `internal/storage/dolt/store.go` (lines 1464-1488)
+**Status:** Resolved in v0.60+ by migrating to UUID primary keys.
 
-After every pull, `resetAutoIncrements()` iterates over 6 hardcoded tables and resets their `AUTO_INCREMENT` to `MAX(id) + 1`. This is called in all three Pull routing paths and in the Pull after federation sync.
-
-**Assessment:** This is a workaround for a Dolt behavior where pulling can leave auto-increment values out of sync. The hardcoded table list is brittle.
-
-**Recommendation: Monitor.** If Dolt fixes this upstream, this workaround can be removed. Consider making the table list configurable or deriving it from schema introspection if more tables are added.
+The `resetAutoIncrements()` workaround was removed when all six affected tables
+(events, comments, issue_snapshots, compaction_snapshots, wisp_events,
+wisp_comments) were migrated from `BIGINT AUTO_INCREMENT` to `CHAR(36) UUID()`
+primary keys. UUID PKs eliminate counter collisions in multi-clone federation.
 
 ## Summary of Recommendations
 
@@ -144,7 +143,7 @@ After every pull, `resetAutoIncrements()` iterates over 6 hardcoded tables and r
 | Conflict/field strategies | **No change** | - | Already clean |
 | Sovereignty tiers | **No change** | - | Already clean |
 | Tracker SyncEngine | **No change** | - | Already clean |
-| Auto-increment reset | **Monitor** for Dolt upstream fix | - | Future cleanup |
+| Auto-increment reset | **Resolved** — removed via UUID PK migration | - | Done |
 
 ## Files Analyzed
 
@@ -154,7 +153,7 @@ After every pull, `resetAutoIncrements()` iterates over 6 hardcoded tables and r
 | `internal/config/sync_test.go` | 436 | Tests for all sync config types |
 | `internal/config/config.go` | 921 | Config initialization, defaults, SyncConfig/ConflictConfig structs |
 | `internal/config/yaml_config.go` | ~300 | YAML config management, yaml-only keys |
-| `internal/storage/dolt/store.go` | 1668 | DoltStore: Push, Pull, ForcePush, auto-increment reset |
+| `internal/storage/dolt/store.go` | 1668 | DoltStore: Push, Pull, ForcePush |
 | `internal/storage/dolt/federation.go` | 340 | Federation sync: Sync, PushTo, PullFrom, Fetch |
 | `internal/storage/dolt/credentials.go` | 473 | Federation peer credentials, encryption |
 | `internal/storage/versioned.go` | 60 | Shared types: Conflict, SyncStatus, FederationPeer |
@@ -168,7 +167,7 @@ After every pull, `resetAutoIncrements()` iterates over 6 hardcoded tables and r
 The sync subsystem has undergone major simplification across v0.50-v0.53:
 
 - **v0.50.3**: Tracker sync code unified via shared SyncEngine (~800 lines removed)
-- **v0.51.0**: SQLite backend, JSONL sync, 3-way merge, tombstones, storage factory, daemon stubs removed. `bd sync` became a no-op.
+- **v0.51.0**: SQLite backend, JSONL sync, 3-way merge, tombstones, storage factory, daemon stubs removed. `bd sync` removed (replaced by `bd dolt push`/`bd dolt pull`).
 - **v0.52.0**: Dead git-portable sync functions removed (#1793)
 - **v0.53.0**: JSONL sync-branch pipeline removed (~11,000 lines). Daemon infrastructure and 3-way merge remnants removed.
 

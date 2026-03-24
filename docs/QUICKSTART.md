@@ -23,9 +23,6 @@ bd init --contributor
 
 # Team member (branch workflow for collaboration)
 bd init --team
-
-# Protected main branch (GitHub/GitLab)
-bd init --branch beads-sync
 ```
 
 The wizard will:
@@ -39,7 +36,7 @@ The wizard will:
 Notes:
 - Dolt is the default (and only) storage backend. Data is stored in `.beads/dolt/`.
 - Dolt uses a `dolt sql-server` for database operations.
-- To migrate from an older SQLite installation, run `bd migrate --to-dolt`.
+- To import issues from an older installation, run `bd init --from-jsonl`.
 
 ### Role Configuration
 
@@ -181,15 +178,28 @@ Now bd-2 is ready! 🎉
 ./bd stats
 ```
 
-## Database Location
+## Team Sync
 
-By default: `~/.beads/default.db`
-
-You can use project-specific databases:
+Share issues with your team using Dolt remotes. Dolt stores data under `refs/dolt/data` on the same Git remote, separate from standard Git refs.
 
 ```bash
-./bd --db ./my-project.db create "Task"
+# Add a remote (GitHub example — also supports DoltHub, S3, GCS, local paths)
+bd dolt remote add origin git+ssh://git@github.com/org/repo.git
+
+# Push your issues
+bd dolt push
+
+# Pull teammates' changes
+bd dolt pull
 ```
+
+When a teammate clones the repo, `bd bootstrap` auto-detects the existing database on `refs/dolt/data` and clones it — no manual remote setup needed.
+
+See [DOLT-BACKEND.md](DOLT-BACKEND.md#dolt-remotes) for remote configuration details and [FEDERATION-SETUP.md](../FEDERATION-SETUP.md) for multi-team sync.
+
+## Database Location
+
+By default, data is stored in `.beads/dolt/` within your repository.
 
 ## Migrating Databases
 
@@ -246,5 +256,6 @@ bd admin cleanup --force
 - Search issues: `./bd list --status open`
 - Detect cycles: `./bd dep cycles`
 - Use gates for PR/CI sync: See [DEPENDENCIES.md](DEPENDENCIES.md)
+- Sync across computers: See [SYNC_SETUP.md](SYNC_SETUP.md)
 
 See [README.md](../README.md) for full documentation.

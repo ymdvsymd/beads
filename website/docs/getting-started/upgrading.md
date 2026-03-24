@@ -119,11 +119,20 @@ bd migrate --dry-run
 bd migrate
 ```
 
-### Import errors after upgrade
+### Recovery after upgrade
 
-Check the import configuration:
+If you need to restore from a JSONL backup:
 
 ```bash
-bd config get import.orphan_handling
-bd import -i backup.jsonl --orphan-handling allow
+bd init
+bd backup restore
+
+# Or fetch the latest snapshot from a backup git branch
+bd backup fetch-git
+```
+
+Or pull from a Dolt remote:
+
+```bash
+bd dolt pull
 ```

@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # WHY A MOLECULE INSTEAD OF A SCRIPT?
 #
-# Gas Town uses molecules (not scripts) for multi-step workflows because:
+# Orchestrators use molecules (not scripts) for multi-step workflows because:
 #
 #   1. LEDGER: Each step is a timestamped entry in your work history.
 #      Your CV accumulates from completed work. Batch scripts are invisible.
@@ -22,13 +22,13 @@ set -euo pipefail
 #      Clean phase handoffs without busy-waiting.
 #
 # Read more:
-#   - ~/gt/docs/PRIMING.md (see "The Batch-Closure Heresy")
-#   - ~/hop/docs/CONTEXT.md (see "The Mission" and "MEOW Stack")
+#   - Orchestrator docs: PRIMING.md (see "The Batch-Closure Heresy")
+#   - HOP docs: CONTEXT.md (see "The Mission" and "MEOW Stack")
 #
 # THE RELEASE MOLECULE
 #
 # The `beads-release` formula has 29 steps across 3 phases:
-#   Phase 1: Preflight → version bumps → git push (polecat work)
+#   Phase 1: Preflight → version bumps → git push (agent work)
 #   Gate:    Await CI completion (async, no polling)
 #   Phase 2: Verify GitHub/npm/PyPI releases (parallel)
 #   Phase 3: Local install → daemon restart
@@ -81,8 +81,8 @@ Examples:
 
 After running this script:
   1. The release molecule (wisp) is created with all 29 steps
-  2. Hook it to start working: gt hook <mol-id>
-  3. Or sling to a polecat: gt sling beads/polecats/p1 <mol-id>
+  2. Hook it to start working: bd hook <mol-id>
+  3. Or assign to an agent: bd sling <agent> --mol <mol-id>
   4. Watch progress: bd activity --follow
 
 EOF
@@ -138,7 +138,7 @@ if [ "$DRY_RUN" = true ]; then
     echo "  • Observable via bd activity --follow"
     echo "  • Gates wait for CI without polling"
     echo ""
-    echo "Read: ~/gt/docs/PRIMING.md → 'The Batch-Closure Heresy'"
+    echo "Read: Orchestrator docs → PRIMING.md → 'The Batch-Closure Heresy'"
     exit 0
 fi
 
@@ -169,11 +169,11 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "  ${YELLOW}Option 1: Work on it yourself${NC}"
-echo "    gt hook ${MOL_ID}"
+echo "    bd hook ${MOL_ID}"
 echo "    # Then follow the steps in bd show ${MOL_ID}"
 echo ""
-echo "  ${YELLOW}Option 2: Assign to a polecat${NC}"
-echo "    gt sling beads/polecats/p1 ${MOL_ID}"
+echo "  ${YELLOW}Option 2: Assign to an agent${NC}"
+echo "    bd sling beads/agents/p1 --mol ${MOL_ID}"
 echo ""
 echo "  ${YELLOW}Watch progress:${NC}"
 echo "    bd activity --follow"

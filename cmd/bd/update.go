@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/storage"
@@ -92,10 +93,13 @@ create, update, show, or close operation).`,
 		}
 		description, descChanged := getDescriptionFlag(cmd)
 		if descChanged {
+			if err := validateDescriptionUpdate(cmd, description, descChanged); err != nil {
+				FatalErrorRespectJSON("%v", err)
+			}
 			updates["description"] = description
 		}
-		if cmd.Flags().Changed("design") {
-			design, _ := cmd.Flags().GetString("design")
+		design, designChanged := getDesignFlag(cmd)
+		if designChanged {
 			updates["design"] = design
 		}
 		if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
@@ -221,14 +225,28 @@ create, update, show, or close operation).`,
 		// Note: storage layer uses "wisp" field name, maps to "ephemeral" column
 		ephemeralChanged := cmd.Flags().Changed("ephemeral")
 		persistentChanged := cmd.Flags().Changed("persistent")
+		noHistoryChanged := cmd.Flags().Changed("no-history")
+		historyChanged := cmd.Flags().Changed("history")
 		if ephemeralChanged && persistentChanged {
 			FatalErrorRespectJSON("cannot specify both --ephemeral and --persistent flags")
+		}
+		if noHistoryChanged && ephemeralChanged {
+			FatalErrorRespectJSON("cannot specify both --no-history and --ephemeral flags")
+		}
+		if noHistoryChanged && historyChanged {
+			FatalErrorRespectJSON("cannot specify both --no-history and --history flags")
 		}
 		if ephemeralChanged {
 			updates["wisp"] = true
 		}
 		if persistentChanged {
 			updates["wisp"] = false
+		}
+		if noHistoryChanged {
+			updates["no_history"] = true
+		}
+		if historyChanged {
+			updates["no_history"] = false
 		}
 		// Metadata flag (GH#1413)
 		if cmd.Flags().Changed("metadata") {
@@ -277,7 +295,7 @@ create, update, show, or close operation).`,
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
 		for _, id := range args {
-			// Resolve and get issue with routing (e.g., gt-xyz routes to gastown)
+			// Resolve and get issue with routing (e.g., gt-xyz routes to another rig)
 			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
 			if err != nil {
 				if result != nil {
@@ -320,6 +338,14 @@ create, update, show, or close operation).`,
 				}
 			}
 
+			// Handle --metadata: merge with existing metadata instead of replacing
+			if newMeta, ok := regularUpdates["metadata"].(json.RawMessage); ok && len(issue.Metadata) > 0 {
+				merged, err := mergeMetadata(issue.Metadata, newMeta)
+				if err != nil {
+					FatalErrorRespectJSON("metadata merge failed for %s: %v", id, err)
+				}
+				regularUpdates["metadata"] = merged
+			}
 			// Handle incremental metadata edits (GH#1406)
 			if setMeta, ok := updates["_set_metadata"].([]string); ok {
 				unsetMeta, _ := updates["_unset_metadata"].([]string)
@@ -343,6 +369,16 @@ create, update, show, or close operation).`,
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
 					result.Close()
 					continue
+				}
+				// Audit log key field changes (survives Dolt GC flatten)
+				if s, ok := regularUpdates["status"].(string); ok {
+					audit.LogFieldChange(result.ResolvedID, "status", string(issue.Status), s, actor, "")
+				}
+				if a, ok := regularUpdates["assignee"].(string); ok {
+					audit.LogFieldChange(result.ResolvedID, "assignee", issue.Assignee, a, actor, "")
+				}
+				if p, ok := regularUpdates["priority"].(int); ok {
+					audit.LogFieldChange(result.ResolvedID, "priority", fmt.Sprintf("%d", issue.Priority), fmt.Sprintf("%d", p), actor, "")
 				}
 			}
 
@@ -417,6 +453,10 @@ create, update, show, or close operation).`,
 			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID) // Best effort: nil issue handled by subsequent nil check
 			if updatedIssue != nil && hookRunner != nil {
 				hookRunner.Run(hooks.EventUpdate, updatedIssue)
+				// Also fire on_close hook when status actually transitions to closed (GH#2630)
+				if updatedIssue.Status == types.StatusClosed && issue.Status != types.StatusClosed {
+					hookRunner.Run(hooks.EventClose, updatedIssue)
+				}
 			}
 
 			updateTitle := ""
@@ -439,6 +479,14 @@ create, update, show, or close operation).`,
 			result.Close()
 		}
 
+		// Embedded mode: flush Dolt commit. DoltStore commits
+		// inline during UpdateIssue so this is only needed for EmbeddedDoltStore.
+		if isEmbeddedDolt && firstUpdatedID != "" && store != nil {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
+				FatalErrorRespectJSON("failed to commit: %v", err)
+			}
+		}
+
 		// Set last touched after all updates complete
 		if firstUpdatedID != "" {
 			SetLastTouchedID(firstUpdatedID)
@@ -454,6 +502,35 @@ create, update, show, or close operation).`,
 			os.Exit(1)
 		}
 	},
+}
+
+// mergeMetadata merges new metadata JSON into existing metadata.
+// Keys from newMeta overwrite keys in existing; keys only in existing are preserved.
+func mergeMetadata(existing, newMeta json.RawMessage) (json.RawMessage, error) {
+	base := make(map[string]json.RawMessage)
+	if len(existing) > 0 {
+		trimmed := strings.TrimSpace(string(existing))
+		if trimmed != "" && trimmed != "null" {
+			if err := json.Unmarshal(existing, &base); err != nil {
+				return nil, fmt.Errorf("existing metadata is not a JSON object: %w", err)
+			}
+		}
+	}
+
+	incoming := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(newMeta, &incoming); err != nil {
+		return nil, fmt.Errorf("new metadata is not a JSON object: %w", err)
+	}
+
+	for k, v := range incoming {
+		base[k] = v
+	}
+
+	result, err := json.Marshal(base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal merged metadata: %w", err)
+	}
+	return json.RawMessage(result), nil
 }
 
 // applyMetadataEdits applies --set-metadata and --unset-metadata edits to existing metadata.
@@ -527,6 +604,7 @@ func init() {
 	updateCmd.Flags().String("title", "", "New title")
 	updateCmd.Flags().StringP("type", "t", "", "New type (bug|feature|task|epic|chore|decision); custom types require types.custom config")
 	registerCommonIssueFlags(updateCmd)
+	updateCmd.Flags().Bool("allow-empty-description", false, "Allow empty description replacement when reading from stdin or file")
 	updateCmd.Flags().String("spec-id", "", "Link to specification document")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")
 	_ = updateCmd.Flags().MarkHidden("acceptance-criteria") // Only fails if flag missing (caught in tests)
@@ -553,6 +631,8 @@ func init() {
 	// Ephemeral/persistent flags
 	updateCmd.Flags().Bool("ephemeral", false, "Mark issue as ephemeral (wisp) - not exported to JSONL")
 	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
+	updateCmd.Flags().Bool("no-history", false, "Mark issue as no-history (skip Dolt commits, not GC-eligible)")
+	updateCmd.Flags().Bool("history", false, "Clear no-history flag (re-enable Dolt commit history)")
 	// Metadata flag (GH#1413)
 	updateCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
 	// Incremental metadata edits (GH#1406)

@@ -69,8 +69,11 @@ bd doctor --fix
 # Or pull from Dolt remote
 bd dolt pull
 
-# Or restore from a JSONL backup if available
-bd import -i backup.jsonl
+# Or restore from a local JSONL backup snapshot
+bd backup restore
+
+# Or fetch the latest snapshot from a backup git branch
+bd backup fetch-git
 ```
 
 ## Dolt Server Issues
@@ -103,21 +106,24 @@ bd dolt start
 ### Changes not syncing
 
 ```bash
-# Force sync
-bd sync
+# Force push to Dolt remote
+bd dolt push
 
 # Check hooks
 bd hooks status
 ```
 
-### Import errors
+### Recovery from backup
 
 ```bash
-# Allow orphans
-bd import -i backup.jsonl --orphan-handling allow
+# Restore from a local JSONL backup snapshot
+bd backup restore
 
-# Check for duplicates after
-bd duplicates
+# Or fetch the latest snapshot from a backup git branch
+bd backup fetch-git
+
+# Or pull from Dolt remote
+bd dolt pull
 ```
 
 ### Merge conflicts
@@ -126,8 +132,8 @@ bd duplicates
 # Check for and fix Dolt conflicts
 bd doctor --fix
 
-# Re-sync
-bd sync
+# Re-push
+bd dolt push
 ```
 
 ## Git Hook Issues

@@ -42,17 +42,46 @@ func hookSectionEndLine() string {
 	return fmt.Sprintf("%s v%s ---", hookSectionEndPrefix, Version)
 }
 
+// hookTimeoutSeconds is the maximum time a beads hook is allowed to run before
+// being killed and allowing the git operation to proceed.  A bounded timeout
+// prevents `bd hooks run` from hanging `git push` indefinitely (GH#2453).
+// The default is 300 seconds (5 minutes) to accommodate chained hooks — e.g.
+// pre-commit framework pipelines that run linters, type-checkers, and builds
+// inside `bd hooks run` via the `.old` hook chain (GH#2732).
+// The value can be overridden via the BEADS_HOOK_TIMEOUT environment variable.
+const hookTimeoutSeconds = 300
+
 // generateHookSection returns the marked section content for a given hook name.
 // The section is self-contained: it checks for bd availability, runs the hook
 // via 'bd hooks run', and propagates exit codes — without preventing any user
 // content after the section from executing on success.
+//
+// Resilience (GH#2453, GH#2449):
+//   - A configurable timeout prevents hooks from hanging git operations.
+//   - If the beads database is not initialized (exit code 3), the hook exits
+//     successfully with a warning so that git operations are not blocked.
 func generateHookSection(hookName string) string {
 	return hookSectionBeginLine() + "\n" +
 		"# This section is managed by beads. Do not remove these markers.\n" +
 		"if command -v bd >/dev/null 2>&1; then\n" +
 		"  export BD_GIT_HOOK=1\n" +
-		"  bd hooks run " + hookName + " \"$@\"\n" +
-		"  _bd_exit=$?; if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi\n" +
+		"  _bd_timeout=${BEADS_HOOK_TIMEOUT:-" + fmt.Sprintf("%d", hookTimeoutSeconds) + "}\n" +
+		"  if command -v timeout >/dev/null 2>&1; then\n" +
+		"    timeout \"$_bd_timeout\" bd hooks run " + hookName + " \"$@\"\n" +
+		"    _bd_exit=$?\n" +
+		"    if [ $_bd_exit -eq 124 ]; then\n" +
+		"      echo >&2 \"beads: hook '" + hookName + "' timed out after ${_bd_timeout}s — continuing without beads\"\n" +
+		"      _bd_exit=0\n" +
+		"    fi\n" +
+		"  else\n" +
+		"    bd hooks run " + hookName + " \"$@\"\n" +
+		"    _bd_exit=$?\n" +
+		"  fi\n" +
+		"  if [ $_bd_exit -eq 3 ]; then\n" +
+		"    echo >&2 \"beads: database not initialized — skipping hook '" + hookName + "'\"\n" +
+		"    _bd_exit=0\n" +
+		"  fi\n" +
+		"  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi\n" +
 		"fi\n" +
 		hookSectionEndLine() + "\n"
 }
@@ -538,6 +567,14 @@ func installHooksWithOptions(hookNames []string, force bool, shared bool, chain 
 		return fmt.Errorf("failed to create hooks directory: %w", err)
 	}
 
+	// When setting a local core.hooksPath (beads or shared mode), preserve any
+	// hooks from the previously effective hooks directory (e.g. a global
+	// core.hooksPath or the default .git/hooks). Without this, setting a local
+	// core.hooksPath silently shadows the global one and those hooks stop running.
+	if beadsHooks || shared {
+		preservePreexistingHooks(hooksDir)
+	}
+
 	// Install each hook using section markers (GH#1380).
 	// Only the content between markers is managed by beads; user content
 	// outside the markers is preserved across reinstalls and upgrades.
@@ -600,14 +637,93 @@ func installHooksWithOptions(hookNames []string, force bool, shared bool, chain 
 	return nil
 }
 
+// preservePreexistingHooks copies non-beads hooks from the currently effective
+// hooks directory into targetDir. This prevents hooks from a global
+// core.hooksPath (or the default .git/hooks/) from being silently lost when
+// beads sets a local core.hooksPath override.
+func preservePreexistingHooks(targetDir string) {
+	// Get the hooks directory git would currently use (before we override it).
+	currentDir, err := git.GetGitHooksDir()
+	if err != nil {
+		return
+	}
+
+	// Resolve to absolute paths for reliable comparison.
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		return
+	}
+	absCurrent, err := filepath.Abs(currentDir)
+	if err != nil {
+		return
+	}
+
+	// If the current dir is already our target, this is a re-install — skip.
+	if absTarget == absCurrent {
+		return
+	}
+
+	// If current dir is already a beads-managed directory, skip.
+	repoRoot := git.GetRepoRoot()
+	if repoRoot != "" {
+		absBeadsHooks, _ := filepath.Abs(filepath.Join(repoRoot, ".beads", "hooks"))
+		absSharedHooks, _ := filepath.Abs(filepath.Join(repoRoot, ".beads-hooks"))
+		if absCurrent == absBeadsHooks || absCurrent == absSharedHooks {
+			return
+		}
+	}
+
+	// Copy all hooks from the source directory, not just managed ones.
+	entries, err := os.ReadDir(currentDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || strings.HasSuffix(entry.Name(), ".sample") {
+			continue
+		}
+
+		srcPath := filepath.Join(currentDir, entry.Name())
+		// #nosec G304 -- hook path constrained to known hooks directories
+		content, err := os.ReadFile(srcPath)
+		if err != nil {
+			continue
+		}
+
+		contentStr := string(content)
+		// Skip if it's already a beads hook
+		if strings.Contains(contentStr, hookSectionBeginPrefix) ||
+			strings.Contains(contentStr, inlineHookMarker) {
+			continue
+		}
+
+		// Don't overwrite existing files in target
+		dstPath := filepath.Join(targetDir, entry.Name())
+		if _, err := os.Stat(dstPath); err == nil {
+			continue
+		}
+
+		// #nosec G306 -- git hooks must be executable
+		if err := os.WriteFile(dstPath, content, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to preserve %s hook from %s: %v\n", entry.Name(), currentDir, err)
+			continue
+		}
+		fmt.Printf("  Preserving existing %s hook from %s\n", entry.Name(), currentDir)
+	}
+}
+
 func configureSharedHooksPath() error {
-	// Set git config core.hooksPath to .beads-hooks
-	// Note: This may run before .beads exists, so it uses git.GetRepoRoot() directly
+	// Set git config core.hooksPath to an absolute path pointing to .beads-hooks.
+	// Using an absolute path is critical for git worktrees (GH#2414):
+	// git resolves relative core.hooksPath relative to the working tree root.
+	// Note: This may run before .beads exists, so it uses git.GetRepoRoot() directly.
 	repoRoot := git.GetRepoRoot()
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
-	cmd := exec.Command("git", "config", "core.hooksPath", ".beads-hooks")
+	absHooksPath := filepath.Join(repoRoot, ".beads-hooks")
+	cmd := exec.Command("git", "config", "core.hooksPath", absHooksPath)
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git config failed: %w (output: %s)", err, string(output))
@@ -616,12 +732,17 @@ func configureSharedHooksPath() error {
 }
 
 func configureBeadsHooksPath() error {
-	// Set git config core.hooksPath to .beads/hooks
+	// Set git config core.hooksPath to an absolute path pointing to .beads/hooks.
+	// Using an absolute path is critical for git worktrees (GH#2414):
+	// git resolves relative core.hooksPath relative to the working tree root,
+	// so in a worktree ".beads/hooks" would resolve to <worktree>/.beads/hooks/
+	// which doesn't exist — the hooks live in the main repo's .beads/hooks/.
 	repoRoot := git.GetRepoRoot()
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
-	cmd := exec.Command("git", "config", "core.hooksPath", ".beads/hooks")
+	absHooksPath := filepath.Join(repoRoot, ".beads", "hooks")
+	cmd := exec.Command("git", "config", "core.hooksPath", absHooksPath)
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git config failed: %w (output: %s)", err, string(output))
@@ -708,7 +829,11 @@ func resetHooksPathIfBeadsManaged() error {
 	}
 
 	hooksPath := strings.TrimSpace(string(out))
-	if hooksPath == ".beads/hooks" || hooksPath == ".beads-hooks" {
+	// Match both relative (legacy) and absolute (GH#2414) beads hooks paths
+	absBeadsHooks := filepath.Join(repoRoot, ".beads", "hooks")
+	absSharedHooks := filepath.Join(repoRoot, ".beads-hooks")
+	if hooksPath == ".beads/hooks" || hooksPath == ".beads-hooks" ||
+		hooksPath == absBeadsHooks || hooksPath == absSharedHooks {
 		cmd = exec.Command("git", "config", "--unset", "core.hooksPath")
 		cmd.Dir = repoRoot
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -842,9 +967,9 @@ func runPrepareCommitMsgHook(args []string) int {
 		return 0
 	}
 
-	// Detect agent context
-	identity := detectAgentIdentity()
-	if identity == nil {
+	// Detect actor context from BD_ACTOR env var
+	actor := os.Getenv("BD_ACTOR")
+	if actor == "" {
 		return 0 // Not in agent context, nothing to add
 	}
 
@@ -855,36 +980,19 @@ func runPrepareCommitMsgHook(args []string) int {
 		return 0
 	}
 
-	// Check if trailers already present (avoid duplicates on amend)
-	// Look for "Executed-By:" at the start of a line (actual trailer format)
+	// Check if trailer already present (avoid duplicates on amend)
 	for _, line := range strings.Split(string(content), "\n") {
 		if strings.HasPrefix(line, "Executed-By:") {
 			return 0
 		}
 	}
 
-	// Build trailers
-	var trailers []string
-	trailers = append(trailers, fmt.Sprintf("Executed-By: %s", identity.FullIdentity))
-	if identity.Rig != "" {
-		trailers = append(trailers, fmt.Sprintf("Rig: %s", identity.Rig))
-	}
-	if identity.Role != "" {
-		trailers = append(trailers, fmt.Sprintf("Role: %s", identity.Role))
-	}
-	if identity.Molecule != "" {
-		trailers = append(trailers, fmt.Sprintf("Molecule: %s", identity.Molecule))
-	}
-
-	// Append trailers to message
+	// Append Executed-By trailer
 	msg := strings.TrimRight(string(content), "\n\r\t ")
 	var sb strings.Builder
 	sb.WriteString(msg)
 	sb.WriteString("\n\n")
-	for _, trailer := range trailers {
-		sb.WriteString(trailer)
-		sb.WriteString("\n")
-	}
+	sb.WriteString(fmt.Sprintf("Executed-By: %s\n", actor))
 
 	// Write back
 	if err := os.WriteFile(msgFile, []byte(sb.String()), 0600); err != nil { // Restrict permissions per gosec G306
@@ -892,93 +1000,6 @@ func runPrepareCommitMsgHook(args []string) int {
 	}
 
 	return 0
-}
-
-// agentIdentity holds detected agent context information.
-type agentIdentity struct {
-	FullIdentity string // e.g., "beads/crew/dave"
-	Rig          string // e.g., "beads"
-	Role         string // e.g., "crew"
-	Molecule     string // e.g., "bd-xyz" (if attached)
-}
-
-// detectAgentIdentity returns agent identity if running in agent context.
-// Returns nil if not in an agent context (human commit).
-func detectAgentIdentity() *agentIdentity {
-	// Check GT_ROLE environment variable first (set by orchestrator sessions)
-	gtRole := os.Getenv("GT_ROLE")
-	if gtRole != "" {
-		return parseAgentIdentity(gtRole)
-	}
-
-	// Fall back to cwd-based detection
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil
-	}
-
-	// Detect from path patterns
-	return detectAgentFromPath(cwd)
-}
-
-// parseAgentIdentity parses a GT_ROLE value into agent identity.
-// Only supports compound format (e.g., "beads/crew/dave").
-// Simple format role names are Gas Town concepts and should be
-// expanded to compound format by gastown before being set.
-func parseAgentIdentity(role string) *agentIdentity {
-	// Only support compound format: "beads/crew/dave", "gastown/polecats/Nux-123"
-	// Simple formats like "crew" or "polecat" are Gas Town concepts -
-	// gastown should expand them to compound format before setting GT_ROLE.
-	if !strings.Contains(role, "/") {
-		return nil
-	}
-
-	parts := strings.Split(role, "/")
-	identity := &agentIdentity{FullIdentity: role}
-
-	if len(parts) >= 1 {
-		identity.Rig = parts[0]
-	}
-	if len(parts) >= 2 {
-		identity.Role = parts[1]
-	}
-
-	// Check for molecule
-	identity.Molecule = getPinnedMolecule()
-
-	return identity
-}
-
-// detectAgentFromPath is deprecated - path-based agent detection is a
-// Gas Town concept and should be handled by gastown, not beads.
-// Returns nil - agents should set GT_ROLE in compound format instead.
-func detectAgentFromPath(cwd string) *agentIdentity {
-	return nil
-}
-
-// getPinnedMolecule checks if there's a molecule attached via gt mol status.
-func getPinnedMolecule() string {
-	// Try gt mol status --json
-	cmd := exec.Command("gt", "mol", "status", "--json")
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-
-	// Parse JSON response
-	var status struct {
-		HasMolecule bool   `json:"has_molecule"`
-		MoleculeID  string `json:"molecule_id"`
-	}
-	if err := json.Unmarshal(out, &status); err != nil {
-		return ""
-	}
-
-	if status.HasMolecule && status.MoleculeID != "" {
-		return status.MoleculeID
-	}
-
-	return ""
 }
 
 // =============================================================================
