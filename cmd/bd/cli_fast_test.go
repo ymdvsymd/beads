@@ -98,6 +98,9 @@ func copyDir(src, dst string) error {
 // The template is created once via sync.Once and copied for each test.
 func setupCLITestDB(t *testing.T) string {
 	t.Helper()
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	initTemplateDB()
 	if templateDBErr != nil {
 		t.Fatalf("Template DB initialization failed: %v", templateDBErr)
@@ -774,7 +777,7 @@ func init() {
 		panic(err)
 	}
 	testBD = filepath.Join(tmpDir, bdBinary)
-	cmd := exec.Command("go", "build", "-o", testBD, ".")
+	cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", testBD, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		panic(string(out))
 	}
@@ -814,6 +817,9 @@ func runBDExecAllowErrorWithEnv(t *testing.T, dir string, env []string, args ...
 func TestCLI_EndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow CLI test in short mode")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 
@@ -1006,6 +1012,9 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 func TestCLI_CreateDryRun(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow CLI test in short mode")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 
 	t.Run("BasicDryRunPreview", func(t *testing.T) {
@@ -1328,6 +1337,9 @@ func TestCLI_CommentsAddShortID(t *testing.T) {
 func TestCLI_CreateRejectsFlagLikeTitles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow CLI test in short mode")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 
 	tests := []struct {

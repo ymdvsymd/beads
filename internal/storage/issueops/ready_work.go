@@ -67,7 +67,7 @@ func GetReadyWorkInTx(
 	}
 	// Exclude future-deferred issues unless IncludeDeferred is set.
 	if !filter.IncludeDeferred {
-		whereClauses = append(whereClauses, "(defer_until IS NULL OR defer_until <= NOW())")
+		whereClauses = append(whereClauses, "(defer_until IS NULL OR defer_until <= UTC_TIMESTAMP())")
 	}
 	// Exclude children of future-deferred parents.
 	if !filter.IncludeDeferred {
@@ -90,11 +90,25 @@ func GetReadyWorkInTx(
 			args = append(args, label)
 		}
 	}
+	if len(filter.ExcludeLabels) > 0 {
+		placeholders := make([]string, len(filter.ExcludeLabels))
+		for i, label := range filter.ExcludeLabels {
+			placeholders[i] = "?"
+			args = append(args, label)
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT issue_id FROM labels WHERE label IN (%s))", strings.Join(placeholders, ", ")))
+	}
 	// Parent filtering.
 	if filter.ParentID != nil {
 		parentID := *filter.ParentID
 		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR (id LIKE CONCAT(?, '.%') AND id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child')))")
 		args = append(args, parentID, parentID)
+	}
+
+	// Molecule filtering: filter to direct children of the specified molecule.
+	if filter.MoleculeID != "" {
+		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR (id LIKE CONCAT(?, '.%') AND id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child')))")
+		args = append(args, filter.MoleculeID, filter.MoleculeID)
 	}
 
 	// Metadata existence check.
@@ -118,7 +132,7 @@ func GetReadyWorkInTx(
 				return nil, err
 			}
 			whereClauses = append(whereClauses, "JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?")
-			args = append(args, "$."+k, filter.MetadataFields[k])
+			args = append(args, storage.JSONMetadataPath(k), filter.MetadataFields[k])
 		}
 	}
 
@@ -194,7 +208,7 @@ func GetReadyWorkInTx(
 	}
 
 	// Batch-fetch full issues preserving order.
-	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs)
+	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get ready work: fetch issues: %w", err)
 	}
@@ -232,7 +246,7 @@ func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx) ([]string
 	// Step 1: Get IDs of issues with future defer_until.
 	deferredRows, err := tx.QueryContext(ctx, `
 		SELECT id FROM issues
-		WHERE defer_until IS NOT NULL AND defer_until > NOW()
+		WHERE defer_until IS NOT NULL AND defer_until > UTC_TIMESTAMP()
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("deferred parents: get deferred issues: %w", err)

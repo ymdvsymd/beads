@@ -163,6 +163,51 @@ actor: configuser
 	}
 }
 
+func TestInitialize_IgnoresModuleRootConfigWhenRequested(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	configDir := filepath.Join(tmpDir, "xdg-config")
+	repoDir := filepath.Join(tmpDir, "repo")
+	beadsDir := filepath.Join(repoDir, ".beads")
+
+	for _, dir := range []string{homeDir, configDir, beadsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/test\n\ngo 1.24.0\n"), 0o644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("json: true\nactor: repo-user\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config.yaml: %v", err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	t.Chdir(repoDir)
+
+	ResetForTesting()
+	defer ResetForTesting()
+
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false when repo config is ignored", got)
+	}
+	if got := GetString("actor"); got != "" {
+		t.Fatalf("GetString(actor) = %q, want empty default when repo config is ignored", got)
+	}
+	if got := ConfigFileUsed(); got != "" {
+		t.Fatalf("ConfigFileUsed() = %q, want empty when repo config is ignored", got)
+	}
+}
+
 func TestLocalConfigOverride(t *testing.T) {
 	// Isolate from environment variables
 	restore := envSnapshot(t)
@@ -1368,4 +1413,44 @@ func TestGetStringFromDir(t *testing.T) {
 			t.Errorf("got %q, want %q", got, "alice")
 		}
 	})
+}
+
+func TestInitialize_ExternalBEADSDirDoesNotMergeCallerProjectConfig(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	callerRepo := filepath.Join(t.TempDir(), "caller")
+	callerBeadsDir := filepath.Join(callerRepo, ".beads")
+	if err := os.MkdirAll(callerBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create caller .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(callerBeadsDir, "config.yaml"), []byte("readonly: true\njson: true\n"), 0o600); err != nil {
+		t.Fatalf("failed to write caller config: %v", err)
+	}
+
+	targetBeadsDir := filepath.Join(t.TempDir(), "target", ".beads")
+	if err := os.MkdirAll(targetBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create target .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeadsDir, "config.yaml"), []byte("actor: target-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write target config: %v", err)
+	}
+
+	t.Chdir(callerRepo)
+	t.Setenv("BEADS_DIR", targetBeadsDir)
+
+	ResetForTesting()
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	if got := GetString("actor"); got != "target-user" {
+		t.Fatalf("GetString(actor) = %q, want %q", got, "target-user")
+	}
+	if got := GetBool("readonly"); got {
+		t.Fatalf("GetBool(readonly) = %v, want false", got)
+	}
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false", got)
+	}
 }

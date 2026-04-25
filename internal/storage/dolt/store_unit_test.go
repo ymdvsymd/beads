@@ -9,6 +9,7 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // newTestDoltDB creates a temporary database on the test Dolt server.
@@ -24,7 +25,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 
 	dbName := uniqueTestDBName(t)
 
-	adminDSN := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", testServerPort)
+	adminDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root"}.String()
 	admin, err := sql.Open("mysql", adminDSN)
 	if err != nil {
 		t.Fatalf("failed to connect to test Dolt server: %v", err)
@@ -35,7 +36,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 	}
 	admin.Close()
 
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s", testServerPort, dbName)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("failed to connect to test database %s: %v", dbName, err)
@@ -348,6 +349,89 @@ func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 	}
 }
 
+// TestApplyConfigDefaults_SocketFromEnv verifies that BEADS_DOLT_SERVER_SOCKET
+// populates ServerSocket when not already set.
+func TestApplyConfigDefaults_SocketFromEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/test-dolt.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/test-dolt.sock" {
+		t.Errorf("expected ServerSocket from env, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestApplyConfigDefaults_SocketExplicitOverridesEnv verifies that an explicit
+// ServerSocket in Config takes precedence over the env var.
+func TestApplyConfigDefaults_SocketExplicitOverridesEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/env-socket.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{ServerSocket: "/tmp/explicit.sock"}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/explicit.sock" {
+		t.Errorf("expected explicit socket to win, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestBuildServerDSN_WithSocket verifies that buildServerDSN produces a unix
+// DSN when ServerSocket is configured.
+func TestBuildServerDSN_WithSocket(t *testing.T) {
+	cfg := &Config{
+		ServerSocket: "/tmp/dolt.sock",
+		ServerUser:   "root",
+		ServerHost:   "127.0.0.1",
+		ServerPort:   3307,
+		Database:     "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "unix" {
+		t.Errorf("expected Net=unix, got %q", parsed.Net)
+	}
+	if parsed.Addr != "/tmp/dolt.sock" {
+		t.Errorf("expected Addr=/tmp/dolt.sock, got %q", parsed.Addr)
+	}
+	// TLS defaults to false (no TLS requested), same as TCP.
+	if parsed.TLSConfig != "false" {
+		t.Errorf("expected tls=false (default), got %q", parsed.TLSConfig)
+	}
+}
+
+// TestBuildServerDSN_WithoutSocket verifies TCP DSN is unaffected.
+func TestBuildServerDSN_WithoutSocket(t *testing.T) {
+	cfg := &Config{
+		ServerUser: "root",
+		ServerHost: "127.0.0.1",
+		ServerPort: 3307,
+		Database:   "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "tcp" {
+		t.Errorf("expected Net=tcp, got %q", parsed.Net)
+	}
+}
+
 // TestExecWithLongTimeoutDSNRewrite verifies that execWithLongTimeout's
 // ParseDSN/FormatDSN rewrite produces a valid DSN with readTimeout=5m
 // given a DSN from buildServerDSN.
@@ -376,6 +460,58 @@ func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 	}
 	if reParsed.ReadTimeout != 5*time.Minute {
 		t.Errorf("expected readTimeout=5m, got %v", reParsed.ReadTimeout)
+	}
+}
+
+// TestBuildServerDSN_SpecialCharacterPassword verifies that passwords with
+// characters that collide with DSN delimiters (@ : / ? & < > etc.) are
+// properly escaped by FormatDSN. This was a real bug — passwords from Secret
+// Manager like "zId&z,L9P4X,%k4n4rylGV<Ibos9<)/p" caused Access Denied.
+func TestBuildServerDSN_SpecialCharacterPassword(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+	}{
+		{"ampersand and angle brackets", "zId&z,L9P4X,%k4n4rylGV<Ibos9<)/p"},
+		{"at sign and colon", "p@ss:word"},
+		{"slash and question mark", "pass/word?maybe"},
+		{"percent encoding chars", "100%done&dusted"},
+		{"empty password", ""},
+		{"alphanumeric only", "SimplePassword123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				ServerUser:     "testuser",
+				ServerPassword: tt.password,
+				ServerHost:     "127.0.0.1",
+				ServerPort:     3308,
+				Database:       "testdb",
+			}
+			applyConfigDefaults(cfg)
+
+			dsn := buildServerDSN(cfg, cfg.Database)
+
+			// The DSN must be parseable by go-sql-driver
+			parsed, err := mysql.ParseDSN(dsn)
+			if err != nil {
+				t.Fatalf("buildServerDSN produced unparseable DSN: %v\n  DSN: %s", err, dsn)
+			}
+
+			// The parsed password must match the original exactly
+			if parsed.Passwd != tt.password {
+				t.Errorf("password roundtrip failed: got %q, want %q", parsed.Passwd, tt.password)
+			}
+
+			if parsed.User != "testuser" {
+				t.Errorf("user roundtrip failed: got %q, want %q", parsed.User, "testuser")
+			}
+
+			if parsed.DBName != "testdb" {
+				t.Errorf("database roundtrip failed: got %q, want %q", parsed.DBName, "testdb")
+			}
+		})
 	}
 }
 

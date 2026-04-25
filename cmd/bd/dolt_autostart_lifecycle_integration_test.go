@@ -18,6 +18,9 @@ func TestE2E_AutoStartedRepoLocalServerPersistsAcrossCommands(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow integration test in short mode")
 	}
+	if isEmbeddedMode() {
+		t.Skip("skipping: bd dolt status not supported in embedded mode")
+	}
 	if runtime.GOOS == windowsOS {
 		t.Skip("repo-local dolt lifecycle integration test not supported on windows")
 	}
@@ -38,9 +41,12 @@ func TestE2E_AutoStartedRepoLocalServerPersistsAcrossCommands(t *testing.T) {
 		"BEADS_DOLT_SERVER_PORT=",
 		"BEADS_DOLT_PORT=",
 		"BEADS_DOLT_SHARED_SERVER=",
+		"GIT_TERMINAL_PROMPT=0",
+		"SSH_ASKPASS=",
+		"GIT_ASKPASS=",
 	)
 
-	initOut, initErr := runBDExecWithBinary(t, bdBinary, tmpDir, env, "init", "--backend", "dolt", "--prefix", "test", "--quiet")
+	initOut, initErr := runBDExecWithBinary(t, bdBinary, tmpDir, env, "init", "--backend", "dolt", "--server", "--prefix", "test", "--quiet")
 	if initErr != nil {
 		lower := strings.ToLower(initOut)
 		if strings.Contains(lower, "dolt") && (strings.Contains(lower, "not supported") || strings.Contains(lower, "not available") || strings.Contains(lower, "unknown")) {
@@ -125,7 +131,7 @@ func buildLifecycleTestBinary(t *testing.T) string {
 		t.Fatalf("getwd: %v", err)
 	}
 	bdBinary := filepath.Join(t.TempDir(), "bd")
-	cmd := exec.Command("go", "build", "-o", bdBinary, ".")
+	cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", bdBinary, ".")
 	cmd.Dir = pkgDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {

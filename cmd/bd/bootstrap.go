@@ -3,19 +3,88 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
+	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"golang.org/x/term"
 )
+
+type bootstrapServerProbeConfig struct {
+	host     string
+	port     int
+	user     string
+	pass     string
+	database string
+	tls      bool
+}
+
+type bootstrapServerDBCheck struct {
+	Exists    bool
+	Reachable bool
+	Err       error
+}
+
+var checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
+	host := probeCfg.host
+	port := probeCfg.port
+	dbName := probeCfg.database
+	dsn := doltutil.ServerDSN{
+		Host:     host,
+		Port:     port,
+		User:     probeCfg.user,
+		Password: probeCfg.pass,
+		TLS:      probeCfg.tls,
+	}.String()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return bootstrapServerDBCheck{Reachable: false, Err: err}
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		return bootstrapServerDBCheck{Reachable: false, Err: err}
+	}
+
+	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
+	if err != nil {
+		return bootstrapServerDBCheck{Reachable: true, Err: err}
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return bootstrapServerDBCheck{Reachable: true, Err: err}
+		}
+		if name == dbName {
+			return bootstrapServerDBCheck{Exists: true, Reachable: true}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return bootstrapServerDBCheck{Reachable: true, Err: err}
+	}
+
+	return bootstrapServerDBCheck{Exists: false, Reachable: true}
+}
 
 var bootstrapCmd = &cobra.Command{
 	Use:     "bootstrap",
@@ -25,7 +94,8 @@ var bootstrapCmd = &cobra.Command{
 Unlike 'bd init --force', bootstrap will never delete existing issues.
 
 Bootstrap auto-detects the right action:
-  • If sync.git-remote is configured: clones from the remote
+  • If sync.remote is configured: clones from the remote
+  • If git origin has Dolt data (refs/dolt/data): clones from git
   • If .beads/backup/*.jsonl exists: restores from backup
   • If .beads/issues.jsonl exists: imports from git-tracked JSONL
   • If no database exists: creates a fresh one
@@ -36,34 +106,78 @@ This is the recommended command for:
   • Recovering after moving to a new machine
   • Repairing a broken database configuration
 
+Non-interactive mode (--non-interactive, --yes/-y, or BD_NON_INTERACTIVE=1):
+  Skips the confirmation prompt before executing the bootstrap plan.
+  Also auto-detected when stdin is not a terminal or CI=true is set.
+
 Examples:
   bd bootstrap              # Auto-detect and set up
   bd bootstrap --dry-run    # Show what would be done
   bd bootstrap --json       # Output plan as JSON
+  bd bootstrap --yes        # Skip confirmation prompt
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		yesFlag, _ := cmd.Flags().GetBool("yes")
+		nonInteractiveFlag, _ := cmd.Flags().GetBool("non-interactive")
+
+		// Resolve non-interactive mode: flag > env var > CI env > terminal detection.
+		nonInteractive := isNonInteractiveBootstrap(yesFlag || nonInteractiveFlag)
 
 		// Find beads directory
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
+			// No .beads directory exists yet. Before giving up, probe the
+			// git remote for Dolt data stored in git (refs/dolt/data). This
+			// is the "fresh second clone" case: clone1 pushed Beads state
+			// to a git remote, and clone2 needs to bootstrap from it.
+			// Only applies to git remotes — Dolt-native remotes (DoltHub,
+			// S3, etc.) should be configured via sync.remote. (GH#2792)
+			//
+			// If found, synthesize the theoretical .beads path and fall
+			// through to the normal detectBootstrapAction + executeBootstrapPlan
+			// flow. Actual directory creation is deferred to executeSyncAction
+			// to preserve --dry-run semantics.
+			if isGitRepo() && !isBareGitRepo() {
+				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
+					if gitOriginHasDoltDataRef() {
+						if fallbackDir := beads.GetWorktreeFallbackBeadsDir(); fallbackDir != "" {
+							beadsDir = fallbackDir
+						} else {
+							cwd, err := os.Getwd()
+							if err != nil {
+								FatalError("failed to get working directory: %v", err)
+							}
+							beadsDir = filepath.Join(cwd, ".beads")
+						}
+					}
+				}
+			}
+		}
+
+		if beadsDir == "" {
+			// No .beads and no remote data — nothing to bootstrap from.
 			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"action":     "none",
-					"reason":     "no .beads directory found",
-					"suggestion": "Run 'bd init' to create a new project",
-				})
+				outputJSON(noWorkspaceBootstrapPayload())
 			} else {
-				fmt.Fprintf(os.Stderr, "No .beads directory found.\n")
-				fmt.Fprintf(os.Stderr, "To create a new project, use: bd init\n")
+				fmt.Fprintf(os.Stderr, "%s\n", activeWorkspaceNotFoundMessage())
+				fmt.Fprintf(os.Stderr, "Hint: %s\n", diagHint())
 				fmt.Fprintf(os.Stderr, "Bootstrap is for existing projects that need database setup.\n")
 			}
 			os.Exit(1)
 		}
 
-		// Load config
+		// Load config from .beads/metadata.json. When the beadsDir was
+		// synthesized (fresh clone or rig with no local .beads), the file
+		// won't exist. In that case, walk up parent directories to find a
+		// workspace-level metadata.json that contains the correct database
+		// name (e.g. dolt_database). Without this, server-mode rigs get the
+		// default name "beads" instead of their configured name. (GH#3029)
 		cfg, err := configfile.Load(beadsDir)
 		if err != nil || cfg == nil {
+			cfg = findParentConfig(beadsDir)
+		}
+		if cfg == nil {
 			cfg = configfile.DefaultConfig()
 		}
 
@@ -83,9 +197,8 @@ Examples:
 		}
 
 		// Execute the plan
-		if err := executeBootstrapPlan(plan, cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
-			os.Exit(1)
+		if err := executeBootstrapPlan(plan, cfg, nonInteractive); err != nil {
+			FatalError("Bootstrap failed: %v", err)
 		}
 	},
 }
@@ -102,43 +215,75 @@ type BootstrapPlan struct {
 	HasExisting bool   `json:"has_existing"`
 }
 
+func noWorkspaceBootstrapPayload() map[string]interface{} {
+	return map[string]interface{}{
+		"action":     "none",
+		"reason":     activeWorkspaceNotFoundError(),
+		"suggestion": diagHint(),
+	}
+}
+
 func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPlan {
 	plan := BootstrapPlan{
 		BeadsDir: beadsDir,
 		Database: cfg.GetDoltDatabase(),
 	}
 
-	// Check for existing database
-	doltPath := doltserver.ResolveDoltDir(beadsDir)
-	if info, err := os.Stat(doltPath); err == nil && info.IsDir() {
-		entries, _ := os.ReadDir(doltPath)
-		if len(entries) > 0 {
-			plan.HasExisting = true
-			plan.Action = "none"
-			plan.Reason = "Database already exists at " + doltPath
-			return plan
-		}
+	// When bootstrap synthesized a fallback beadsDir for a fresh clone or
+	// worktree recovery, the path may not exist yet. In that case we must let
+	// sync.remote / refs/dolt/data detection run before treating an existing
+	// shared-server database as "nothing to do", otherwise an unrelated default
+	// "beads" database can mask the real recovery path.
+	beadsDirExists := false
+	if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+		beadsDirExists = true
 	}
 
-	// Check sync.git-remote
-	syncRemote := config.GetString("sync.git-remote")
+	// Check for existing database (path differs between server and embedded mode).
+	// Determine server/shared-server mode from the target workspace itself
+	// (metadata.json, env vars, and the target config.yaml when present) rather
+	// than unrelated global config loaded from the caller's current repo.
+	isSharedServer := bootstrapSharedServerMode(beadsDir)
+	isServer := cfg.IsDoltServerMode() || isSharedServer
+
+	// Check sync.remote (primary) or sync.git-remote (deprecated fallback)
+	syncRemote := resolveSyncRemote()
 	if syncRemote != "" {
+		// User-provided sync.remote — trust the URL format as-is.
+		// normalizeRemoteURL would convert http:// to git+http://,
+		// breaking Dolt remotesapi endpoints (GH#3339).
 		plan.SyncRemote = syncRemote
 		plan.Action = "sync"
-		plan.Reason = "sync.git-remote configured — will clone from " + syncRemote
+		plan.Reason = "sync.remote configured — will clone from " + syncRemote
 		return plan
 	}
 
-	// Auto-detect: probe origin for refs/dolt/data
+	// Auto-detect: probe git origin for Dolt data stored in git
+	// (refs/dolt/data). This only applies to git remotes — Dolt-native
+	// remotes (DoltHub, S3, etc.) must be configured via sync.remote.
 	if isGitRepo() && !isBareGitRepo() {
-		if originURL, err := gitRemoteGetURL("origin"); err == nil && originURL != "" {
-			if gitLsRemoteHasRef("origin", "refs/dolt/data") {
-				plan.SyncRemote = gitURLToDoltRemote(originURL)
+		if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
+			if gitOriginHasDoltDataRef() {
+				plan.SyncRemote = normalizeRemoteURL(originURL)
 				plan.Action = "sync"
-				plan.Reason = "Found existing beads database on origin (refs/dolt/data) — will clone from " + originURL
+				plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + originURL
 				return plan
 			}
 		}
+	}
+
+	if dbAction, ok := existingBootstrapDBPlan(beadsDir, cfg, isServer, isSharedServer); ok {
+		// If the local beadsDir does not exist yet, prefer recovering via sync
+		// first. This avoids false "nothing to do" results when the default
+		// shared-server database name happens to exist for another project.
+		if beadsDirExists || dbAction.Action != "none" {
+			return dbAction
+		}
+		// For synthesized paths with no local workspace directory yet, defer the
+		// existing-db no-op until we've ruled out all other recovery paths.
+		// This preserves the sync-precedence fix without downgrading the
+		// legitimate "database already exists" case into a fresh init.
+		plan = dbAction
 	}
 
 	// Check for backup JSONL files (must be non-empty to be useful)
@@ -160,17 +305,133 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 		return plan
 	}
 
+	if plan.Action == "none" {
+		return plan
+	}
+
 	// Fresh setup
 	plan.Action = "init"
 	plan.Reason = "No existing database, remote, or backup — will create fresh database"
 	return plan
 }
 
+func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, isSharedServer bool) (BootstrapPlan, bool) {
+	plan := BootstrapPlan{
+		BeadsDir: beadsDir,
+		Database: cfg.GetDoltDatabase(),
+	}
+
+	var dbPath string
+	if isServer {
+		dbPath = bootstrapServerDoltDir(beadsDir, cfg, isSharedServer)
+	} else {
+		dbPath = filepath.Join(beadsDir, "embeddeddolt")
+	}
+	if info, err := os.Stat(dbPath); err != nil || !info.IsDir() {
+		return BootstrapPlan{}, false
+	}
+
+	entries, _ := os.ReadDir(dbPath)
+	if len(entries) == 0 {
+		return BootstrapPlan{}, false
+	}
+
+	if isServer {
+		probeCfg := bootstrapServerProbeConfig{
+			host:     cfg.GetDoltServerHost(),
+			port:     bootstrapServerPort(beadsDir, cfg, isSharedServer),
+			user:     cfg.GetDoltServerUser(),
+			pass:     cfg.GetDoltServerPassword(),
+			database: cfg.GetDoltDatabase(),
+			tls:      cfg.GetDoltServerTLS(),
+		}
+		result := checkBootstrapServerDB(probeCfg)
+		if result.Err != nil {
+			plan.Action = "none"
+			plan.Reason = fmt.Sprintf("Could not verify existing server database %s: %v", cfg.GetDoltDatabase(), result.Err)
+			return plan, true
+		}
+		if result.Exists {
+			plan.HasExisting = true
+			plan.Action = "none"
+			plan.Reason = fmt.Sprintf("Database %s already exists on server at %s:%d", probeCfg.database, probeCfg.host, probeCfg.port)
+			return plan, true
+		}
+		return BootstrapPlan{}, false
+	}
+
+	plan.HasExisting = true
+	plan.Action = "none"
+	plan.Reason = "Database already exists at " + dbPath
+	return plan, true
+}
+
+func bootstrapSharedServerMode(beadsDir string) bool {
+	if v := os.Getenv("BEADS_DOLT_SHARED_SERVER"); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	return strings.EqualFold(config.GetStringFromDir(beadsDir, "dolt.shared-server"), "true")
+}
+
+func bootstrapServerDoltDir(beadsDir string, cfg *configfile.Config, isSharedServer bool) string {
+	if isSharedServer {
+		if dir, err := doltserver.SharedDoltDir(); err == nil {
+			return dir
+		}
+	}
+
+	if d := cfg.GetDoltDataDir(); d != "" {
+		if filepath.IsAbs(d) {
+			return d
+		}
+		return filepath.Join(beadsDir, d)
+	}
+
+	return filepath.Join(beadsDir, "dolt")
+}
+
+func bootstrapServerPort(beadsDir string, cfg *configfile.Config, isSharedServer bool) int {
+	if p := os.Getenv("BEADS_DOLT_SERVER_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port
+		}
+	}
+
+	if isSharedServer {
+		if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+			if port := doltserver.ReadPortFile(sharedDir); port > 0 {
+				return port
+			}
+		}
+		return doltserver.DefaultSharedServerPort
+	}
+
+	if port := doltserver.ReadPortFile(beadsDir); port > 0 {
+		return port
+	}
+
+	if p := config.GetStringFromDir(beadsDir, "dolt.port"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port
+		}
+	}
+
+	if cfg.DoltServerPort > 0 {
+		return cfg.DoltServerPort
+	}
+
+	return configfile.DefaultDoltServerPort
+}
+
 func printBootstrapPlan(plan BootstrapPlan) {
 	switch plan.Action {
 	case "none":
 		fmt.Printf("✓ Database already exists: %s\n", plan.BeadsDir)
-		fmt.Printf("  Nothing to do. Use 'bd doctor' to check health.\n")
+		if isEmbeddedMode() {
+			fmt.Printf("  Nothing to do.\n")
+		} else {
+			fmt.Printf("  Nothing to do. Use 'bd doctor' to check health.\n")
+		}
 	case "sync":
 		fmt.Printf("Bootstrap plan: clone from remote\n")
 		fmt.Printf("  Remote: %s\n", plan.SyncRemote)
@@ -188,9 +449,12 @@ func printBootstrapPlan(plan BootstrapPlan) {
 	}
 }
 
-// confirmPrompt asks the user to confirm an action. Returns true if the user
-// confirms or if stdin is not a terminal (non-interactive/CI contexts).
-func confirmPrompt(message string) bool {
+// confirmPrompt asks the user to confirm an action. Returns true if
+// nonInteractive is set, stdin is not a terminal, or the user confirms.
+func confirmPrompt(message string, nonInteractive bool) bool {
+	if nonInteractive {
+		return true
+	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return true
 	}
@@ -201,8 +465,8 @@ func confirmPrompt(message string) bool {
 	return line == "" || line == "y" || line == "yes"
 }
 
-func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config) error {
-	if !confirmPrompt("Proceed?") {
+func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInteractive bool) error {
+	if !confirmPrompt("Proceed?", nonInteractive) {
 		fmt.Fprintf(os.Stderr, "Aborted.\n")
 		return nil
 	}
@@ -223,16 +487,11 @@ func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config) error {
 }
 
 func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
-	doltDir := doltserver.ResolveDoltDir(plan.BeadsDir)
-	if err := os.MkdirAll(doltDir, 0o750); err != nil {
-		return fmt.Errorf("create dolt directory: %w", err)
-	}
-
 	prefix := inferPrefix(cfg)
 	dbName := cfg.GetDoltDatabase()
 
-	store, err := dolt.New(ctx, &dolt.Config{
-		Path:            doltDir,
+	s, err := newDoltStore(ctx, &dolt.Config{
+		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
 		Database:        dbName,
 		CreateIfMissing: true,
 		AutoStart:       true,
@@ -241,12 +500,12 @@ func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	if err != nil {
 		return fmt.Errorf("create database: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = s.Close() }()
 
-	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
+	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := store.Commit(ctx, "bd bootstrap"); err != nil {
+	if err := s.CommitWithConfig(ctx, "bd bootstrap"); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
 
@@ -255,16 +514,11 @@ func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 }
 
 func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
-	doltDir := doltserver.ResolveDoltDir(plan.BeadsDir)
-	if err := os.MkdirAll(doltDir, 0o750); err != nil {
-		return fmt.Errorf("create dolt directory: %w", err)
-	}
-
 	prefix := inferPrefix(cfg)
 	dbName := cfg.GetDoltDatabase()
 
-	store, err := dolt.New(ctx, &dolt.Config{
-		Path:            doltDir,
+	s, err := newDoltStore(ctx, &dolt.Config{
+		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
 		Database:        dbName,
 		CreateIfMissing: true,
 		AutoStart:       true,
@@ -273,36 +527,29 @@ func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfi
 	if err != nil {
 		return fmt.Errorf("create database: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = s.Close() }()
 
-	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
+	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := store.Commit(ctx, "bd bootstrap: init"); err != nil {
+	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
 		return fmt.Errorf("commit init: %w", err)
 	}
 
-	result, err := runBackupRestore(ctx, store, plan.BackupDir, false)
-	if err != nil {
+	if err := runBackupRestore(ctx, s, plan.BackupDir, false); err != nil {
 		return fmt.Errorf("restore from backup: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Restored from backup: %d issues, %d comments, %d dependencies, %d labels\n",
-		result.Issues, result.Comments, result.Dependencies, result.Labels)
+	fmt.Fprintf(os.Stderr, "Restored from backup\n")
 	return nil
 }
 
 func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
-	doltDir := doltserver.ResolveDoltDir(plan.BeadsDir)
-	if err := os.MkdirAll(doltDir, 0o750); err != nil {
-		return fmt.Errorf("create dolt directory: %w", err)
-	}
-
 	prefix := inferPrefix(cfg)
 	dbName := cfg.GetDoltDatabase()
 
-	store, err := dolt.New(ctx, &dolt.Config{
-		Path:            doltDir,
+	s, err := newDoltStore(ctx, &dolt.Config{
+		Path:            doltserver.ResolveDoltDir(plan.BeadsDir),
 		Database:        dbName,
 		CreateIfMissing: true,
 		AutoStart:       true,
@@ -311,21 +558,21 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 	if err != nil {
 		return fmt.Errorf("create database: %w", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = s.Close() }()
 
-	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
+	if err := s.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("set issue prefix: %w", err)
 	}
-	if err := store.Commit(ctx, "bd bootstrap: init"); err != nil {
+	if err := s.CommitWithConfig(ctx, "bd bootstrap: init"); err != nil {
 		return fmt.Errorf("commit init: %w", err)
 	}
 
-	count, err := importFromLocalJSONL(ctx, store, plan.JSONLFile)
+	count, err := importFromLocalJSONL(ctx, s, plan.JSONLFile)
 	if err != nil {
 		return fmt.Errorf("import from JSONL: %w", err)
 	}
 
-	if err := store.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil {
+	if err := s.Commit(ctx, "bd bootstrap: import from issues.jsonl"); err != nil {
 		return fmt.Errorf("commit import: %w", err)
 	}
 
@@ -334,15 +581,189 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 }
 
 func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
-	doltDir := doltserver.ResolveDoltDir(plan.BeadsDir)
-	dbName := cfg.GetDoltDatabase()
+	// Ensure .beads directory exists — it may not in the "fresh clone"
+	// bootstrap path where we detected remote data before .beads was
+	// created. Deferred here to preserve --dry-run semantics. (GH#2792)
+	if err := os.MkdirAll(plan.BeadsDir, 0o750); err != nil {
+		return fmt.Errorf("create beads directory: %w", err)
+	}
 
-	synced, err := dolt.BootstrapFromGitRemoteWithDB(ctx, doltDir, plan.SyncRemote, dbName)
+	dbName := cfg.GetDoltDatabase()
+	if err := cloneFromRemote(ctx, plan.BeadsDir, plan.SyncRemote, dbName, cfg); err != nil {
+		return err
+	}
+
+	// Finalize the bootstrapped workspace so subsequent bd commands can open
+	// the cloned database. Without metadata.json and config.yaml,
+	// configfile.Load() returns nil, callers fall back to the default
+	// dolt_database name, and bd loses track of the cloned database —
+	// producing "no beads configuration found" and "Error 1105: no database
+	// selected" on bd status / bd dolt push in fresh clones. Every other
+	// bootstrap action (init, restore, jsonl-import) writes these files via
+	// newDoltStore + createConfigYaml; the sync path historically did not.
+	// (GH#3201)
+	if err := finalizeSyncedBootstrap(plan.BeadsDir, plan.SyncRemote, cfg, dbName); err != nil {
+		return err
+	}
+
+	// Open and close the store to ensure dolt_ignore'd wisp tables are
+	// created in the working set. Clone does not include these tables
+	// (they are never committed), so they must be recreated after clone.
+	// Both embedded and server mode handle this in their store init paths.
+	warmupStore, err := newDoltStoreFromConfig(ctx, plan.BeadsDir)
+	if err != nil {
+		// Non-fatal: wisp tables will be created on the next command that
+		// opens the store. Warn so the user knows to retry if they hit
+		// "table not found: wisp_*" errors.
+		fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
+		return nil
+	}
+	_ = warmupStore.Close()
+
+	return nil
+}
+
+// finalizeSyncedBootstrap writes metadata.json and config.yaml after a
+// successful sync clone, matching the on-disk layout that bd init produces.
+// It is idempotent: re-running over an already-finalized workspace leaves
+// existing files intact (createConfigYaml skips if config.yaml exists; the
+// metadata.json write is a full rewrite that preserves caller fields).
+func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config, dbName string) error {
+	// Preserve whatever upstream fields were already set in cfg (which may
+	// be DefaultConfig when metadata.json was absent, or a parent workspace
+	// config propagated by findParentConfig), then fill in the bits
+	// required by configfile.Load consumers.
+	cfg.Backend = configfile.BackendDolt
+	cfg.DoltDatabase = dbName
+	if cfg.IsDoltServerMode() || doltserver.IsSharedServerMode() {
+		cfg.DoltMode = configfile.DoltModeServer
+	} else {
+		cfg.DoltMode = configfile.DoltModeEmbedded
+	}
+	// Mirror init's convention: metadata.json database points at the Dolt
+	// directory rather than the legacy "beads.db" placeholder.
+	if cfg.Database == "" || cfg.Database == beads.CanonicalDatabaseName {
+		cfg.Database = "dolt"
+	}
+
+	if err := cfg.Save(beadsDir); err != nil {
+		return fmt.Errorf("write metadata.json: %w", err)
+	}
+
+	if err := createConfigYaml(beadsDir, false, ""); err != nil {
+		return fmt.Errorf("create config.yaml: %w", err)
+	}
+
+	// Persist sync.remote so subsequent fresh clones (and bd bootstrap
+	// retries) can rediscover the remote without re-probing origin refs.
+	if syncRemote != "" {
+		if err := config.SetYamlConfigInDir(beadsDir, "sync.remote", syncRemote); err != nil {
+			return fmt.Errorf("persist sync.remote to config.yaml: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// cloneFromRemote clones a Dolt database from a remote URL.
+// In embedded mode, uses the embedded engine's DOLT_CLONE procedure.
+// In external server mode, connects to the running server via MySQL and
+// executes DOLT_CLONE so the server places the database in its own data
+// directory. In owned-server mode, shells out to dolt clone via
+// BootstrapFromRemoteWithDB.
+// Shared by bd init and bd bootstrap to keep clone logic in one place.
+func cloneFromRemote(ctx context.Context, beadsDir, remoteURL, dbName string, cfg *configfile.Config) error {
+	mode := doltserver.ResolveServerMode(beadsDir)
+
+	switch mode {
+	case doltserver.ServerModeEmbedded:
+		return cloneViaEmbedded(ctx, beadsDir, remoteURL, dbName)
+
+	case doltserver.ServerModeExternal:
+		if cfg == nil {
+			// Caller didn't provide config; fall back to loading from disk.
+			if loaded, err := configfile.Load(beadsDir); err == nil && loaded != nil {
+				cfg = loaded
+			}
+		}
+		if cfg != nil {
+			return cloneViaServer(ctx, beadsDir, remoteURL, dbName, cfg)
+		}
+		// No config available — fall through to CLI clone.
+		fmt.Fprintf(os.Stderr, "Warning: server mode detected but no config available, falling back to CLI clone\n")
+		return cloneViaCLI(ctx, beadsDir, remoteURL, dbName)
+
+	default: // ServerModeOwned
+		return cloneViaCLI(ctx, beadsDir, remoteURL, dbName)
+	}
+}
+
+// cloneViaEmbedded clones using the embedded Dolt engine (CGO required).
+func cloneViaEmbedded(ctx context.Context, beadsDir, remoteURL, dbName string) error {
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
+		return fmt.Errorf("create embeddeddolt directory: %w", err)
+	}
+	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, "", "")
+	if err != nil {
+		return fmt.Errorf("open embedded engine for clone: %w", err)
+	}
+	defer func() { _ = cleanup() }()
+
+	if err := versioncontrolops.DoltClone(ctx, db, remoteURL, dbName); err != nil {
+		return fmt.Errorf("clone from remote: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Synced database from %s\n", remoteURL)
+	return nil
+}
+
+// cloneViaServer clones by connecting to the external Dolt server and
+// executing CALL DOLT_CLONE. The server places the database in its own
+// data directory, which is the correct behavior for externally managed
+// servers where bd does not know the filesystem layout.
+func cloneViaServer(ctx context.Context, beadsDir, remoteURL, dbName string, cfg *configfile.Config) error {
+	resolved := doltserver.DefaultConfig(beadsDir)
+	dsn := doltutil.ServerDSN{
+		Host:     cfg.GetDoltServerHost(),
+		Port:     resolved.Port,
+		User:     cfg.GetDoltServerUser(),
+		Password: cfg.GetDoltServerPasswordForPort(resolved.Port),
+		TLS:      cfg.GetDoltServerTLS(),
+		// No Database — DOLT_CLONE creates the database.
+	}.String()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("connect to dolt server for clone: %w", err)
+	}
+	defer db.Close()
+
+	cloneCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	if err := db.PingContext(cloneCtx); err != nil {
+		return fmt.Errorf("dolt server unreachable at %s:%d (is dolt sql-server running?): %w",
+			cfg.GetDoltServerHost(), resolved.Port, err)
+	}
+
+	if err := versioncontrolops.DoltClone(cloneCtx, db, remoteURL, dbName); err != nil {
+		return fmt.Errorf("clone from remote via server: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Synced database from %s (via server at %s:%d)\n",
+		remoteURL, cfg.GetDoltServerHost(), resolved.Port)
+	return nil
+}
+
+// cloneViaCLI clones by shelling out to the dolt CLI.
+// Used for owned-server mode where bd manages the server lifecycle.
+func cloneViaCLI(ctx context.Context, beadsDir, remoteURL, dbName string) error {
+	doltDir := doltserver.ResolveDoltDir(beadsDir)
+	synced, err := dolt.BootstrapFromRemoteWithDB(ctx, doltDir, remoteURL, dbName)
 	if err != nil {
 		return fmt.Errorf("sync from remote: %w", err)
 	}
 	if synced {
-		fmt.Fprintf(os.Stderr, "Synced database from %s\n", plan.SyncRemote)
+		fmt.Fprintf(os.Stderr, "Synced database from %s\n", remoteURL)
 	}
 	return nil
 }
@@ -356,7 +777,54 @@ func inferPrefix(cfg *configfile.Config) string {
 	return filepath.Base(cwd)
 }
 
+// isNonInteractiveBootstrap returns true if bootstrap should skip confirmation prompts.
+// Precedence: explicit flag > BD_NON_INTERACTIVE env > CI env > terminal detection.
+func isNonInteractiveBootstrap(flagValue bool) bool {
+	if flagValue {
+		return true
+	}
+	if v := os.Getenv("BD_NON_INTERACTIVE"); v == "1" || v == "true" {
+		return true
+	}
+	if v := os.Getenv("CI"); v == "true" || v == "1" {
+		return true
+	}
+	return !term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// findParentConfig walks up from beadsDir's parent looking for a
+// .beads/metadata.json in ancestor directories. This handles the case where a
+// rig subdirectory (its own git repo) doesn't have a local .beads but its
+// parent workspace does. Returns nil if no parent config is found.
+func findParentConfig(beadsDir string) *configfile.Config {
+	// Start from the parent of beadsDir's enclosing directory.
+	// beadsDir is typically "<project>/.beads", so we start from <project>'s parent.
+	start := filepath.Dir(filepath.Dir(beadsDir))
+	homeDir, _ := os.UserHomeDir()
+
+	for dir := start; dir != "/" && dir != "."; {
+		candidate := filepath.Join(dir, ".beads")
+		if cfg, err := configfile.Load(candidate); err == nil && cfg != nil {
+			return cfg
+		}
+
+		// Don't search above $HOME
+		if homeDir != "" && dir == homeDir {
+			break
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return nil
+}
+
 func init() {
 	bootstrapCmd.Flags().Bool("dry-run", false, "Show what would be done without doing it")
+	bootstrapCmd.Flags().BoolP("yes", "y", false, "Skip confirmation prompts (for CI/automation)")
+	bootstrapCmd.Flags().Bool("non-interactive", false, "Alias for --yes")
 	rootCmd.AddCommand(bootstrapCmd)
 }

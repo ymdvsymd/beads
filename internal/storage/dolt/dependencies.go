@@ -35,7 +35,7 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 		}
 	}
 
-	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		opts := issueops.AddDependencyOpts{
 			SourceTable:   "issues",
 			TargetTable:   targetTable,
@@ -499,7 +499,7 @@ func (s *DoltStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.
 	var result []*types.Issue
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		result, err = issueops.GetIssuesByIDsInTx(ctx, tx, ids)
+		result, err = issueops.GetIssuesByIDsInTx(ctx, tx, ids, nil)
 		return err
 	})
 	return result, err

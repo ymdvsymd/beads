@@ -10,7 +10,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -101,27 +100,20 @@ create, update, show, or close operation).`,
 			FatalErrorRespectJSON("--suggest-next only works when closing a single issue")
 		}
 
-		// Resolve partial IDs first, handling cross-rig routing
+		// Resolve partial IDs
 		var resolvedIDs []string
-		var routedArgs []string // IDs that need cross-repo routing
-		// Direct mode - check routing for each ID
 		for _, id := range args {
-			if needsRouting(id) {
-				routedArgs = append(routedArgs, id)
-			} else {
-				resolved, err := utils.ResolvePartialID(ctx, store, id)
-				if err != nil {
-					FatalErrorRespectJSON("resolving ID %s: %v", id, err)
-				}
-				resolvedIDs = append(resolvedIDs, resolved)
+			resolved, err := utils.ResolvePartialID(ctx, store, id)
+			if err != nil {
+				FatalErrorRespectJSON("resolving ID %s: %v", id, err)
 			}
+			resolvedIDs = append(resolvedIDs, resolved)
 		}
 
 		// Direct mode
 		closedIssues := []*types.Issue{}
 		closedCount := 0
 
-		// Handle local IDs
 		for _, id := range resolvedIDs {
 			// Get issue for checks (nil issue is handled by validateIssueClosable)
 			issue, _ := store.GetIssue(ctx, id)
@@ -178,15 +170,8 @@ create, update, show, or close operation).`,
 			// Auto-close parent molecule if all steps are now complete
 			autoCloseCompletedMolecule(ctx, store, id, actor, session)
 
-			// Run hooks (best effort: hooks run only if re-fetch succeeds)
+			// Re-fetch for display
 			closedIssue, _ := store.GetIssue(ctx, id)
-			if closedIssue != nil && hookRunner != nil {
-				// Fire on_update only if status actually changed (GH#2630)
-				if issue == nil || issue.Status != types.StatusClosed {
-					hookRunner.Run(hooks.EventUpdate, closedIssue)
-				}
-				hookRunner.Run(hooks.EventClose, closedIssue)
-			}
 
 			if jsonOutput {
 				if closedIssue != nil {
@@ -195,82 +180,6 @@ create, update, show, or close operation).`,
 			} else {
 				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(id, issueTitleOrEmpty(issue)), reason)
 			}
-		}
-
-		// Handle routed IDs (cross-rig)
-		for _, id := range routedArgs {
-			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
-				continue
-			}
-			if result == nil || result.Issue == nil {
-				if result != nil {
-					result.Close()
-				}
-				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
-				continue
-			}
-
-			if err := validateIssueClosable(result.ResolvedID, result.Issue, force); err != nil {
-				result.Close()
-				fmt.Fprintf(os.Stderr, "%s\n", err)
-				continue
-			}
-
-			// Check gate satisfaction for machine-checkable gates (GH#1467)
-			if !force {
-				if err := checkGateSatisfaction(result.Issue); err != nil {
-					result.Close()
-					fmt.Fprintf(os.Stderr, "cannot close %s: %s\n", id, err)
-					continue
-				}
-			}
-
-			// Check if issue has open blockers (GH#962)
-			if !force {
-				blocked, blockers, err := result.Store.IsBlocked(ctx, result.ResolvedID)
-				if err != nil {
-					result.Close()
-					fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
-					continue
-				}
-				if blocked && len(blockers) > 0 {
-					result.Close()
-					fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
-					continue
-				}
-			}
-
-			if err := result.Store.CloseIssue(ctx, result.ResolvedID, reason, actor, session); err != nil {
-				result.Close()
-				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
-				continue
-			}
-
-			closedCount++
-
-			// Auto-close parent molecule if all steps are now complete
-			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
-
-			// Run hooks (best effort: hooks run only if re-fetch succeeds)
-			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
-			if closedIssue != nil && hookRunner != nil {
-				// Fire on_update only if status actually changed (GH#2630)
-				if result.Issue == nil || result.Issue.Status != types.StatusClosed {
-					hookRunner.Run(hooks.EventUpdate, closedIssue)
-				}
-				hookRunner.Run(hooks.EventClose, closedIssue)
-			}
-
-			if jsonOutput {
-				if closedIssue != nil {
-					closedIssues = append(closedIssues, closedIssue)
-				}
-			} else {
-				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(result.ResolvedID, result.Issue.Title), reason)
-			}
-			result.Close()
 		}
 
 		// Handle --suggest-next flag in direct mode
@@ -352,7 +261,7 @@ create, update, show, or close operation).`,
 
 		// Embedded mode: flush Dolt commit. DoltStore commits
 		// inline during CloseIssue so this is only needed for EmbeddedDoltStore.
-		if isEmbeddedDolt && closedCount > 0 && store != nil {
+		if isEmbeddedMode() && closedCount > 0 && store != nil {
 			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
@@ -360,7 +269,7 @@ create, update, show, or close operation).`,
 
 		// Exit non-zero if no issues were actually closed (close guard
 		// and other soft failures should surface as non-zero exit codes for scripting)
-		totalAttempted := len(resolvedIDs) + len(routedArgs)
+		totalAttempted := len(resolvedIDs)
 		if totalAttempted > 0 && closedCount == 0 {
 			os.Exit(1)
 		}
@@ -418,7 +327,7 @@ func checkGateSatisfaction(issue *types.Issue) error {
 
 	switch {
 	case strings.HasPrefix(issue.AwaitType, "gh:run"):
-		resolved, escalated, reason, err = checkGHRun(issue)
+		resolved, escalated, reason, err = checkGHRun(issue, true)
 	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
 		resolved, escalated, reason, err = checkGHPR(issue)
 	case issue.AwaitType == "timer":
@@ -448,9 +357,10 @@ func checkGateSatisfaction(issue *types.Issue) error {
 	return fmt.Errorf("gate condition not satisfied: %s (use --force to override)", reason)
 }
 
-// autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
-// and if so, auto-closes the molecule root. This prevents stale wisps that are
-// complete but never explicitly closed (e.g., deacon patrol wisps).
+// autoCloseCompletedMolecule checks if closing a step completed an auto-closing
+// parent molecule, and if so, closes the molecule root. Ordinary epics remain
+// open when all children finish so they can become explicitly close-eligible
+// instead of being closed as a side effect of the final child close.
 func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, closedStepID, actorName, session string) {
 	moleculeID := findParentMolecule(ctx, s, closedStepID)
 	if moleculeID == "" {
@@ -459,7 +369,7 @@ func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, clos
 
 	// Check if molecule root is already closed
 	root, err := s.GetIssue(ctx, moleculeID)
-	if err != nil || root == nil || root.Status == types.StatusClosed {
+	if err != nil || root == nil || root.Status == types.StatusClosed || !shouldAutoCloseCompletedRoot(root) {
 		return
 	}
 
@@ -482,6 +392,32 @@ func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, clos
 	if !jsonOutput {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
 	}
+}
+
+// shouldAutoCloseCompletedRoot returns true for molecule roots that should
+// auto-close when their final step closes. Regular epics stay open and become
+// explicit close-eligible work, while ephemeral wisps, template-driven
+// molecules, and molecule-type coordination roots keep their cleanup behavior.
+func shouldAutoCloseCompletedRoot(root *types.Issue) bool {
+	if root == nil {
+		return false
+	}
+
+	if root.IssueType == types.TypeMolecule || root.Ephemeral {
+		return true
+	}
+
+	if root.IssueType != types.TypeEpic {
+		return false
+	}
+
+	for _, label := range root.Labels {
+		if label == BeadsTemplateLabel {
+			return true
+		}
+	}
+
+	return false
 }
 
 // countEpicOpenChildren returns the number of open (non-closed) children for an epic.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/templates/agents"
 )
@@ -57,6 +58,10 @@ func defaultClaudeEnv() (claudeEnv, error) {
 }
 
 func projectSettingsPath(base string) string {
+	return filepath.Join(base, ".claude", "settings.json")
+}
+
+func legacyProjectSettingsPath(base string) string {
 	return filepath.Join(base, ".claude", "settings.local.json")
 }
 
@@ -73,26 +78,36 @@ func claudeAgentsEnv(env claudeEnv) agentsEnv {
 }
 
 // InstallClaude installs Claude Code hooks
-func InstallClaude(project bool, stealth bool) {
+func InstallClaude(global bool, stealth bool) {
 	env, err := claudeEnvProvider()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		setupExit(1)
 		return
 	}
-	if err := installClaude(env, project, stealth); err != nil {
+	if err := installClaude(env, global, stealth); err != nil {
 		setupExit(1)
 	}
 }
 
-func installClaude(env claudeEnv, project bool, stealth bool) error {
+// InstallClaudeProject installs project-local Claude hooks, returning an error
+// instead of exiting. Used by bd init to integrate Claude setup automatically.
+func InstallClaudeProject(stealth bool) error {
+	env, err := claudeEnvProvider()
+	if err != nil {
+		return err
+	}
+	return installClaude(env, false, stealth)
+}
+
+func installClaude(env claudeEnv, global bool, stealth bool) error {
 	var settingsPath string
-	if project {
-		settingsPath = projectSettingsPath(env.projectDir)
-		_, _ = fmt.Fprintln(env.stdout, "Installing Claude hooks for this project...")
-	} else {
+	if global {
 		settingsPath = globalSettingsPath(env.homeDir)
 		_, _ = fmt.Fprintln(env.stdout, "Installing Claude hooks globally...")
+	} else {
+		settingsPath = projectSettingsPath(env.projectDir)
+		_, _ = fmt.Fprintln(env.stdout, "Installing Claude hooks for this project...")
 	}
 
 	if err := env.ensureDir(filepath.Dir(settingsPath), 0o755); err != nil {
@@ -127,11 +142,19 @@ func installClaude(env claudeEnv, project bool, stealth bool) error {
 		command = "bd prime --stealth"
 	}
 
-	if addHookCommand(hooks, "SessionStart", command) {
-		_, _ = fmt.Fprintln(env.stdout, "✓ Registered SessionStart hook")
-	}
-	if addHookCommand(hooks, "PreCompact", command) {
-		_, _ = fmt.Fprintln(env.stdout, "✓ Registered PreCompact hook")
+	// GH#3192: Skip writing hooks if the beads plugin is already providing them.
+	// The plugin declares identical SessionStart/PreCompact hooks in plugin.json,
+	// so project-level hooks would fire bd prime twice per session.
+	pluginManaged := hasBeadsPlugin(env)
+	if pluginManaged {
+		_, _ = fmt.Fprintln(env.stdout, "✓ Beads plugin detected — hooks are plugin-managed, skipping")
+	} else {
+		if addHookCommand(hooks, "SessionStart", command) {
+			_, _ = fmt.Fprintln(env.stdout, "✓ Registered SessionStart hook")
+		}
+		if addHookCommand(hooks, "PreCompact", command) {
+			_, _ = fmt.Fprintln(env.stdout, "✓ Registered PreCompact hook")
+		}
 	}
 
 	data, err := json.MarshalIndent(settings, "", "  ")
@@ -143,6 +166,29 @@ func installClaude(env claudeEnv, project bool, stealth bool) error {
 	if err := env.writeFile(settingsPath, data); err != nil {
 		_, _ = fmt.Fprintf(env.stderr, "Error: write settings: %v\n", err)
 		return err
+	}
+
+	// Migrate legacy hooks: remove beads hooks from settings.local.json if present
+	if !global {
+		legacyPath := legacyProjectSettingsPath(env.projectDir)
+		if hasBeadsHooks(legacyPath) {
+			if legacyData, readErr := env.readFile(legacyPath); readErr == nil {
+				var legacySettings map[string]interface{}
+				if json.Unmarshal(legacyData, &legacySettings) == nil {
+					if legacyHooks, ok := legacySettings["hooks"].(map[string]interface{}); ok {
+						removeHookCommand(legacyHooks, "SessionStart", "bd prime")
+						removeHookCommand(legacyHooks, "PreCompact", "bd prime")
+						removeHookCommand(legacyHooks, "SessionStart", "bd prime --stealth")
+						removeHookCommand(legacyHooks, "PreCompact", "bd prime --stealth")
+						if migrated, marshalErr := json.MarshalIndent(legacySettings, "", "  "); marshalErr == nil {
+							if writeErr := env.writeFile(legacyPath, migrated); writeErr == nil {
+								_, _ = fmt.Fprintf(env.stdout, "✓ Migrated hooks from %s\n", legacyPath)
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Install minimal beads section in CLAUDE.md.
@@ -172,14 +218,21 @@ func CheckClaude() {
 }
 
 func checkClaude(env claudeEnv) error {
-	globalSettings := globalSettingsPath(env.homeDir)
 	projectSettings := projectSettingsPath(env.projectDir)
+	globalSettings := globalSettingsPath(env.homeDir)
+	legacySettings := legacyProjectSettingsPath(env.projectDir)
 
 	switch {
-	case hasBeadsHooks(globalSettings):
-		_, _ = fmt.Fprintf(env.stdout, "✓ Global hooks installed: %s\n", globalSettings)
 	case hasBeadsHooks(projectSettings):
 		_, _ = fmt.Fprintf(env.stdout, "✓ Project hooks installed: %s\n", projectSettings)
+	case hasBeadsHooks(globalSettings):
+		_, _ = fmt.Fprintf(env.stdout, "✓ Global hooks installed: %s\n", globalSettings)
+	case hasBeadsHooks(legacySettings):
+		_, _ = fmt.Fprintf(env.stdout, "✓ Project hooks installed (legacy): %s\n", legacySettings)
+		_, _ = fmt.Fprintf(env.stdout, "  Consider running 'bd setup claude' to migrate to .claude/settings.json\n")
+	case hasBeadsPlugin(env):
+		// GH#3192: Plugin provides hooks via plugin.json — no project-level hooks needed
+		_, _ = fmt.Fprintln(env.stdout, "✓ Hooks provided by beads plugin (plugin-managed)")
 	default:
 		_, _ = fmt.Fprintln(env.stdout, "✗ No hooks installed")
 		_, _ = fmt.Fprintln(env.stdout, "  Run: bd setup claude")
@@ -190,26 +243,26 @@ func checkClaude(env claudeEnv) error {
 }
 
 // RemoveClaude removes Claude Code hooks
-func RemoveClaude(project bool) {
+func RemoveClaude(global bool) {
 	env, err := claudeEnvProvider()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		setupExit(1)
 		return
 	}
-	if err := removeClaude(env, project); err != nil {
+	if err := removeClaude(env, global); err != nil {
 		setupExit(1)
 	}
 }
 
-func removeClaude(env claudeEnv, project bool) error {
+func removeClaude(env claudeEnv, global bool) error {
 	var settingsPath string
-	if project {
-		settingsPath = projectSettingsPath(env.projectDir)
-		_, _ = fmt.Fprintln(env.stdout, "Removing Claude hooks from project...")
-	} else {
+	if global {
 		settingsPath = globalSettingsPath(env.homeDir)
 		_, _ = fmt.Fprintln(env.stdout, "Removing Claude hooks globally...")
+	} else {
+		settingsPath = projectSettingsPath(env.projectDir)
+		_, _ = fmt.Fprintln(env.stdout, "Removing Claude hooks from project...")
 	}
 
 	data, err := env.readFile(settingsPath)
@@ -240,6 +293,25 @@ func removeClaude(env claudeEnv, project bool) error {
 			if err := env.writeFile(settingsPath, data); err != nil {
 				_, _ = fmt.Fprintf(env.stderr, "Error: write settings: %v\n", err)
 				return err
+			}
+		}
+	}
+
+	// Also clean legacy settings.local.json when removing project hooks
+	if !global {
+		legacyPath := legacyProjectSettingsPath(env.projectDir)
+		if legacyData, readErr := env.readFile(legacyPath); readErr == nil {
+			var legacySettings map[string]interface{}
+			if json.Unmarshal(legacyData, &legacySettings) == nil {
+				if legacyHooks, ok := legacySettings["hooks"].(map[string]interface{}); ok {
+					removeHookCommand(legacyHooks, "SessionStart", "bd prime")
+					removeHookCommand(legacyHooks, "PreCompact", "bd prime")
+					removeHookCommand(legacyHooks, "SessionStart", "bd prime --stealth")
+					removeHookCommand(legacyHooks, "PreCompact", "bd prime --stealth")
+					if migrated, marshalErr := json.MarshalIndent(legacySettings, "", "  "); marshalErr == nil {
+						_ = env.writeFile(legacyPath, migrated)
+					}
+				}
 			}
 		}
 	}
@@ -349,6 +421,47 @@ func removeHookCommand(hooks map[string]interface{}, event, command string) {
 	} else {
 		hooks[event] = filtered
 	}
+}
+
+// hasBeadsPlugin checks if the beads Claude Code plugin is enabled in any
+// settings file. The plugin declares its own SessionStart/PreCompact hooks
+// in plugin.json, so project-level hooks from bd setup claude would duplicate them.
+func hasBeadsPlugin(env claudeEnv) bool {
+	paths := []string{
+		projectSettingsPath(env.projectDir),
+		globalSettingsPath(env.homeDir),
+		legacyProjectSettingsPath(env.projectDir),
+	}
+	for _, p := range paths {
+		if checkBeadsPluginInFile(env.readFile, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkBeadsPluginInFile checks if the beads plugin is enabled in a single settings file.
+func checkBeadsPluginInFile(readFile func(string) ([]byte, error), path string) bool {
+	data, err := readFile(path)
+	if err != nil {
+		return false
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+	enabledPlugins, ok := settings["enabledPlugins"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	for key, value := range enabledPlugins {
+		if strings.Contains(strings.ToLower(key), "beads") {
+			if enabled, ok := value.(bool); ok && enabled {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasBeadsHooks checks if a settings file has bd prime hooks

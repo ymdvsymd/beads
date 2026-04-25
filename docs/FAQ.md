@@ -40,7 +40,7 @@ GitHub Issues + gh CLI can approximate some features, but fundamentally cannot r
 
 **When to use each:** GitHub Issues excels for human teams in web UI with cross-repo dashboards and integrations. bd excels for AI agents needing offline, git-synchronized task memory with graph semantics and deterministic queries.
 
-See [GitHub issue #125](https://github.com/steveyegge/beads/issues/125) for detailed comparison.
+See [GitHub issue #125](https://github.com/gastownhall/beads/issues/125) for detailed comparison.
 
 ### How is this different from Taskwarrior?
 
@@ -198,7 +198,7 @@ bd dolt push    # Push changes to Dolt remote
 bd dolt pull    # Pull changes from Dolt remote
 ```
 
-The `bd export` command exists for issue portability and interchange. For supported backup and restore flows, use `bd backup` to write JSONL backup snapshots, `bd backup restore` to restore them, and `bd backup export-git` / `bd backup fetch-git` if you want those snapshots published to a git branch. None of these are needed for day-to-day Dolt sync.
+The `bd export` command exists for issue portability and interchange. For backup and restore, use `bd backup init <path>` / `bd backup sync` to push Dolt-native backups, and `bd backup restore <path>` to restore from them. None of these are needed for day-to-day Dolt sync.
 
 ### What if my database feels stale after a colleague pushes changes?
 
@@ -489,8 +489,8 @@ bd dolt pull    # Pull from Dolt remote if configured
 - **Documentation**: [README.md](../README.md), [QUICKSTART.md](QUICKSTART.md), [ADVANCED.md](ADVANCED.md)
 - **Troubleshooting**: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 - **Examples**: [examples/](../examples/)
-- **GitHub Issues**: [Report bugs or request features](https://github.com/steveyegge/beads/issues)
-- **GitHub Discussions**: [Ask questions](https://github.com/steveyegge/beads/discussions)
+- **GitHub Issues**: [Report bugs or request features](https://github.com/gastownhall/beads/issues)
+- **GitHub Discussions**: [Ask questions](https://github.com/gastownhall/beads/discussions)
 
 ### How can I contribute?
 

@@ -69,7 +69,7 @@ func CheckDatabaseVersion(path string, cliVersion string) DoctorCheck {
 			Status:  StatusError,
 			Message: "No dolt database found",
 			Detail:  "Storage: Dolt",
-			Fix:     "Run 'bd init' to create database (will clone from remote if configured)",
+			Fix:     "Run 'bd bootstrap' as the safe existing-project recovery entry point. Use '--dry-run' to inspect the plan first, and use 'bd init' only for brand-new projects.",
 		}
 	}
 
@@ -111,7 +111,7 @@ func CheckDatabaseVersionWithStore(ss *SharedStore, cliVersion string) DoctorChe
 				Status:  StatusError,
 				Message: "No dolt database found",
 				Detail:  "Storage: Dolt",
-				Fix:     "Run 'bd init' to create database (will clone from remote if configured)",
+				Fix:     "Run 'bd bootstrap' as the safe existing-project recovery entry point. Use '--dry-run' to inspect the plan first, and use 'bd init' only for brand-new projects.",
 			}
 		}
 		return DoctorCheck{
@@ -127,7 +127,7 @@ func CheckDatabaseVersionWithStore(ss *SharedStore, cliVersion string) DoctorChe
 
 func checkDatabaseVersionWithStore(store *dolt.DoltStore, cliVersion string) DoctorCheck {
 	ctx := context.Background()
-	dbVersion, err := store.GetMetadata(ctx, "bd_version")
+	dbVersion, err := store.GetLocalMetadata(ctx, "bd_version")
 	if err != nil {
 		return DoctorCheck{
 			Name:    "Database",
@@ -138,12 +138,13 @@ func checkDatabaseVersionWithStore(store *dolt.DoltStore, cliVersion string) Doc
 		}
 	}
 	if dbVersion == "" {
+		// bd_version is in local_metadata (dolt-ignored), so it's expected to be
+		// empty after a working-set reset. It self-heals on next startup.
 		return DoctorCheck{
 			Name:    "Database",
-			Status:  StatusWarning,
-			Message: "Database missing version metadata",
+			Status:  StatusOK,
+			Message: "bd_version not yet stamped (will self-heal on next startup)",
 			Detail:  "Storage: Dolt",
-			Fix:     "Run 'bd doctor --fix' to repair metadata",
 		}
 	}
 
@@ -280,7 +281,7 @@ func CheckDatabaseIntegrityWithStore(ss *SharedStore) DoctorCheck {
 func checkDatabaseIntegrityWithStore(store *dolt.DoltStore) DoctorCheck {
 	ctx := context.Background()
 	// Minimal checks: metadata + statistics. If these work, the store is at least readable.
-	if _, err := store.GetMetadata(ctx, "bd_version"); err != nil {
+	if _, err := store.GetLocalMetadata(ctx, "bd_version"); err != nil {
 		return DoctorCheck{
 			Name:    "Database Integrity",
 			Status:  StatusError,

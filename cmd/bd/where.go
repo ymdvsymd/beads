@@ -24,8 +24,8 @@ var whereCmd = &cobra.Command{
 	Short:   "Show active beads location",
 	Long: `Show the active beads database location, including redirect information.
 
-This command is useful for debugging when using redirects, to understand
-which .beads directory is actually being used.
+	This command is useful for debugging when using redirects, to understand
+	which beads workspace is actually being used.
 
 Examples:
   bd where           # Show active beads location
@@ -38,10 +38,14 @@ Examples:
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
 			if jsonOutput {
-				outputJSON(map[string]string{"error": "no beads directory found"})
+				outputJSON(map[string]string{
+					"error":   "no_beads_directory",
+					"message": activeWorkspaceNotFoundMessage(),
+					"hint":    whereDiagHint(),
+				})
 			} else {
-				fmt.Fprintln(os.Stderr, "Error: no beads directory found")
-				fmt.Fprintln(os.Stderr, "Hint: run 'bd doctor' to diagnose, or 'bd init' to create a new database")
+				fmt.Fprintln(os.Stderr, "Error: "+activeWorkspaceNotFoundMessage())
+				fmt.Fprintln(os.Stderr, "Hint: "+whereDiagHint())
 			}
 			os.Exit(1)
 		}
@@ -105,14 +109,18 @@ func findOriginalBeadsDir() string {
 		cwd = resolved
 	}
 
-	// Check BEADS_DIR first
+	// Check BEADS_DIR first: if the env points at a .beads directory with a
+	// redirect file, that's the original. Fall through to the fs walk if
+	// BEADS_DIR is set but does not contain a redirect — bd's startup now
+	// rebinds BEADS_DIR to the resolved target (#3230) after following
+	// redirects, so an unconditional early-return here would hide every
+	// redirect from `bd where` output.
 	if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
 		envDir = utils.CanonicalizePath(envDir)
 		redirectFile := filepath.Join(envDir, beads.RedirectFileName)
 		if _, err := os.Stat(redirectFile); err == nil {
 			return envDir
 		}
-		return ""
 	}
 
 	// Walk up directory tree looking for .beads with redirect

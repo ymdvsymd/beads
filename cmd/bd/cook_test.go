@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/formula"
@@ -543,12 +544,12 @@ func TestCookFormulaToSubgraph_StandaloneExpansion(t *testing.T) {
 		}
 	}
 
-	// Root epic
+	// Root molecule
 	if subgraph.Root.ID != "rule-of-five" {
 		t.Errorf("Root.ID = %q, want %q", subgraph.Root.ID, "rule-of-five")
 	}
-	if subgraph.Root.IssueType != types.TypeEpic {
-		t.Errorf("Root.IssueType = %q, want %q", subgraph.Root.IssueType, types.TypeEpic)
+	if subgraph.Root.IssueType != types.TypeMolecule {
+		t.Errorf("Root.IssueType = %q, want %q", subgraph.Root.IssueType, types.TypeMolecule)
 	}
 
 	// Verify child issue IDs
@@ -643,5 +644,57 @@ func TestCookFormulaToSubgraph_StandaloneExpansionWithWorkflowVars(t *testing.T)
 	}
 	if workIssue.Description != "Build {{feature}} per brief: {{brief}}" {
 		t.Errorf("Description = %q, want {{vars}} preserved", workIssue.Description)
+	}
+}
+
+// TestCookFormulaToSubgraph_StepMetadata verifies that a step's Metadata flows
+// through cook onto the resulting Issue.Metadata as a JSON object. Regression
+// for gastownhall/beads#3341.
+func TestCookFormulaToSubgraph_StepMetadata(t *testing.T) {
+	f := &formula.Formula{
+		Formula: "repro",
+		Version: 1,
+		Type:    formula.TypeWorkflow,
+		Steps: []*formula.Step{
+			{
+				ID:     "work",
+				Title:  "Do the work",
+				Labels: []string{"worker"},
+				Metadata: map[string]interface{}{
+					"priority_level": "high",
+					"origin":         "repro",
+				},
+			},
+		},
+	}
+
+	subgraph, err := cookFormulaToSubgraph(f, "repro")
+	if err != nil {
+		t.Fatalf("cookFormulaToSubgraph failed: %v", err)
+	}
+
+	var workIssue *types.Issue
+	for _, issue := range subgraph.Issues {
+		if issue.ID == "repro.work" {
+			workIssue = issue
+			break
+		}
+	}
+	if workIssue == nil {
+		t.Fatal("repro.work issue not found in subgraph")
+	}
+	if len(workIssue.Metadata) == 0 {
+		t.Fatalf("workIssue.Metadata is empty; want JSON object carrying step metadata")
+	}
+
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(workIssue.Metadata, &decoded); err != nil {
+		t.Fatalf("workIssue.Metadata is not valid JSON: %v (raw: %s)", err, string(workIssue.Metadata))
+	}
+	if got := decoded["priority_level"]; got != "high" {
+		t.Errorf("Metadata[priority_level] = %v, want \"high\"", got)
+	}
+	if got := decoded["origin"]; got != "repro" {
+		t.Errorf("Metadata[origin] = %v, want \"repro\"", got)
 	}
 }

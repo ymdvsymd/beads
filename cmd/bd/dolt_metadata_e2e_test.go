@@ -83,6 +83,9 @@ func TestE2E_DoctorFixMetadataRoundtrip(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("dolt metadata e2e test not supported on windows")
 	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 
 	tmpDir := createTempDirWithCleanup(t)
 
@@ -109,8 +112,9 @@ func TestE2E_DoctorFixMetadataRoundtrip(t *testing.T) {
 	}
 
 	// Delete metadata to simulate a pre-Phase-1 database
+	// bd_version is now in local_metadata (dolt-ignored), repo_id/clone_id remain in metadata
 	sqlOut, sqlErr := runBDExecAllowErrorWithEnv(t, tmpDir, env, "sql",
-		"DELETE FROM metadata WHERE key IN ('bd_version', 'repo_id', 'clone_id')")
+		"DELETE FROM local_metadata WHERE `key` = 'bd_version'; DELETE FROM metadata WHERE `key` IN ('repo_id', 'clone_id')")
 	if sqlErr != nil {
 		t.Fatalf("bd sql DELETE failed: %v\n%s", sqlErr, sqlOut)
 	}
@@ -151,6 +155,9 @@ func TestE2E_MigrateDoltMetadata(t *testing.T) {
 	}
 	if runtime.GOOS == "windows" {
 		t.Skip("dolt metadata e2e test not supported on windows")
+	}
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 
 	tmpDir := createTempDirWithCleanup(t)

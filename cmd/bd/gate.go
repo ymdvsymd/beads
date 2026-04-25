@@ -11,9 +11,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -212,13 +209,124 @@ This is used by 'bd done --phase-complete' to register for gate wake notificatio
 		}
 
 		// Embedded mode: flush Dolt commit.
-		if isEmbeddedDolt && store != nil {
+		if isEmbeddedMode() && store != nil {
 			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalError("failed to commit: %v", err)
 			}
 		}
 
 		fmt.Printf("%s Added waiter to gate %s: %s\n", ui.RenderPass("✓"), gateID, waiter)
+	},
+}
+
+// gateCreateCmd creates an ad-hoc gate issue that blocks another issue
+var gateCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a gate that blocks an issue",
+	Long: `Create an ad-hoc gate issue that blocks another issue until resolved.
+
+The blocked issue will not appear in 'bd ready' until the gate is resolved
+via 'bd gate resolve'.
+
+Gate types:
+  human   - Requires manual 'bd gate resolve' (default)
+  timer   - Auto-resolves after --timeout duration
+  gh:run  - Waits for GitHub Actions workflow
+  gh:pr   - Waits for PR merge
+
+Examples:
+  bd gate create --blocks bd-abc
+  bd gate create --type=human --blocks bd-abc --reason="Need design review"
+  bd gate create --type=timer --blocks bd-abc --timeout=2h
+  bd gate create --type=gh:pr --blocks bd-abc --await-id=42`,
+	Run: func(cmd *cobra.Command, args []string) {
+		CheckReadonly("gate create")
+
+		blocksID, _ := cmd.Flags().GetString("blocks")
+		gateType, _ := cmd.Flags().GetString("type")
+		reason, _ := cmd.Flags().GetString("reason")
+		awaitID, _ := cmd.Flags().GetString("await-id")
+		timeoutStr, _ := cmd.Flags().GetString("timeout")
+
+		ctx := rootCtx
+
+		// Verify the target issue exists
+		targetIssue, err := store.GetIssue(ctx, blocksID)
+		if err != nil {
+			FatalError("issue not found: %s", blocksID)
+		}
+
+		// Parse timeout if specified
+		var timeout time.Duration
+		if timeoutStr != "" {
+			parsed, err := time.ParseDuration(timeoutStr)
+			if err != nil {
+				FatalError("invalid timeout: %v", err)
+			}
+			timeout = parsed
+		}
+
+		// Build gate title
+		title := fmt.Sprintf("Gate: %s", gateType)
+		if awaitID != "" {
+			title = fmt.Sprintf("Gate: %s %s", gateType, awaitID)
+		}
+
+		// Build description
+		desc := fmt.Sprintf("Ad-hoc gate blocking %s", targetIssue.ID)
+		if reason != "" {
+			desc = fmt.Sprintf("%s\n\nReason: %s", desc, reason)
+		}
+
+		// Create the gate issue
+		gate := &types.Issue{
+			Title:       title,
+			Description: desc,
+			Status:      types.StatusOpen,
+			Priority:    2,
+			IssueType:   types.IssueType("gate"),
+			AwaitType:   gateType,
+			AwaitID:     awaitID,
+			Timeout:     timeout,
+			CreatedBy:   getActorWithGit(),
+			Owner:       getOwner(),
+		}
+
+		if err := store.CreateIssue(ctx, gate, actor); err != nil {
+			FatalError("creating gate: %v", err)
+		}
+
+		// Add blocking dependency: target issue depends on gate
+		dep := &types.Dependency{
+			IssueID:     targetIssue.ID,
+			DependsOnID: gate.ID,
+			Type:        types.DepBlocks,
+		}
+		if err := store.AddDependency(ctx, dep, actor); err != nil {
+			FatalError("adding blocking dependency: %v", err)
+		}
+
+		// CreateIssue commits the issue row. AddDependency writes to the
+		// working set and needs a follow-up commit.
+		commitMsg := fmt.Sprintf("bd: create gate %s blocking %s", gate.ID, targetIssue.ID)
+		if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
+			FatalError("failed to commit: %v", err)
+		}
+
+		if jsonOutput {
+			outputJSON(gate)
+			return
+		}
+
+		fmt.Printf("%s Created gate %s (type: %s)\n", ui.RenderPass("✓"), ui.RenderID(gate.ID), gateType)
+		fmt.Printf("  Blocks: %s (%s)\n", targetIssue.ID, targetIssue.Title)
+		if reason != "" {
+			fmt.Printf("  Reason: %s\n", reason)
+		}
+		if timeout > 0 {
+			fmt.Printf("  Timeout: %s\n", timeout)
+		}
+		fmt.Printf("\nResolve with: bd gate resolve %s\n", gate.ID)
 	},
 }
 
@@ -314,7 +422,7 @@ Use --reason to provide context for why the gate was resolved.`,
 		}
 
 		// Embedded mode: flush Dolt commit.
-		if isEmbeddedDolt && store != nil {
+		if isEmbeddedMode() && store != nil {
 			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalError("failed to commit: %v", err)
 			}
@@ -424,7 +532,7 @@ Examples:
 
 			switch {
 			case strings.HasPrefix(gate.AwaitType, "gh:run"):
-				result.resolved, result.escalated, result.reason, result.err = checkGHRun(gate)
+				result.resolved, result.escalated, result.reason, result.err = checkGHRun(gate, !dryRun)
 			case strings.HasPrefix(gate.AwaitType, "gh:pr"):
 				result.resolved, result.escalated, result.reason, result.err = checkGHPR(gate)
 			case gate.AwaitType == "timer":
@@ -532,6 +640,12 @@ type ghPRStatus struct {
 	Title  string `json:"title"`
 }
 
+var (
+	discoverRunIDByWorkflowNameFunc = discoverRunIDByWorkflowName
+	updateGateAwaitIDFunc           = updateGateAwaitID
+	checkGHRunStatusFunc            = checkGHRunStatus
+)
+
 // isNumericID returns true if the string contains only digits (a GitHub run ID)
 func isNumericID(s string) bool {
 	if s == "" {
@@ -594,8 +708,9 @@ func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
 	return fmt.Sprintf("%d", runs[0].DatabaseID), nil
 }
 
-// checkGHRun checks a GitHub Actions workflow run gate
-func checkGHRun(gate *types.Issue) (resolved, escalated bool, reason string, err error) {
+// checkGHRun checks a GitHub Actions workflow run gate.
+// When persistDiscoveredRunID is false, workflow-name discovery stays in-memory only.
+func checkGHRun(gate *types.Issue, persistDiscoveredRunID bool) (resolved, escalated bool, reason string, err error) {
 	if gate.AwaitID == "" {
 		return false, false, "no run ID specified - set await_id or use workflow name hint", nil
 	}
@@ -604,19 +719,25 @@ func checkGHRun(gate *types.Issue) (resolved, escalated bool, reason string, err
 
 	// If await_id is a workflow name hint (non-numeric), auto-discover the run ID
 	if !isNumericID(gate.AwaitID) {
-		discoveredID, discoverErr := discoverRunIDByWorkflowName(gate.AwaitID)
+		discoveredID, discoverErr := discoverRunIDByWorkflowNameFunc(gate.AwaitID)
 		if discoverErr != nil {
 			return false, false, fmt.Sprintf("workflow hint '%s': %v", gate.AwaitID, discoverErr), nil
 		}
 
-		// Update the gate with the discovered run ID
-		if updateErr := updateGateAwaitID(nil, gate.ID, discoveredID); updateErr != nil {
-			return false, false, "", fmt.Errorf("failed to update gate with discovered run ID: %w", updateErr)
+		if persistDiscoveredRunID {
+			// Non-dry-run flows persist the numeric run ID for future checks.
+			if updateErr := updateGateAwaitIDFunc(nil, gate.ID, discoveredID); updateErr != nil {
+				return false, false, "", fmt.Errorf("failed to update gate with discovered run ID: %w", updateErr)
+			}
 		}
 
 		runID = discoveredID
 	}
 
+	return checkGHRunStatusFunc(runID)
+}
+
+func checkGHRunStatus(runID string) (resolved, escalated bool, reason string, err error) {
 	// Run: gh run view <id> --json status,conclusion,name
 	cmd := exec.Command("gh", "run", "view", runID, "--json", "status,conclusion,name") // #nosec G204 -- runID is a validated GitHub run ID
 	var stdout, stderr bytes.Buffer
@@ -729,49 +850,11 @@ func checkTimer(gate *types.Issue, now time.Time) (resolved, escalated bool, rea
 // checkBeadGate checks if a cross-rig bead gate is satisfied.
 // await_id format: <rig>:<bead-id> (e.g., "other-project:op-abc123")
 // Returns (satisfied, reason).
-func checkBeadGate(ctx context.Context, awaitID string) (bool, string) {
-	// Parse await_id format: <rig>:<bead-id>
-	parts := strings.SplitN(awaitID, ":", 2)
-	if len(parts) != 2 {
-		return false, fmt.Sprintf("invalid await_id format: expected <rig>:<bead-id>, got %q", awaitID)
-	}
-
-	rigName := parts[0]
-	beadID := parts[1]
-
-	if rigName == "" || beadID == "" {
-		return false, "await_id missing rig name or bead ID"
-	}
-
-	// Resolve the target rig's beads directory
-	currentBeadsDir := beads.FindBeadsDir()
-	if currentBeadsDir == "" {
-		return false, "could not find current beads directory"
-	}
-	targetBeadsDir, _, err := routing.ResolveBeadsDirForRig(rigName, currentBeadsDir)
-	if err != nil {
-		return false, fmt.Sprintf("rig %q not found: %v", rigName, err)
-	}
-
-	// Open the target database (read-only) using storage factory
-	// This supports both Dolt and legacy SQLite backends in the target rig.
-	targetStore, err := dolt.NewFromConfigWithOptions(ctx, targetBeadsDir, &dolt.Config{ReadOnly: true})
-	if err != nil {
-		return false, fmt.Sprintf("failed to open database for rig %q: %v", rigName, err)
-	}
-	defer func() { _ = targetStore.Close() }()
-
-	// Check if the target bead exists and is closed
-	issue, err := targetStore.GetIssue(ctx, beadID)
-	if err != nil {
-		return false, fmt.Sprintf("bead %s not found in rig %s: %v", beadID, rigName, err)
-	}
-
-	if issue.Status == types.StatusClosed {
-		return true, fmt.Sprintf("target bead %s is closed", beadID)
-	}
-
-	return false, fmt.Sprintf("target bead %s status is %q (waiting for closed)", beadID, string(issue.Status))
+//
+// Multi-rig routing has been removed, so cross-rig bead gates cannot be resolved.
+// This always returns false with a descriptive message.
+func checkBeadGate(_ context.Context, awaitID string) (bool, string) {
+	return false, fmt.Sprintf("cross-rig bead gate %q cannot be checked (multi-rig routing removed)", awaitID)
 }
 
 // closeGate closes a gate issue with the given reason
@@ -780,7 +863,7 @@ func closeGate(_ interface{}, gateID, reason string) error {
 		return err
 	}
 	// Embedded mode: flush Dolt commit.
-	if isEmbeddedDolt && store != nil {
+	if isEmbeddedMode() && store != nil {
 		if _, err := store.CommitPending(rootCtx, actor); err != nil {
 			return err
 		}
@@ -820,13 +903,23 @@ func init() {
 	gateCheckCmd.Flags().BoolP("escalate", "e", false, "Escalate failed/expired gates")
 	gateCheckCmd.Flags().IntP("limit", "l", 100, "Limit results (default 100)")
 
+	// gate create flags
+	gateCreateCmd.Flags().String("blocks", "", "Issue ID to block (required)")
+	gateCreateCmd.Flags().StringP("type", "t", "human", "Gate type (human, timer, gh:run, gh:pr)")
+	gateCreateCmd.Flags().StringP("reason", "r", "", "Reason for the gate")
+	gateCreateCmd.Flags().String("await-id", "", "Condition identifier (run ID, PR number, etc.)")
+	gateCreateCmd.Flags().String("timeout", "", "Timeout duration (e.g., 2h, 30m)")
+	_ = gateCreateCmd.MarkFlagRequired("blocks")
+
 	// Issue ID completions
 	gateShowCmd.ValidArgsFunction = issueIDCompletion
 	gateResolveCmd.ValidArgsFunction = issueIDCompletion
 	gateAddWaiterCmd.ValidArgsFunction = issueIDCompletion
+	gateCreateCmd.ValidArgsFunction = issueIDCompletion
 
 	// Add subcommands
 	gateCmd.AddCommand(gateListCmd)
+	gateCmd.AddCommand(gateCreateCmd)
 	gateCmd.AddCommand(gateShowCmd)
 	gateCmd.AddCommand(gateResolveCmd)
 	gateCmd.AddCommand(gateCheckCmd)

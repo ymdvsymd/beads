@@ -26,6 +26,7 @@ type Config struct {
 	DoltMode           string `json:"dolt_mode,omitempty"`            // "embedded" (default) or "server"
 	DoltServerHost     string `json:"dolt_server_host,omitempty"`     // Server host (default: 127.0.0.1)
 	DoltServerPort     int    `json:"dolt_server_port,omitempty"`     // Server port (default: 3307)
+	DoltServerSocket   string `json:"dolt_server_socket,omitempty"`   // Unix domain socket path (overrides host/port)
 	DoltServerUser     string `json:"dolt_server_user,omitempty"`     // MySQL user (default: root)
 	DoltDatabase       string `json:"dolt_database,omitempty"`        // SQL database name (default: beads)
 	DoltServerTLS      bool   `json:"dolt_server_tls,omitempty"`      // Enable TLS for server connections (required for Hosted Dolt)
@@ -37,6 +38,11 @@ type Config struct {
 	// Used to detect cross-project data leakage when a client connects
 	// to the wrong Dolt server (GH#2372).
 	ProjectID string `json:"project_id,omitempty"`
+
+	// GlobalDoltDatabase is the SQL database name for the project-agnostic
+	// global issue database in shared-server mode. Set during bd init when
+	// shared-server mode is active. Empty means no global database available.
+	GlobalDoltDatabase string `json:"global_dolt_database,omitempty"`
 
 	// Stale closed issues check configuration
 	// 0 = disabled (default), positive = threshold in days
@@ -225,13 +231,27 @@ const (
 
 // IsDoltServerMode returns true if Dolt should connect via sql-server.
 // Server mode is the standard connection method.
-// Checks the BEADS_DOLT_SERVER_MODE env var first, then falls back to the
-// dolt_mode field in metadata.json. Only applies when backend is "dolt".
+//
+// Checks (in priority order):
+//  1. BEADS_DOLT_SERVER_MODE=1 env var
+//  2. BEADS_DOLT_SHARED_SERVER env var (shared-server implies server mode)
+//  3. dolt_mode field in metadata.json
+//
+// Runtime env vars take precedence over persisted metadata.json to prevent
+// stale dolt_mode=embedded from overriding active server intent (GH#2949).
 func (c *Config) IsDoltServerMode() bool {
-	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" && c.GetBackend() == BackendDolt {
+	if c.GetBackend() != BackendDolt {
+		return false
+	}
+	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
 		return true
 	}
-	return c.GetBackend() == BackendDolt && strings.ToLower(c.DoltMode) == DoltModeServer
+	// Shared-server mode implies server-backed storage. Check env var
+	// directly to avoid circular import with doltserver package.
+	if v := os.Getenv("BEADS_DOLT_SHARED_SERVER"); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	return strings.ToLower(c.DoltMode) == DoltModeServer
 }
 
 // GetDoltMode returns the Dolt connection mode, defaulting to server.
@@ -279,6 +299,15 @@ func (c *Config) GetDoltServerPort() int {
 	return DefaultDoltServerPort
 }
 
+// GetDoltServerSocket returns the Dolt server Unix domain socket path.
+// Checks BEADS_DOLT_SERVER_SOCKET env var first, then config. Empty means use TCP.
+func (c *Config) GetDoltServerSocket() string {
+	if s := os.Getenv("BEADS_DOLT_SERVER_SOCKET"); s != "" {
+		return s
+	}
+	return c.DoltServerSocket
+}
+
 // GetDoltServerUser returns the Dolt server MySQL user.
 // Checks BEADS_DOLT_SERVER_USER env var first, then config, then default.
 func (c *Config) GetDoltServerUser() string {
@@ -303,10 +332,42 @@ func (c *Config) GetDoltDatabase() string {
 	return DefaultDoltDatabase
 }
 
+// GetGlobalDoltDatabase returns the global database name for shared-server mode.
+// Returns empty string if no global database is configured.
+func (c *Config) GetGlobalDoltDatabase() string {
+	return c.GlobalDoltDatabase
+}
+
 // GetDoltServerPassword returns the Dolt server password.
-// Checks BEADS_DOLT_PASSWORD env var (password should never be stored in config files).
+// Checks in order:
+//  1. BEADS_DOLT_PASSWORD env var (highest priority, existing behavior)
+//  2. Credentials file lookup by [host:port] section
+//     (path from BEADS_CREDENTIALS_FILE env var, or ~/.config/beads/credentials)
+//  3. Empty string (no password)
+//
+// Note: uses the port from configfile (metadata.json / env var), which may differ
+// from the resolved runtime port (doltserver port file). If you have the resolved
+// port, prefer GetDoltServerPasswordForPort for correct credentials file lookup.
 func (c *Config) GetDoltServerPassword() string {
-	return os.Getenv("BEADS_DOLT_PASSWORD")
+	return c.GetDoltServerPasswordForPort(c.GetDoltServerPort())
+}
+
+// GetDoltServerPasswordForPort returns the Dolt server password using an explicit
+// port for the credentials file lookup. Use this when the resolved runtime port
+// (from doltserver.DefaultConfig) differs from the configfile port (metadata.json).
+//
+// This avoids a mismatch where metadata.json says port 3308 (tunnel) but the
+// doltserver port file says 3307 (local), causing the credentials file lookup
+// to use the wrong [host:port] section.
+func (c *Config) GetDoltServerPasswordForPort(port int) string {
+	if p := os.Getenv("BEADS_DOLT_PASSWORD"); p != "" {
+		return p
+	}
+	host := c.GetDoltServerHost()
+	if p := LookupCredentialsPassword(host, port); p != "" {
+		return p
+	}
+	return ""
 }
 
 // GetDoltServerTLS returns whether TLS is enabled for server connections.

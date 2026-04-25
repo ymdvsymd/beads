@@ -194,7 +194,7 @@ func CheckAgentDocumentation(repoPath string) DoctorCheck {
 // actually exists on disk. For Dolt backends, data is on the server. For legacy
 // backends, this checks that .db files match the configuration.
 func CheckDatabaseConfig(repoPath string) DoctorCheck {
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 
 	// Load config
 	cfg, err := configfile.Load(beadsDir)
@@ -310,12 +310,21 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 			// the correct port for standalone server mode (ephemeral).
 			port := doltserver.DefaultConfig(beadsDir).Port
 			user := cfg.GetDoltServerUser()
-			password := cfg.GetDoltServerPassword()
+			// Look up the password by the resolved runtime port — cfg.GetDoltServerPassword
+			// uses cfg.GetDoltServerPort() which falls back to the 3307 default when
+			// metadata.json omits the port, causing credentials lookup to miss when
+			// the actual server runs on a different port (e.g. 3306 for
+			// externally-hosted Dolt). That mismatch produced spurious
+			// "Fresh clone detected" warnings (bd-tzo9).
+			password := cfg.GetDoltServerPasswordForPort(port)
 			dbName := cfg.GetDoltDatabase()
-			result := checkFreshCloneDB(host, port, user, password, dbName)
+			result := checkFreshCloneDB(host, port, user, password, dbName, cfg.GetDoltServerTLS())
 			if result.Reachable {
-				syncGitRemote := config.GetStringFromDir(beadsDir, "sync.git-remote")
-				return freshCloneServerResult(result.Exists, dbName, host, port, syncGitRemote)
+				syncRemote := config.GetStringFromDir(beadsDir, "sync.remote")
+				if syncRemote == "" {
+					syncRemote = config.GetStringFromDir(beadsDir, "sync.git-remote")
+				}
+				return freshCloneServerResult(result.Exists, dbName, host, port, syncRemote)
 			}
 			// Server unreachable — fall through to existing behavior (FR-030).
 		}
@@ -338,7 +347,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	}
 
 	// Check if JSONL has any issues (empty JSONL = not really a fresh clone)
-	issueCount, prefix := countJSONLIssuesAndPrefix(jsonlPath)
+	issueCount, _ := countJSONLIssuesAndPrefix(jsonlPath)
 	if issueCount == 0 {
 		return DoctorCheck{
 			Name:    "Fresh Clone",
@@ -348,10 +357,7 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 	}
 
 	// This is a fresh clone! JSONL has issues but no database.
-	fixCmd := "bd init"
-	if prefix != "" {
-		fixCmd = fmt.Sprintf("bd init --prefix %s", prefix)
-	}
+	fixCmd := "bd bootstrap"
 
 	return DoctorCheck{
 		Name:    "Fresh Clone",
@@ -359,8 +365,10 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 		Message: fmt.Sprintf("Fresh clone detected (%d issues in %s, no database)", issueCount, jsonlName),
 		Detail: "This appears to be a freshly cloned repository.\n" +
 			"  The JSONL file contains issues but no local database exists.\n" +
-			"  Run 'bd init' to create the database and import existing issues.",
-		Fix: fmt.Sprintf("Run '%s' to initialize the database and import issues", fixCmd),
+			"  Run 'bd bootstrap' as the safe entry point for recovering existing state.\n" +
+			"  Use '--dry-run' first if you need to inspect whether bootstrap will recover or initialize.\n" +
+			"  Use 'bd init' only when creating a brand-new project with no existing .beads data.",
+		Fix: fmt.Sprintf("Run '%s' to recover the existing database and import tracked issues", fixCmd),
 	}
 }
 

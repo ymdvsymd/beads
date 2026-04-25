@@ -106,7 +106,7 @@ The automation requires this secret to be configured:
 
 **PYPI_API_TOKEN**: Your PyPI API token
 1. Generate token at https://pypi.org/manage/account/token/
-2. Add to GitHub at https://github.com/steveyegge/beads/settings/secrets/actions
+2. Add to GitHub at https://github.com/gastownhall/beads/settings/secrets/actions
 3. Name: `PYPI_API_TOKEN`
 4. Value: `pypi-...` (your full token)
 
@@ -170,9 +170,23 @@ Just push your tag and wait ~5 minutes:
 git push origin v0.9.X
 ```
 
-Monitor at: https://github.com/steveyegge/beads/actions
+Monitor at: https://github.com/gastownhall/beads/actions
 
-The release will appear at: https://github.com/steveyegge/beads/releases
+The release will appear at: https://github.com/gastownhall/beads/releases
+
+### Documentation site (Docusaurus)
+
+The published docs at GitHub Pages are versioned. Unreleased edits live in `website/docs/` (**Next**); each release should add a snapshot:
+
+```bash
+cd website
+npm ci
+npm run docusaurus docs:version X.Y.Z
+```
+
+Then set `lastVersion` in `website/docusaurus.config.ts` to `X.Y.Z` so visitors default to the latest stable docs (not **Next**).
+
+Commit `website/versioned_docs/`, `website/versioned_sidebars/`, and `website/versions.json` with the release. The `scripts/generate-llms-full.sh` script pulls from the latest entry in `versions.json` so `llms-full.txt` stays aligned with that snapshot.
 
 ## Post-Release
 

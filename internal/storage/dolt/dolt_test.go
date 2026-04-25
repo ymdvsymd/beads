@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -52,9 +51,7 @@ func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 // TestMain in testmain_test.go.
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("Dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	if testServerPort == 0 {
 		t.Skip("Test Dolt server not running, skipping test")
 	}
@@ -120,11 +117,11 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	// Re-create dolt_ignore'd tables (wisps, etc.) on the branch.
 	// These tables are in dolt_ignore so they only exist in the working set,
 	// not in commits. Branching from main doesn't inherit them.
-	if err := createIgnoredTables(store.db); err != nil {
+	if err := CreateIgnoredTables(store.db); err != nil {
 		branchCleanup()
 		store.Close()
 		os.RemoveAll(tmpDir)
-		t.Fatalf("createIgnoredTables on branch failed: %v", err)
+		t.Fatalf("CreateIgnoredTables on branch failed: %v", err)
 	}
 
 	cleanup := func() {

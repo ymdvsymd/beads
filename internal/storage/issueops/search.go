@@ -100,13 +100,26 @@ func searchTableInTx(ctx context.Context, tx *sql.Tx, query string, filter types
 		for i, issue := range issues {
 			ids[i] = issue.ID
 		}
-		labelMap, labelErr := GetLabelsForIssuesInTx(ctx, tx, ids)
+		labelMap, labelErr := GetLabelsForIssuesInTx(ctx, tx, ids, nil)
 		if labelErr != nil {
 			return nil, fmt.Errorf("search %s: hydrate labels: %w", tables.Main, labelErr)
 		}
 		for _, issue := range issues {
 			if labels, ok := labelMap[issue.ID]; ok {
 				issue.Labels = labels
+			}
+		}
+
+		// Optionally hydrate dependencies in bulk (same batched pattern as labels).
+		if filter.IncludeDependencies {
+			depMap, depErr := GetDependencyRecordsForIssuesInTx(ctx, tx, ids)
+			if depErr != nil {
+				return nil, fmt.Errorf("search %s: hydrate dependencies: %w", tables.Main, depErr)
+			}
+			for _, issue := range issues {
+				if deps, ok := depMap[issue.ID]; ok {
+					issue.Dependencies = deps
+				}
 			}
 		}
 	}

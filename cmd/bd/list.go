@@ -40,8 +40,9 @@ func withStorage(ctx context.Context, store storage.DoltStorage, dbPath string, 
 	return fmt.Errorf("no storage available")
 }
 
-// getHierarchicalChildren handles the --tree --parent combination logic
-func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string) ([]*types.Issue, error) {
+// getHierarchicalChildren handles the --tree --parent combination logic.
+// baseFilter carries CLI filters (--type, --status, etc.) through the recursive walk.
+func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter) ([]*types.Issue, error) {
 	// First verify that the parent issue exists
 	var parentIssue *types.Issue
 	err := withStorage(ctx, store, dbPath, func(s storage.DoltStorage) error {
@@ -56,20 +57,24 @@ func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbP
 		return nil, fmt.Errorf("parent issue '%s' not found", parentID)
 	}
 
-	// Use recursive search to find all descendants using the same logic as --parent filter
-	// This works around issues with GetDependencyTree not finding all dependents properly
+	// Use recursive search to find all descendants using the same logic as --parent filter.
+	// The parent itself is NOT included in the result set — only actual children and
+	// their descendants. This matches the behavior of --json and --flat (GH#3349).
 	allDescendants := make(map[string]*types.Issue)
 
-	// Always include the parent
-	allDescendants[parentID] = parentIssue
-
-	// Recursively find all descendants
-	err = findAllDescendants(ctx, store, dbPath, parentID, allDescendants, 0, 10) // max depth 10
+	err = findAllDescendants(ctx, store, dbPath, parentID, baseFilter, allDescendants, 0, 10) // max depth 10
 	if err != nil {
 		return nil, fmt.Errorf("error finding descendants: %v", err)
 	}
 
-	// Convert map to slice for display
+	if len(allDescendants) == 0 {
+		return nil, nil
+	}
+
+	// Include the parent as the tree root only when descendants exist,
+	// so the tree renderer can draw the hierarchy with the parent at the top.
+	allDescendants[parentID] = parentIssue
+
 	treeIssues := make([]*types.Issue, 0, len(allDescendants))
 	for _, issue := range allDescendants {
 		treeIssues = append(treeIssues, issue)
@@ -78,18 +83,18 @@ func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbP
 	return treeIssues, nil
 }
 
-// findAllDescendants recursively finds all descendants using parent filtering
-func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, result map[string]*types.Issue, currentDepth, maxDepth int) error {
+// findAllDescendants recursively finds all descendants using parent filtering.
+// baseFilter carries CLI filters (--type, --status, etc.) so the tree respects them.
+func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter, result map[string]*types.Issue, currentDepth, maxDepth int) error {
 	if currentDepth >= maxDepth {
 		return nil // Prevent infinite recursion
 	}
 
-	// Get direct children using the same filter logic as regular --parent
 	var children []*types.Issue
 	err := withStorage(ctx, store, dbPath, func(s storage.DoltStorage) error {
-		filter := types.IssueFilter{
-			ParentID: &parentID,
-		}
+		filter := baseFilter
+		filter.ParentID = &parentID
+		filter.Limit = 0 // unlimited per level to avoid truncating the tree walk
 		var err error
 		children, err = s.SearchIssues(ctx, "", filter)
 		return err
@@ -98,12 +103,10 @@ func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath s
 		return err
 	}
 
-	// Add children and recursively find their descendants
 	for _, child := range children {
 		if _, exists := result[child.ID]; !exists {
 			result[child.ID] = child
-			// Recursively find this child's descendants
-			err = findAllDescendants(ctx, store, dbPath, child.ID, result, currentDepth+1, maxDepth)
+			err = findAllDescendants(ctx, store, dbPath, child.ID, baseFilter, result, currentDepth+1, maxDepth)
 			if err != nil {
 				return err
 			}
@@ -116,15 +119,54 @@ func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath s
 // watchIssues polls for changes and re-displays (GH#654)
 // Uses polling instead of fsnotify because Dolt stores data in a server-side
 // database, not files — file watchers never fire.
-func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, sortBy string, reverse bool) {
-	// Initial display
+type watchListDependencyStore interface {
+	GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error)
+}
+
+func loadWatchedIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, parentID string, sortBy string, reverse bool) ([]*types.Issue, error) {
+	if parentID != "" {
+		issues, err := getHierarchicalChildren(ctx, store, "", parentID, filter)
+		if err != nil {
+			return nil, err
+		}
+		// getHierarchicalChildren builds its result from a map, so normalize the
+		// slice before snapshot comparison to avoid spurious redraws.
+		sortIssues(issues, "id", false)
+		return issues, nil
+	}
+
 	issues, err := store.SearchIssues(ctx, "", filter)
+	if err != nil {
+		return nil, err
+	}
+	sortIssues(issues, sortBy, reverse)
+	return issues, nil
+}
+
+func displayWatchedIssueList(ctx context.Context, store watchListDependencyStore, issues []*types.Issue) {
+	var allDeps map[string][]*types.Dependency
+	if store != nil {
+		deps, err := store.GetAllDependencyRecords(ctx)
+		if err == nil {
+			allDeps = deps
+		}
+	}
+	displayPrettyListWithDeps(issues, true, allDeps)
+}
+
+func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, parentID string, sortBy string, reverse bool, effectiveLimit int) {
+	// Initial display
+	issues, err := loadWatchedIssues(ctx, store, filter, parentID, sortBy, reverse)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error querying issues: %v\n", err)
 		return
 	}
-	sortIssues(issues, sortBy, reverse)
-	displayPrettyList(issues, true)
+	truncated := effectiveLimit > 0 && len(issues) > effectiveLimit
+	if truncated {
+		issues = issues[:effectiveLimit]
+	}
+	displayWatchedIssueList(ctx, store, issues)
+	printTruncationHint(truncated, effectiveLimit)
 	lastSnapshot := issueSnapshot(issues)
 
 	fmt.Fprintf(os.Stderr, "\nWatching for changes... (Press Ctrl+C to exit)\n")
@@ -144,16 +186,20 @@ func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.Is
 			fmt.Fprintf(os.Stderr, "\nStopped watching.\n")
 			return
 		case <-ticker.C:
-			issues, err := store.SearchIssues(ctx, "", filter)
+			issues, err := loadWatchedIssues(ctx, store, filter, parentID, sortBy, reverse)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error refreshing issues: %v\n", err)
 				continue
 			}
-			sortIssues(issues, sortBy, reverse)
+			truncated := effectiveLimit > 0 && len(issues) > effectiveLimit
+			if truncated {
+				issues = issues[:effectiveLimit]
+			}
 			snap := issueSnapshot(issues)
 			if snap != lastSnapshot {
 				lastSnapshot = snap
-				displayPrettyList(issues, true)
+				displayWatchedIssueList(ctx, store, issues)
+				printTruncationHint(truncated, effectiveLimit)
 				fmt.Fprintf(os.Stderr, "\nWatching for changes... (Press Ctrl+C to exit)\n")
 			}
 		}
@@ -273,6 +319,7 @@ var listCmd = &cobra.Command{
 		}
 		labels, _ := cmd.Flags().GetStringSlice("label")
 		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
+		excludeLabels, _ := cmd.Flags().GetStringSlice("exclude-label")
 		labelPattern, _ := cmd.Flags().GetString("label-pattern")
 		labelRegex, _ := cmd.Flags().GetString("label-regex")
 		titleSearch, _ := cmd.Flags().GetString("title")
@@ -385,6 +432,7 @@ var listCmd = &cobra.Command{
 		// Normalize labels: trim, dedupe, remove empty
 		labels = utils.NormalizeLabels(labels)
 		labelsAny = utils.NormalizeLabels(labelsAny)
+		excludeLabels = utils.NormalizeLabels(excludeLabels)
 
 		// Apply directory-aware label scoping if no labels explicitly provided (GH#541)
 		if len(labels) == 0 && len(labelsAny) == 0 {
@@ -428,6 +476,12 @@ var listCmd = &cobra.Command{
 			sqlLimit = 0
 		}
 
+		// Fetch one extra row so we can distinguish "exactly N matches" from
+		// "N+ matches truncated" without running a second count query (GH#3212).
+		if sqlLimit > 0 {
+			sqlLimit++
+		}
+
 		filter := types.IssueFilter{
 			Limit: sqlLimit,
 		}
@@ -437,21 +491,42 @@ var listCmd = &cobra.Command{
 			s := types.StatusOpen
 			filter.Status = &s
 		} else if status != "" && status != "all" {
-			s := types.Status(status)
-			// Validate --status value (bd-ttno)
+			// Support comma-separated status values (GH#2846)
+			statusParts := strings.Split(status, ",")
 			var customStatuses []string
 			if store != nil {
-				cs, _ := store.GetCustomStatuses(rootCtx)
-				customStatuses = cs
-			}
-			if !s.IsValidWithCustom(customStatuses) {
-				validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
-				if len(customStatuses) > 0 {
-					validList += ", " + strings.Join(customStatuses, ", ")
+				cs, err := store.GetCustomStatuses(rootCtx)
+				if err != nil {
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "%s Could not load custom statuses from database: %v (falling back to config)\n", ui.RenderWarn("!"), err)
+					}
+				} else {
+					customStatuses = cs
 				}
-				FatalError("invalid status %q (valid: %s)", status, validList)
 			}
-			filter.Status = &s
+			if len(statusParts) == 1 {
+				s := types.Status(strings.TrimSpace(statusParts[0]))
+				if !s.IsValidWithCustom(customStatuses) {
+					validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
+					if len(customStatuses) > 0 {
+						validList += ", " + strings.Join(customStatuses, ", ")
+					}
+					FatalError("invalid status %q (valid: %s)", status, validList)
+				}
+				filter.Status = &s
+			} else {
+				for _, part := range statusParts {
+					s := types.Status(strings.TrimSpace(part))
+					if !s.IsValidWithCustom(customStatuses) {
+						validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
+						if len(customStatuses) > 0 {
+							validList += ", " + strings.Join(customStatuses, ", ")
+						}
+						FatalError("invalid status %q in multi-status filter (valid: %s)", strings.TrimSpace(part), validList)
+					}
+					filter.Statuses = append(filter.Statuses, s)
+				}
+			}
 		}
 
 		// Default to non-closed/non-pinned issues unless --all, --pinned, or explicit --status (GH#788, bd-uhcg)
@@ -506,6 +581,9 @@ var listCmd = &cobra.Command{
 		}
 		if len(labelsAny) > 0 {
 			filter.LabelsAny = labelsAny
+		}
+		if len(excludeLabels) > 0 {
+			filter.ExcludeLabels = excludeLabels
 		}
 		if labelPattern != "" {
 			filter.LabelPattern = labelPattern
@@ -760,27 +838,15 @@ var listCmd = &cobra.Command{
 
 		ctx := rootCtx
 
-		// Handle --rig flag: query a different rig's database
-		rigOverride, _ := cmd.Flags().GetString("rig")
 		activeStore := store
-		if rigOverride != "" {
-			rigStore, err := openStoreForRig(ctx, rigOverride)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			defer func() { _ = rigStore.Close() }() // Best effort cleanup
-			activeStore = rigStore
-		} else {
-			// Keep list/read behavior aligned with bd create routing decisions.
-			// Contributor auto-routing should read from the same target repo.
-			routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			if routed {
-				defer func() { _ = routedStore.Close() }()
-				activeStore = routedStore
-			}
+		// Contributor auto-routing: read from the same target repo as bd create.
+		routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
+		if err != nil {
+			FatalError("%v", err)
+		}
+		if routed {
+			defer func() { _ = routedStore.Close() }()
+			activeStore = routedStore
 		}
 
 		// Direct mode
@@ -792,14 +858,16 @@ var listCmd = &cobra.Command{
 		// Apply sorting
 		sortIssues(issues, sortBy, reverse)
 
-		// Apply limit after sorting when --sort deferred it from SQL (GH#1237)
-		if sortBy != "" && effectiveLimit > 0 && len(issues) > effectiveLimit {
+		// Detect truncation (GH#3212). We fetched effectiveLimit+1 above, so any
+		// overflow means more matches exist than we're displaying.
+		truncated := effectiveLimit > 0 && len(issues) > effectiveLimit
+		if truncated {
 			issues = issues[:effectiveLimit]
 		}
 
 		// Handle watch mode (GH#654) - must be before other output modes
 		if watchMode {
-			watchIssues(ctx, activeStore, filter, sortBy, reverse)
+			watchIssues(ctx, activeStore, filter, parentID, sortBy, reverse, effectiveLimit)
 			return
 		}
 
@@ -808,7 +876,7 @@ var listCmd = &cobra.Command{
 		if prettyFormat && !jsonOutput {
 			// Special handling for --tree --parent combination (hierarchical descendants)
 			if parentID != "" {
-				treeIssues, err := getHierarchicalChildren(ctx, activeStore, "", parentID)
+				treeIssues, err := getHierarchicalChildren(ctx, activeStore, "", parentID, filter)
 				if err != nil {
 					FatalError("%v", err)
 				}
@@ -830,10 +898,7 @@ var listCmd = &cobra.Command{
 			// Best effort: display gracefully degrades with empty data
 			allDeps, _ := activeStore.GetAllDependencyRecords(ctx)
 			displayPrettyListWithDeps(issues, false, allDeps)
-			// Show truncation hint if we hit the limit (GH#788)
-			if effectiveLimit > 0 && len(issues) == effectiveLimit {
-				fmt.Fprintf(os.Stderr, "\nShowing %d issues (use --limit 0 for all)\n", effectiveLimit)
-			}
+			printTruncationHint(truncated, effectiveLimit)
 			return
 		}
 
@@ -842,6 +907,7 @@ var listCmd = &cobra.Command{
 			if err := outputFormattedList(ctx, activeStore, issues, formatStr); err != nil {
 				FatalError("%v", err)
 			}
+			printTruncationHint(truncated, effectiveLimit)
 			return
 		}
 
@@ -887,6 +953,7 @@ var listCmd = &cobra.Command{
 				}
 			}
 			outputJSON(issuesWithCounts)
+			printTruncationHint(truncated, effectiveLimit)
 			return
 		}
 
@@ -915,6 +982,7 @@ var listCmd = &cobra.Command{
 				formatAgentIssue(&buf, issue, blockedByMap[issue.ID], blocksMap[issue.ID], parentMap[issue.ID])
 			}
 			fmt.Print(buf.String())
+			printTruncationHint(truncated, effectiveLimit)
 			return
 		} else if longFormat {
 			// Long format: multi-line with details
@@ -938,10 +1006,7 @@ var listCmd = &cobra.Command{
 			}
 		}
 
-		// Show truncation hint if we hit the limit (GH#788)
-		if effectiveLimit > 0 && len(issues) == effectiveLimit {
-			fmt.Fprintf(os.Stderr, "\nShowing %d issues (use --limit 0 for all)\n", effectiveLimit)
-		}
+		printTruncationHint(truncated, effectiveLimit)
 
 		// Show tip after successful list (direct mode only)
 		maybeShowTip(store)
@@ -949,7 +1014,7 @@ var listCmd = &cobra.Command{
 }
 
 func init() {
-	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Note: dependency-blocked issues use 'bd blocked'")
+	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Comma-separated for multiple: --status open,in_progress")
 	listCmd.Flags().String("state", "", "Alias for --status")
 	_ = listCmd.Flags().MarkHidden("state")
 	registerPriorityFlag(listCmd, "")
@@ -957,6 +1022,7 @@ func init() {
 	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision")
 	listCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	listCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
+	listCmd.Flags().StringSlice("exclude-label", []string{}, "Exclude issues that have ANY of these labels")
 	listCmd.Flags().String("label-pattern", "", "Filter by label glob pattern (e.g., 'tech-*' matches tech-debt, tech-legacy)")
 	listCmd.Flags().String("label-regex", "", "Filter by label regex pattern (e.g., 'tech-(debt|legacy)')")
 	listCmd.Flags().String("title", "", "Filter by title text (case-insensitive substring match)")
@@ -1042,9 +1108,6 @@ func init() {
 
 	// Ready filter: show only issues ready to be worked on (bd-ihu31)
 	listCmd.Flags().Bool("ready", false, "Show only ready issues (status=open, excludes hooked/in_progress/blocked/deferred)")
-
-	// Cross-rig routing: query a different rig's database (bd-rgdjr)
-	listCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig my-project, --rig gt-, --rig gt)")
 
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)

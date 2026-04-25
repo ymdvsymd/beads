@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
@@ -19,11 +21,17 @@ func init() {
 
 // Tracker implements tracker.IssueTracker for Linear.
 type Tracker struct {
-	client    *Client
+	clients   map[string]*Client // keyed by team ID
 	config    *MappingConfig
 	store     storage.Storage
-	teamID    string
+	teamIDs   []string // ordered list of configured team IDs
 	projectID string
+}
+
+// SetTeamIDs sets the team IDs before Init(). When set, Init() uses these
+// instead of reading from config. This supports the --team CLI flag.
+func (t *Tracker) SetTeamIDs(ids []string) {
+	t.teamIDs = ids
 }
 
 func (t *Tracker) Name() string         { return "linear" }
@@ -38,29 +46,45 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 		return fmt.Errorf("Linear API key not configured (set linear.api_key or LINEAR_API_KEY)")
 	}
 
-	teamID, err := t.getConfig(ctx, "linear.team_id", "LINEAR_TEAM_ID")
-	if err != nil || teamID == "" {
-		return fmt.Errorf("Linear team ID not configured (set linear.team_id or LINEAR_TEAM_ID)")
-	}
-	t.teamID = teamID
-
-	client := NewClient(apiKey, teamID)
-
-	if endpoint, _ := store.GetConfig(ctx, "linear.api_endpoint"); endpoint != "" {
-		client = client.WithEndpoint(endpoint)
-	}
-	if projectID, _ := store.GetConfig(ctx, "linear.project_id"); projectID != "" {
-		client = client.WithProjectID(projectID)
-		t.projectID = projectID
+	// Resolve team IDs: use pre-set IDs (from CLI), or fall back to config.
+	if len(t.teamIDs) == 0 {
+		pluralVal, _ := t.getConfig(ctx, "linear.team_ids", "LINEAR_TEAM_IDS")
+		singularVal, _ := t.getConfig(ctx, "linear.team_id", "LINEAR_TEAM_ID")
+		t.teamIDs = tracker.ResolveProjectIDs(nil, pluralVal, singularVal)
+		if len(t.teamIDs) == 0 {
+			return fmt.Errorf("Linear team ID not configured (set linear.team_id, linear.team_ids, or LINEAR_TEAM_ID)")
+		}
 	}
 
-	t.client = client
+	// Read optional endpoint and project ID.
+	var endpoint, projectID string
+	if store != nil {
+		endpoint, _ = store.GetConfig(ctx, "linear.api_endpoint")
+		projectID, _ = store.GetConfig(ctx, "linear.project_id")
+		if projectID != "" {
+			t.projectID = projectID
+		}
+	}
+
+	// Create per-team clients upfront for O(1) routing.
+	t.clients = make(map[string]*Client, len(t.teamIDs))
+	for _, teamID := range t.teamIDs {
+		client := NewClient(apiKey, teamID)
+		if endpoint != "" {
+			client = client.WithEndpoint(endpoint)
+		}
+		if projectID != "" {
+			client = client.WithProjectID(projectID)
+		}
+		t.clients[teamID] = client
+	}
+
 	t.config = LoadMappingConfig(&configLoaderAdapter{ctx: ctx, store: store})
 	return nil
 }
 
 func (t *Tracker) Validate() error {
-	if t.client == nil {
+	if len(t.clients) == 0 {
 		return fmt.Errorf("Linear tracker not initialized")
 	}
 	return nil
@@ -69,51 +93,77 @@ func (t *Tracker) Validate() error {
 func (t *Tracker) Close() error { return nil }
 
 func (t *Tracker) FetchIssues(ctx context.Context, opts tracker.FetchOptions) ([]tracker.TrackerIssue, error) {
-	var issues []Issue
-	var err error
-
 	state := opts.State
 	if state == "" {
 		state = "all"
 	}
 
-	if opts.Since != nil {
-		issues, err = t.client.FetchIssuesSince(ctx, state, *opts.Since)
-	} else {
-		issues, err = t.client.FetchIssues(ctx, state)
-	}
-	if err != nil {
-		return nil, err
+	seen := make(map[string]bool)
+	var result []tracker.TrackerIssue
+
+	for _, teamID := range t.teamIDs {
+		client := t.clients[teamID]
+		if client == nil {
+			continue
+		}
+
+		var issues []Issue
+		var err error
+		if opts.Since != nil {
+			issues, err = client.FetchIssuesSince(ctx, state, *opts.Since)
+		} else {
+			issues, err = client.FetchIssues(ctx, state)
+		}
+		if err != nil {
+			return result, fmt.Errorf("fetching issues from team %s: %w", teamID, err)
+		}
+
+		for _, li := range issues {
+			if seen[li.ID] {
+				continue
+			}
+			seen[li.ID] = true
+			result = append(result, linearToTrackerIssue(&li))
+		}
 	}
 
-	result := make([]tracker.TrackerIssue, 0, len(issues))
-	for _, li := range issues {
-		result = append(result, linearToTrackerIssue(&li))
-	}
 	return result, nil
 }
 
 func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.TrackerIssue, error) {
-	li, err := t.client.FetchIssueByIdentifier(ctx, identifier)
-	if err != nil {
-		return nil, err
+	// Try the primary client first (first team), then others.
+	for _, teamID := range t.teamIDs {
+		client := t.clients[teamID]
+		if client == nil {
+			continue
+		}
+		li, err := client.FetchIssueByIdentifier(ctx, identifier)
+		if err != nil {
+			continue // Issue might belong to a different team.
+		}
+		if li != nil {
+			ti := linearToTrackerIssue(li)
+			return &ti, nil
+		}
 	}
-	if li == nil {
-		return nil, nil
-	}
-	ti := linearToTrackerIssue(li)
-	return &ti, nil
+	return nil, nil
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	// Create on the primary (first) team.
+	client := t.primaryClient()
+	if client == nil {
+		return nil, fmt.Errorf("no Linear client available")
+	}
+
 	priority := PriorityToLinear(issue.Priority, t.config)
 
-	stateID, err := t.findStateID(ctx, issue.Status)
+	stateID, err := t.findStateID(ctx, client, issue.Status)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
 
-	created, err := t.client.CreateIssue(ctx, issue.Title, issue.Description, priority, stateID, nil)
+	created, err := client.CreateIssue(ctx, issue.Title, issue.Description, priority, stateID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -123,11 +173,17 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 }
 
 func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	// Route to the correct team's client based on the external ID.
+	client := t.clientForExternalID(ctx, externalID)
+	if client == nil {
+		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
+	}
+
 	mapper := t.FieldMapper()
 	updates := mapper.IssueToTracker(issue)
 
 	// Resolve and include state so status changes are pushed to Linear.
-	stateID, err := t.findStateID(ctx, issue.Status)
+	stateID, err := t.findStateID(ctx, client, issue.Status)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
@@ -135,7 +191,7 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 		updates["stateId"] = stateID
 	}
 
-	updated, err := t.client.UpdateIssue(ctx, externalID, updates)
+	updated, err := client.UpdateIssue(ctx, externalID, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +202,11 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 
 func (t *Tracker) FieldMapper() tracker.FieldMapper {
 	return &linearFieldMapper{config: t.config}
+}
+
+// MappingConfig returns the resolved Linear mapping configuration.
+func (t *Tracker) MappingConfig() *MappingConfig {
+	return t.config
 }
 
 func (t *Tracker) IsExternalRef(ref string) bool {
@@ -166,29 +227,105 @@ func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 	return fmt.Sprintf("https://linear.app/issue/%s", issue.Identifier)
 }
 
-// findStateID looks up the Linear workflow state ID for a beads status.
-func (t *Tracker) findStateID(ctx context.Context, status types.Status) (string, error) {
-	targetType := StatusToLinearStateType(status)
+// ValidatePushStateMappings ensures push has explicit, non-ambiguous status
+// mappings for every configured team before any mutation occurs.
+func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
+	if t.config == nil || len(t.config.ExplicitStateMap) == 0 {
+		return fmt.Errorf("%s", missingExplicitStateMapMessage)
+	}
+	for _, teamID := range t.teamIDs {
+		client := t.clients[teamID]
+		if client == nil {
+			continue
+		}
+		cache, err := BuildStateCache(ctx, client)
+		if err != nil {
+			return fmt.Errorf("fetching workflow states for team %s: %w", teamID, err)
+		}
+		for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked, types.StatusClosed} {
+			if _, err := ResolveStateIDForBeadsStatus(cache, status, t.config); err != nil {
+				// Only fail for statuses the config explicitly tries to map or when
+				// mappings are entirely absent. Missing blocked mappings are allowed
+				// until a blocked issue is actually pushed.
+				if status == types.StatusBlocked && strings.Contains(err.Error(), "has no configured Linear state") {
+					continue
+				}
+				return err
+			}
+		}
+	}
+	return nil
+}
 
-	states, err := t.client.GetTeamStates(ctx)
+// findStateID looks up the Linear workflow state ID for a beads status
+// using the given per-team client.
+func (t *Tracker) findStateID(ctx context.Context, client *Client, status types.Status) (string, error) {
+	cache, err := BuildStateCache(ctx, client)
 	if err != nil {
 		return "", err
 	}
+	return ResolveStateIDForBeadsStatus(cache, status, t.config)
+}
 
-	for _, s := range states {
-		if s.Type == targetType {
-			return s.ID, nil
+// primaryClient returns the client for the first configured team.
+func (t *Tracker) primaryClient() *Client {
+	if len(t.teamIDs) == 0 {
+		return nil
+	}
+	return t.clients[t.teamIDs[0]]
+}
+
+// clientForExternalID resolves which per-team client should handle an issue
+// identified by its Linear identifier (e.g., "TEAM-123").
+func (t *Tracker) clientForExternalID(ctx context.Context, externalID string) *Client {
+	if len(t.teamIDs) == 1 {
+		return t.primaryClient()
+	}
+
+	// Try to fetch the issue from each team's client to find the owner.
+	for _, teamID := range t.teamIDs {
+		client := t.clients[teamID]
+		if client == nil {
+			continue
+		}
+		li, err := client.FetchIssueByIdentifier(ctx, externalID)
+		if err == nil && li != nil {
+			return client
 		}
 	}
 
-	if len(states) > 0 {
-		return states[0].ID, nil
-	}
-	return "", fmt.Errorf("no workflow states found")
+	return t.primaryClient()
+}
+
+// TeamIDs returns the list of configured team IDs.
+func (t *Tracker) TeamIDs() []string {
+	return t.teamIDs
+}
+
+// PrimaryClient returns the client for the first configured team.
+// Exported for CLI code that needs direct client access (e.g., push hooks).
+func (t *Tracker) PrimaryClient() *Client {
+	return t.primaryClient()
 }
 
 // getConfig reads a config value from storage, falling back to env var.
+// For yaml-only keys (e.g. linear.api_key), reads from config.yaml first
+// to match the behavior of cmd/bd/linear.go:getLinearConfig().
 func (t *Tracker) getConfig(ctx context.Context, key, envVar string) (string, error) {
+	// Secret keys are stored in config.yaml, not the Dolt database,
+	// to avoid leaking secrets when pushing to remotes.
+	if config.IsYamlOnlyKey(key) {
+		if val := config.GetString(key); val != "" {
+			return val, nil
+		}
+		if envVar != "" {
+			if envVal := os.Getenv(envVar); envVal != "" {
+				return envVal, nil
+			}
+		}
+		return "", nil
+	}
+
 	val, err := t.store.GetConfig(ctx, key)
 	if err == nil && val != "" {
 		return val, nil
@@ -250,13 +387,14 @@ func linearToTrackerIssue(li *Issue) tracker.TrackerIssue {
 	return ti
 }
 
-// BuildStateCacheFromTracker builds a StateCache using the tracker's internal client.
+// BuildStateCacheFromTracker builds a StateCache using the tracker's primary client.
 // This allows CLI code to set up PushHooks.BuildStateCache without accessing the client directly.
 func BuildStateCacheFromTracker(ctx context.Context, t *Tracker) (*StateCache, error) {
-	if t.client == nil {
+	client := t.primaryClient()
+	if client == nil {
 		return nil, fmt.Errorf("Linear tracker not initialized")
 	}
-	return BuildStateCache(ctx, t.client)
+	return BuildStateCache(ctx, client)
 }
 
 // configLoaderAdapter wraps storage.Storage to implement linear.ConfigLoader.

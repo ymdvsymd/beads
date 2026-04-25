@@ -4,11 +4,13 @@
 
 **Platforms:** macOS, Linux, Windows, FreeBSD
 
-[![License](https://img.shields.io/github/license/steveyegge/beads)](LICENSE)
+[![License](https://img.shields.io/github/license/gastownhall/beads)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/steveyegge/beads)](https://goreportcard.com/report/github.com/steveyegge/beads)
-[![Release](https://img.shields.io/github/v/release/steveyegge/beads)](https://github.com/steveyegge/beads/releases)
+[![Release](https://img.shields.io/github/v/release/gastownhall/beads)](https://github.com/gastownhall/beads/releases)
 [![npm version](https://img.shields.io/npm/v/@beads/bd)](https://www.npmjs.com/package/@beads/bd)
 [![PyPI](https://img.shields.io/pypi/v/beads-mcp)](https://pypi.org/project/beads-mcp/)
+
+**Docs:** https://gastownhall.github.io/beads/
 
 Beads provides a persistent, structured memory for coding agents. It replaces messy markdown plans with a dependency-aware graph, allowing agents to handle long-horizon tasks without losing context.
 
@@ -16,7 +18,7 @@ Beads provides a persistent, structured memory for coding agents. It replaces me
 
 ```bash
 # Install beads CLI (system-wide - don't clone this repo into your project)
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
 # Initialize in YOUR project
 cd your-project
@@ -64,11 +66,14 @@ Beads supports hierarchical IDs for epics:
 
 ## 📦 Installation
 
-* **npm:** `npm install -g @beads/bd`
-* **Homebrew:** `brew install beads`
-* **Go:** `go install github.com/steveyegge/beads/cmd/bd@latest`
+```bash
+brew install beads           # macOS / Linux (recommended)
+npm install -g @beads/bd     # Node.js users
+```
 
-**Requirements:** Linux, FreeBSD, macOS, or Windows.
+**Other methods:** [install script](docs/INSTALLING.md#quick-install-script-all-platforms) | [go install](docs/INSTALLING.md#quick-install-recommended) | [from source](docs/INSTALLING.md#build-dependencies-contributors-only) | [Windows](docs/INSTALLING.md#windows-11) | [Arch AUR](docs/INSTALLING.md#linux)
+
+**Requirements:** macOS, Linux, Windows, or FreeBSD. See [docs/INSTALLING.md](docs/INSTALLING.md) for complete installation guide.
 
 ### Security And Verification
 
@@ -79,6 +84,63 @@ The install scripts verify release checksums before install. For manual installs
 On macOS, `scripts/install.sh` preserves the downloaded signature by default. Local ad-hoc re-signing is explicit opt-in via `BEADS_INSTALL_RESIGN_MACOS=1`.
 
 See [docs/ANTIVIRUS.md](docs/ANTIVIRUS.md) for Windows AV false-positive guidance and verification workflow.
+
+## 💾 Storage Modes
+
+Beads uses [Dolt](https://github.com/dolthub/dolt) as its database. Two modes
+are available:
+
+### Embedded Mode (default)
+
+```bash
+bd init
+```
+
+Dolt runs in-process — no external server needed. Data lives in
+`.beads/embeddeddolt/`. Single-writer only (file locking enforced).
+This is the recommended mode for most users.
+
+### Server Mode
+
+```bash
+bd init --server
+```
+
+Connects to an external `dolt sql-server`. Data lives in `.beads/dolt/`.
+Supports multiple concurrent writers. Configure the connection with flags
+or environment variables:
+
+| Flag | Env Var | Default |
+|------|---------|---------|
+| `--server-host` | `BEADS_DOLT_SERVER_HOST` | `127.0.0.1` |
+| `--server-port` | `BEADS_DOLT_SERVER_PORT` | `3307` |
+| `--server-socket` | `BEADS_DOLT_SERVER_SOCKET` | (none; uses TCP) |
+| `--server-user` | `BEADS_DOLT_SERVER_USER` | `root` |
+| | `BEADS_DOLT_PASSWORD` | (none) |
+
+**Unix domain sockets:** Use `--server-socket` to connect via a Unix socket
+instead of TCP. This avoids port conflicts between concurrent projects and
+is useful in sandboxed environments (e.g., Claude Code) where file-level
+access control is simpler than network allowlists. The Dolt server must be
+started with `dolt sql-server --socket <path>`. Auto-start is not supported
+in socket mode.
+
+### Backup & Migration
+
+Back up your database and migrate between modes using `bd backup`:
+
+```bash
+# Set up a backup destination and push
+bd backup init /path/to/backup
+bd backup sync
+
+# Restore into a new project (any mode)
+bd init           # or bd init --server
+bd backup restore --force /path/to/backup
+```
+
+See [docs/DOLT.md](docs/DOLT.md#migrating-between-backends) for full
+migration instructions.
 
 ## 🌐 Community Tools
 
@@ -113,9 +175,9 @@ This is useful for:
 - **Evaluation/testing** — ephemeral databases in `/tmp`
 
 For daemon mode without git, use `bd daemon start --local`
-(see [PR #433](https://github.com/steveyegge/beads/pull/433)).
+(see [PR #433](https://github.com/gastownhall/beads/pull/433)).
 
 ## 📝 Documentation
 
-* [Installing](docs/INSTALLING.md) | [Agent Workflow](AGENT_INSTRUCTIONS.md) | [Copilot Setup](docs/COPILOT_INTEGRATION.md) | [Articles](ARTICLES.md) | [Sync Branch Mode](docs/PROTECTED_BRANCHES.md) | [Troubleshooting](docs/TROUBLESHOOTING.md) | [FAQ](docs/FAQ.md)
-* [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/steveyegge/beads)
+* [Documentation site](https://gastownhall.github.io/beads/) (versioned) | [Installing](docs/INSTALLING.md) | [Agent Workflow](AGENT_INSTRUCTIONS.md) | [Copilot Setup](docs/COPILOT_INTEGRATION.md) | [Articles](ARTICLES.md) | [Sync Branch Mode](docs/PROTECTED_BRANCHES.md) | [Troubleshooting](docs/TROUBLESHOOTING.md) | [FAQ](docs/FAQ.md)
+* [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gastownhall/beads)

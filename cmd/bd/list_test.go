@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -367,6 +368,63 @@ func TestListQueryCapabilitiesSuite(t *testing.T) {
 		}
 		if len(results) > 0 && results[0].ID != issue2.ID {
 			t.Errorf("Expected issue2, got %s", results[0].ID)
+		}
+	})
+
+	t.Run("exclude label - single", func(t *testing.T) {
+		// issue1 has "critical" and "security"; issue3 has "docs"; issue2 has none.
+		// Excluding "critical" should return issue2 and issue3.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			ExcludeLabels: []string{"critical"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		ids := make(map[string]bool)
+		for _, r := range results {
+			ids[r.ID] = true
+		}
+		if ids[issue1.ID] {
+			t.Errorf("issue1 (has 'critical') should be excluded")
+		}
+		if !ids[issue2.ID] {
+			t.Errorf("issue2 (no labels) should be included")
+		}
+		if !ids[issue3.ID] {
+			t.Errorf("issue3 (has 'docs', not 'critical') should be included")
+		}
+	})
+
+	t.Run("exclude label - multiple", func(t *testing.T) {
+		// Excluding "critical" and "docs" leaves only issue2.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			ExcludeLabels: []string{"critical", "docs"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 issue after excluding critical+docs, got %d", len(results))
+		}
+		if len(results) > 0 && results[0].ID != issue2.ID {
+			t.Errorf("Expected issue2, got %s", results[0].ID)
+		}
+	})
+
+	t.Run("exclude label - combined with include", func(t *testing.T) {
+		// Include "security" AND exclude "docs": should return issue1 only.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			Labels:        []string{"security"},
+			ExcludeLabels: []string{"docs"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 issue, got %d", len(results))
+		}
+		if len(results) > 0 && results[0].ID != issue1.ID {
+			t.Errorf("Expected issue1, got %s", results[0].ID)
 		}
 	})
 
@@ -971,6 +1029,65 @@ func TestFormatIssueCompactWithDependencies(t *testing.T) {
 	}
 }
 
+// TestFormatIssueCompactBlockedIcon verifies that dependency-blocked open issues
+// show the blocked icon (●) instead of the open icon (○) in compact list output. (GH#2858)
+func TestFormatIssueCompactBlockedIcon(t *testing.T) {
+	t.Parallel()
+
+	t.Run("open issue with blockers shows blocked icon", func(t *testing.T) {
+		issue := &types.Issue{
+			ID:        "test-blocked",
+			Title:     "Blocked by dependency",
+			Priority:  2,
+			IssueType: types.TypeTask,
+			Status:    types.StatusOpen,
+		}
+		var buf strings.Builder
+		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "")
+		result := buf.String()
+		// Should show blocked icon ● not open icon ○
+		if strings.Contains(result, ui.StatusIconOpen) {
+			t.Errorf("dependency-blocked issue should not show open icon ○, got: %q", result)
+		}
+		if !strings.Contains(result, ui.StatusIconBlocked) {
+			t.Errorf("dependency-blocked issue should show blocked icon ●, got: %q", result)
+		}
+	})
+
+	t.Run("open issue without blockers shows open icon", func(t *testing.T) {
+		issue := &types.Issue{
+			ID:        "test-open",
+			Title:     "Normal open issue",
+			Priority:  2,
+			IssueType: types.TypeTask,
+			Status:    types.StatusOpen,
+		}
+		var buf strings.Builder
+		formatIssueCompact(&buf, issue, nil, nil, nil, "")
+		result := buf.String()
+		if !strings.Contains(result, ui.StatusIconOpen) {
+			t.Errorf("open issue without blockers should show open icon ○, got: %q", result)
+		}
+	})
+
+	t.Run("in_progress issue with blockers keeps in_progress icon", func(t *testing.T) {
+		issue := &types.Issue{
+			ID:        "test-wip",
+			Title:     "In progress with blocker",
+			Priority:  2,
+			IssueType: types.TypeTask,
+			Status:    types.StatusInProgress,
+		}
+		var buf strings.Builder
+		formatIssueCompact(&buf, issue, nil, []string{"blocker-1"}, nil, "")
+		result := buf.String()
+		// Should keep in_progress icon, not override to blocked
+		if !strings.Contains(result, ui.StatusIconInProgress) {
+			t.Errorf("in_progress issue should keep its icon even with blockers, got: %q", result)
+		}
+	})
+}
+
 func TestParseTimeFlag(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1231,7 +1348,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test full hierarchy (should return all 6 issues)
 	t.Run("full_hierarchy", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", parent.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", parent.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren failed: %v", err)
 		}
@@ -1242,7 +1359,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test child subset (should return child1 + its 2 grandchildren = 3 total)
 	t.Run("child_subset", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", child1.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", child1.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren for child1 failed: %v", err)
 		}
@@ -1253,7 +1370,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test leaf node (should return only itself)
 	t.Run("leaf_node", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", grandchild11.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", grandchild11.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren for leaf failed: %v", err)
 		}
@@ -1264,7 +1381,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test error case - non-existent parent
 	t.Run("nonexistent_parent", func(t *testing.T) {
-		_, err := getHierarchicalChildren(ctx, store, "", "nonexistent-id")
+		_, err := getHierarchicalChildren(ctx, store, "", "nonexistent-id", types.IssueFilter{})
 		if err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Error("Expected 'not found' error for nonexistent parent")
 		}
@@ -1512,5 +1629,21 @@ func TestListJSON_ParentField(t *testing.T) {
 				t.Errorf("Issue %s should have nil parent, got %q", issue.ID, *iwc.Parent)
 			}
 		}
+	}
+}
+
+func TestListCommandInit(t *testing.T) {
+	t.Parallel()
+	if listCmd == nil {
+		t.Fatal("listCmd should be initialized")
+	}
+
+	// Verify --exclude-label flag exists and defaults to empty slice
+	excludeLabelFlag := listCmd.Flags().Lookup("exclude-label")
+	if excludeLabelFlag == nil {
+		t.Fatal("--exclude-label flag should exist on bd list")
+	}
+	if excludeLabelFlag.DefValue != "[]" {
+		t.Errorf("--exclude-label default should be '[]', got %q", excludeLabelFlag.DefValue)
 	}
 }
