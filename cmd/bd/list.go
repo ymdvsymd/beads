@@ -40,6 +40,40 @@ func withStorage(ctx context.Context, store storage.DoltStorage, dbPath string, 
 	return fmt.Errorf("no storage available")
 }
 
+func readyWorkFilterFromIssueFilter(filter types.IssueFilter) types.WorkFilter {
+	wf := types.WorkFilter{
+		Status:         types.StatusOpen,
+		Limit:          filter.Limit,
+		Labels:         filter.Labels,
+		LabelsAny:      filter.LabelsAny,
+		ExcludeLabels:  filter.ExcludeLabels,
+		LabelPattern:   filter.LabelPattern,
+		LabelRegex:     filter.LabelRegex,
+		ParentID:       filter.ParentID,
+		MolType:        filter.MolType,
+		WispType:       filter.WispType,
+		ExcludeTypes:   filter.ExcludeTypes,
+		MetadataFields: filter.MetadataFields,
+		HasMetadataKey: filter.HasMetadataKey,
+	}
+	if filter.IssueType != nil {
+		wf.Type = string(*filter.IssueType)
+	}
+	if filter.Priority != nil {
+		wf.Priority = filter.Priority
+	}
+	if filter.Assignee != nil {
+		wf.Assignee = filter.Assignee
+	}
+	if filter.NoAssignee {
+		wf.Unassigned = true
+	}
+	if filter.Ephemeral != nil && *filter.Ephemeral {
+		wf.IncludeEphemeral = true
+	}
+	return wf
+}
+
 // getHierarchicalChildren handles the --tree --parent combination logic.
 // baseFilter carries CLI filters (--type, --status, etc.) through the recursive walk.
 func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter) ([]*types.Issue, error) {
@@ -62,7 +96,7 @@ func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbP
 	// their descendants. This matches the behavior of --json and --flat (GH#3349).
 	allDescendants := make(map[string]*types.Issue)
 
-	err = findAllDescendants(ctx, store, dbPath, parentID, baseFilter, allDescendants, 0, 10) // max depth 10
+	err = findAllDescendants(ctx, store, dbPath, parentID, baseFilter, allDescendants)
 	if err != nil {
 		return nil, fmt.Errorf("error finding descendants: %v", err)
 	}
@@ -85,11 +119,7 @@ func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbP
 
 // findAllDescendants recursively finds all descendants using parent filtering.
 // baseFilter carries CLI filters (--type, --status, etc.) so the tree respects them.
-func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter, result map[string]*types.Issue, currentDepth, maxDepth int) error {
-	if currentDepth >= maxDepth {
-		return nil // Prevent infinite recursion
-	}
-
+func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter, result map[string]*types.Issue) error {
 	var children []*types.Issue
 	err := withStorage(ctx, store, dbPath, func(s storage.DoltStorage) error {
 		filter := baseFilter
@@ -106,7 +136,7 @@ func findAllDescendants(ctx context.Context, store storage.DoltStorage, dbPath s
 	for _, child := range children {
 		if _, exists := result[child.ID]; !exists {
 			result[child.ID] = child
-			err = findAllDescendants(ctx, store, dbPath, child.ID, baseFilter, result, currentDepth+1, maxDepth)
+			err = findAllDescendants(ctx, store, dbPath, child.ID, baseFilter, result)
 			if err != nil {
 				return err
 			}
@@ -123,7 +153,16 @@ type watchListDependencyStore interface {
 	GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error)
 }
 
-func loadWatchedIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, parentID string, sortBy string, reverse bool) ([]*types.Issue, error) {
+func loadWatchedIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, ready bool, parentID string, sortBy string, reverse bool) ([]*types.Issue, error) {
+	if ready {
+		issues, err := store.GetReadyWork(ctx, readyWorkFilterFromIssueFilter(filter))
+		if err != nil {
+			return nil, err
+		}
+		sortIssues(issues, sortBy, reverse)
+		return issues, nil
+	}
+
 	if parentID != "" {
 		issues, err := getHierarchicalChildren(ctx, store, "", parentID, filter)
 		if err != nil {
@@ -154,9 +193,9 @@ func displayWatchedIssueList(ctx context.Context, store watchListDependencyStore
 	displayPrettyListWithDeps(issues, true, allDeps)
 }
 
-func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, parentID string, sortBy string, reverse bool, effectiveLimit int) {
+func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.IssueFilter, ready bool, parentID string, sortBy string, reverse bool, effectiveLimit int) {
 	// Initial display
-	issues, err := loadWatchedIssues(ctx, store, filter, parentID, sortBy, reverse)
+	issues, err := loadWatchedIssues(ctx, store, filter, ready, parentID, sortBy, reverse)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error querying issues: %v\n", err)
 		return
@@ -186,7 +225,7 @@ func watchIssues(ctx context.Context, store storage.DoltStorage, filter types.Is
 			fmt.Fprintf(os.Stderr, "\nStopped watching.\n")
 			return
 		case <-ticker.C:
-			issues, err := loadWatchedIssues(ctx, store, filter, parentID, sortBy, reverse)
+			issues, err := loadWatchedIssues(ctx, store, filter, ready, parentID, sortBy, reverse)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error refreshing issues: %v\n", err)
 				continue
@@ -250,7 +289,7 @@ func sortIssues(issues []*types.Issue, sortBy string, reverse bool) {
 		case "status":
 			result = cmp.Compare(a.Status, b.Status)
 		case "id":
-			result = cmp.Compare(a.ID, b.ID)
+			result = utils.NaturalCompareIDs(a.ID, b.ID)
 		case "title":
 			result = cmp.Compare(strings.ToLower(a.Title), strings.ToLower(b.Title))
 		case "type":
@@ -850,9 +889,23 @@ var listCmd = &cobra.Command{
 		}
 
 		// Direct mode
-		issues, err := activeStore.SearchIssues(ctx, "", filter)
-		if err != nil {
-			FatalError("%v", err)
+		var issues []*types.Issue
+		if readyFlag {
+			// Use blocker-aware GetReadyWork semantics (GH#3478).
+			// This ensures bd list --ready matches bd ready behavior,
+			// excluding issues with open blocks dependencies.
+			wf := readyWorkFilterFromIssueFilter(filter)
+			var err error
+			issues, err = activeStore.GetReadyWork(ctx, wf)
+			if err != nil {
+				FatalError("%v", err)
+			}
+		} else {
+			var err error
+			issues, err = activeStore.SearchIssues(ctx, "", filter)
+			if err != nil {
+				FatalError("%v", err)
+			}
 		}
 
 		// Apply sorting
@@ -867,7 +920,7 @@ var listCmd = &cobra.Command{
 
 		// Handle watch mode (GH#654) - must be before other output modes
 		if watchMode {
-			watchIssues(ctx, activeStore, filter, parentID, sortBy, reverse, effectiveLimit)
+			watchIssues(ctx, activeStore, filter, readyFlag, parentID, sortBy, reverse, effectiveLimit)
 			return
 		}
 
@@ -875,7 +928,7 @@ var listCmd = &cobra.Command{
 		// JSON output takes priority over pretty/tree format (bd-list-json-fix, bd-03r)
 		if prettyFormat && !jsonOutput {
 			// Special handling for --tree --parent combination (hierarchical descendants)
-			if parentID != "" {
+			if parentID != "" && !readyFlag {
 				treeIssues, err := getHierarchicalChildren(ctx, activeStore, "", parentID, filter)
 				if err != nil {
 					FatalError("%v", err)
@@ -1107,7 +1160,7 @@ func init() {
 	listCmd.Flags().Bool("no-pager", false, "Disable pager output")
 
 	// Ready filter: show only issues ready to be worked on (bd-ihu31)
-	listCmd.Flags().Bool("ready", false, "Show only ready issues (status=open, excludes hooked/in_progress/blocked/deferred)")
+	listCmd.Flags().Bool("ready", false, "Show only ready issues (no active blockers, same semantics as bd ready)")
 
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)

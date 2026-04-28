@@ -8,7 +8,7 @@ This document contains detailed operational instructions for AI agents working o
 
 ### Code Standards
 
-- **Go version**: 1.24+
+- **Go version**: see `go.mod` for the required version (currently 1.26+)
 - **Linting**: `golangci-lint run ./...` (baseline warnings documented in [docs/LINTING.md](docs/LINTING.md))
 - **Testing**: All new features need tests (`make test` for the normal local/CI path, `make test-icu-path` only when intentionally exercising the opt-in ICU regex path)
 - **Documentation**: Update relevant .md files
@@ -151,7 +151,7 @@ gate for PR handling.
 
 1. **File beads issues for any remaining work** that needs follow-up
 2. **Ensure all quality gates pass** (only if code changes were made):
-   - Run `make lint` or `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
+   - Run `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
    - Run `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
    - File P0 issues if quality gates are broken
 3. **Update beads issues** - close finished work, update status
@@ -194,7 +194,7 @@ gate for PR handling.
 bd create "Add integration tests for sync" -t task -p 2 --json
 
 # 2. Run quality gates (only if code changes were made)
-go test -short ./...
+make test
 golangci-lint run ./...
 
 # 3. Close finished issues
@@ -237,6 +237,28 @@ bd update <id> --design "design notes"
 bd update <id> --notes "additional notes"
 bd update <id> --acceptance "acceptance criteria"
 ```
+
+**Read execution metadata before prose.** When enacting a bd issue, inspect the
+structured metadata before using description or notes to choose execution mode,
+delegation, model, reasoning level, or parallel group:
+
+```bash
+bd show <id> --json | jq '.[0] | {id,title,metadata,description,notes}'
+```
+
+The execution metadata keys are:
+
+- `execution_agent_type`
+- `execution_suggested_model`
+- `execution_reasoning_effort`
+- `execution_mode`
+- `execution_parallel_group`
+
+When these keys are present, treat them as the authoritative execution hints.
+Use `description` for the work scope and `notes` for rationale or fallback
+context. Parent/orchestrator agents must read these fields before spawning
+subagents because a running subagent cannot change its model or reasoning effort
+after launch.
 
 **Use stdin for descriptions with special characters** (backticks, `!`, nested quotes):
 ```bash
@@ -326,7 +348,7 @@ make test
 make test-icu-path
 
 # Coverage run
-go test -coverprofile=coverage.out ./...
+go test -tags gms_pure_go -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Verify installed binary
@@ -449,13 +471,12 @@ gh issue view 201
 
 - Check existing issues: `bd list`
 - Look at recent commits: `git log --oneline -20`
-- Read the docs: README.md, ADVANCED.md, EXTENDING.md
+- Read the docs: README.md, ADVANCED.md, docs/CONFIG.md
 - Create an issue if unsure: `bd create "Question: ..." -t task -p 2`
 
 ## Important Files
 
 - **README.md** - Main documentation (keep this updated!)
-- **EXTENDING.md** - Database extension guide
 - **ADVANCED.md** - Advanced features (rename, merge, compaction)
 - **CONTRIBUTING.md** - Contribution guidelines
 - **SECURITY.md** - Security policy

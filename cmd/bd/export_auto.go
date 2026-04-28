@@ -153,19 +153,11 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 	isTemplate := false
 	filter.IsTemplate = &isTemplate
 
-	// Fetch issues
+	// Fetch all issues (persistent + wisps). SearchIssues with Ephemeral=nil
+	// already includes wisps via ID-based dedup (GH#3352).
 	issues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to search issues: %w", err)
-	}
-
-	// Also fetch wisps
-	ephemeral := true
-	wispFilter := filter
-	wispFilter.Ephemeral = &ephemeral
-	wispIssues, err := store.SearchIssues(ctx, "", wispFilter)
-	if err == nil && len(wispIssues) > 0 {
-		issues = append(issues, wispIssues...)
 	}
 
 	// Bulk-load relational data
@@ -287,7 +279,17 @@ func gitAddFile(path string) error {
 	cmd := exec.Command("git", "add", path)
 	cmd.Dir = filepath.Dir(path)
 	cmd.Env = scrubGitHookEnv(os.Environ())
-	return cmd.Run()
+	// Capture combined output so the caller's warning surfaces git's stderr
+	// (e.g. "paths are ignored", "Unable to create index.lock") instead of
+	// just the exit-status text.
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return err
+	}
+	return nil
 }
 
 // scrubGitHookEnv returns env with the GIT_* variables that can poison
