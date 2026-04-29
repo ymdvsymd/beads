@@ -2,7 +2,7 @@ name: Upstream Sync
 
 on:
   schedule:
-    - cron: '30 1 * * *'  # 毎日01:30 UTC (最頻PRマージ時間01:00の30分後)
+    - cron: '31 1 * * *'  # 毎日01:31 UTC (最頻PRマージ時間01:00の31分後)
   workflow_dispatch:      # 手動実行も可能
 
 jobs:
