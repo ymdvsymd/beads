@@ -429,6 +429,16 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				FatalError("failed to create .beads directory: %v", err)
 			}
 
+			// Fix permissions on pre-existing .beads/ directories that may
+			// have been created with a permissive umask (GH#3391).
+			if fixed, err := config.FixBeadsDirPermissions(beadsDir); err != nil {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: could not fix .beads permissions: %v\n", err)
+				}
+			} else if fixed && !quiet {
+				fmt.Fprintf(os.Stderr, "Fixed .beads permissions to %04o\n", config.BeadsDirPerm)
+			}
+
 			// On Linux btrfs, disable transparent compression on .beads/ so that
 			// dolt's hot append-only write path (under .beads/dolt/ or
 			// .beads/embeddeddolt/) does not trigger kworker thrashing from
@@ -646,7 +656,8 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					}
 					syncFromRemote = false
 				} else {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Error: failed to clone remote %q: %v\n", syncURL, err)
+					fmt.Fprintf(os.Stderr, "Hint: verify the URL is reachable and any credentials are valid, or omit --remote to initialize a fresh local database.\n")
 					os.Exit(1)
 				}
 			} else {
