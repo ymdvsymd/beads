@@ -268,6 +268,13 @@ type Config struct {
 	// NewConnection event in dolt-server.log and churns the pool for no
 	// benefit when the server is local and stable.
 	ConnMaxLifetime time.Duration
+
+	// ConnMaxIdleTime overrides how long a connection may sit idle in the pool
+	// before the pool retires it (0 = default 20s). This must stay below the
+	// dolt sql-server wait_timeout (currently 30s) so the pool retires an idle
+	// connection before the server reaps it server-side; otherwise the next
+	// query handed a server-reaped connection fails with "invalid connection".
+	ConnMaxIdleTime time.Duration
 }
 
 // Defaults for the *sql.DB connection pool. Exported for tests/callers that
@@ -277,6 +284,11 @@ const (
 	defaultMaxOpenConns    = 10
 	defaultMaxIdleConns    = 5
 	defaultConnMaxLifetime = time.Hour
+	// defaultConnMaxIdleTime keeps idle pooled connections shorter-lived than the
+	// dolt sql-server wait_timeout (30s) so the pool retires an idle connection
+	// before the server reaps it; this prevents the next read from picking up a
+	// server-closed connection and failing with "invalid connection".
+	defaultConnMaxIdleTime = 20 * time.Second
 )
 
 // cliExecTimeout is the maximum time to wait for dolt CLI push/pull operations.
@@ -488,6 +500,7 @@ var doltMetrics struct {
 	circuitTrips        metric.Int64Counter
 	circuitRejected     metric.Int64Counter
 	serializationErrors metric.Int64Counter
+	writeRetries        metric.Int64Counter
 	connAcquireMs       metric.Float64Histogram
 	poolWaitCount       metric.Int64Counter
 	poolWaitMs          metric.Float64Histogram
@@ -514,6 +527,10 @@ func init() {
 	doltMetrics.serializationErrors, _ = m.Int64Counter("bd.db.serialization_errors",
 		metric.WithDescription("Serialization failures (MySQL 1213/1205) before retry"),
 		metric.WithUnit("{error}"),
+	)
+	doltMetrics.writeRetries, _ = m.Int64Counter("bd.write_retries_total",
+		metric.WithDescription("Write-tx retries in withRetryTx (label: type=serialization|connection)"),
+		metric.WithUnit("{retry}"),
 	)
 	doltMetrics.connAcquireMs, _ = m.Float64Histogram("bd.db.conn_acquire_ms",
 		metric.WithDescription("Time to acquire a pooled connection for a Dolt transaction"),
@@ -609,18 +626,26 @@ var ErrStoreClosed = errors.New("store is closed")
 
 // withReadTx runs fn inside a transaction while holding the store's read-lock.
 // Used for read operations that need a *sql.Tx to share issueops functions.
+//
+// The whole BeginTx+fn is wrapped in withRetry so a transient connection error
+// (e.g. "invalid connection" when the dolt sql-server reaps a pooled connection
+// that has been idle past its wait_timeout) is retried rather than surfaced to
+// the caller. This is safe because fn is read-only and the transaction is always
+// rolled back, so re-running the operation has no side effects.
 func (s *DoltStore) withReadTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin read tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	return fn(tx)
+	return s.withRetry(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin read tx: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		return fn(tx)
+	})
 }
 
 func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
@@ -632,14 +657,28 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	}
 	return backoff.Retry(func() error {
 		err := s.withWriteTx(ctx, fn)
-		if err != nil && isSerializationError(err) {
+		if err == nil {
+			return nil
+		}
+		// Serialization failures (1213/1205) guarantee a server-side rollback,
+		// so the write never landed — safe to replay at any phase.
+		if isSerializationError(err) {
 			doltMetrics.serializationErrors.Add(ctx, 1)
+			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "serialization")))
 			return err // retryable
 		}
-		if err != nil {
-			return backoff.Permanent(err)
+		// Connection failures are only safe to replay BEFORE commit (BeginTx or
+		// the body): nothing was committed. A failure tagged errCommitPhase is
+		// ambiguous — the commit may have landed before the connection dropped —
+		// so replaying could double-apply the write. Surface it instead.
+		if isRetryableError(err) {
+			if errors.Is(err, errCommitPhase) {
+				return backoff.Permanent(fmt.Errorf("write commit result indeterminate after connection loss (not retried to avoid double-apply): %w", err))
+			}
+			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "connection")))
+			return err // pre-commit transient: retryable
 		}
-		return nil
+		return backoff.Permanent(err)
 	}, backoff.WithContext(bo, ctx))
 }
 
@@ -655,7 +694,9 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		return errors.Join(err, tx.Rollback())
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit write tx: %w", err)
+		// Tag commit-phase failures so withRetryTx can tell an ambiguous commit
+		// loss apart from a safe-to-replay pre-commit failure.
+		return fmt.Errorf("commit write tx: %w (%w)", err, errCommitPhase)
 	}
 	return nil
 }
@@ -1340,9 +1381,15 @@ func applyPoolLimits(db *sql.DB, cfg *Config) {
 		lifetime = cfg.ConnMaxLifetime
 	}
 
+	idle := defaultConnMaxIdleTime
+	if cfg.ConnMaxIdleTime > 0 {
+		idle = cfg.ConnMaxIdleTime
+	}
+
 	db.SetMaxOpenConns(maxOpen)
 	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(lifetime)
+	db.SetConnMaxIdleTime(idle)
 }
 
 // openServerConnection opens a connection to a dolt sql-server via MySQL protocol
@@ -2717,6 +2764,45 @@ func (s *DoltStore) recomputeBlockedAfterPull(ctx context.Context, fromCommit st
 		return fmt.Errorf("commit is_blocked recompute: %w", err)
 	}
 	return nil
+}
+
+// RecomputeAllBlocked recomputes is_blocked for every issue and wisp in one full
+// pass and returns the number of rows it corrected. It is the mode-independent
+// repair behind 'bd recompute-blocked' and 'bd doctor --fix' (bd-6dnrw.37): the
+// scoped post-pull recompute is skipped when a re-pull merges nothing, so a
+// recompute that failed after its merge committed — or a conflicted pull the
+// operator resolved by hand — leaves is_blocked stale until this full pass runs.
+// Idempotent: a consistent database corrects nothing.
+func (s *DoltStore) RecomputeAllBlocked(ctx context.Context) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin is_blocked recompute: %w", err)
+	}
+	// Refuse to derive and commit is_blocked from a dirty graph: the recompute
+	// reads the current working set and stages only `issues`, so pre-existing
+	// dirty issue/dependency edits would otherwise be swept into — or silently
+	// inform — the repair commit (bd-6dnrw.37). Checked inside this tx so it
+	// sees the same working set the recompute will read.
+	if err := issueops.GuardBlockedRecomputeWorkingSet(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	changed, err := issueops.RecomputeAllIsBlockedInTx(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit is_blocked recompute: %w", err)
+	}
+	if changed > 0 {
+		// Stage only issues — the synced table is_blocked lives on (wisps are
+		// dolt_ignore'd) — so an unrelated dirty working set is not swept in.
+		if err := s.doltAddAndCommit(ctx, []string{"issues"}, "bd: recompute is_blocked (full)"); err != nil {
+			return int(changed), err
+		}
+	}
+	return int(changed), nil
 }
 
 // recomputeBlockedTx runs the post-merge is_blocked recompute in its own
