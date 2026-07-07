@@ -244,6 +244,7 @@ Reference for bd Latest. Generated from `bd help --all`.
 - [bd formula](#bd-formula) — Manage workflow formulas
   - [bd formula convert](#bd-formula-convert) — Convert formula from JSON to TOML
   - [bd formula list](#bd-formula-list) — List available formulas
+  - [bd formula schema](#bd-formula-schema) — Show the formula schema index (every exported struct in types.go)
   - [bd formula show](#bd-formula-show) — Show formula details
 - [bd github](#bd-github) — GitHub integration commands
   - [bd github pull](#bd-github-pull) — Pull specific items from GitHub
@@ -3684,6 +3685,17 @@ Config options:
 	- Use --export to dump the default content for customization.
 	- Use --memories-only for hook contexts that should inject only persistent memories.
 
+Memory injection caps:
+	Large memory sets can exceed what a session-start hook host will ingest,
+	and hosts truncate silently. Cap what prime injects with --max-memories N
+	and/or --max-memory-chars N (or the prime.max-memories /
+	prime.max-memory-chars config keys; an explicit flag wins, and an explicit
+	0 forces unlimited). Caps apply at whole-memory boundaries, at least one
+	memory is always emitted, and a banner ahead of the entries reports how
+	many were elided and how to browse the rest with bd memories.
+	--max-memory-chars caps the total bytes of the injected memory entries;
+	the section header and elision banner are excluded from the budget.
+
 ```
 bd prime [flags]
 ```
@@ -3691,12 +3703,14 @@ bd prime [flags]
 **Flags:**
 
 ```
-      --export          Output default content (ignores PRIME.md override)
-      --full            Force full CLI output (ignore MCP detection)
-      --hook-json       Wrap output in the SessionStart hook JSON envelope (Claude Code, Gemini CLI, Codex)
-      --mcp             Force MCP mode (minimal output)
-      --memories-only   Output only persistent memories for compact hook contexts
-      --stealth         Stealth mode (no git operations, flush only)
+      --export                 Output default content (ignores PRIME.md override)
+      --full                   Force full CLI output (ignore MCP detection)
+      --hook-json              Wrap output in the SessionStart hook JSON envelope (Claude Code, Gemini CLI, Codex)
+      --max-memories int       Cap injected persistent memories to N entries (0 = unlimited; falls back to the prime.max-memories config key)
+      --max-memory-chars int   Cap the total bytes of injected memory entries, at whole-memory boundaries; section header and banner are not counted (0 = unlimited; falls back to the prime.max-memory-chars config key)
+      --mcp                    Force MCP mode (minimal output)
+      --memories-only          Output only persistent memories for compact hook contexts
+      --stealth                Stealth mode (no git operations, flush only)
 ```
 
 ### bd quickstart
@@ -4299,7 +4313,7 @@ bd preflight [flags]
 
 ```
       --check       Run checks automatically
-      --fix         Auto-fix issues where possible (not yet implemented)
+      --fix         Auto-fix issues where possible (vendorHash, version sync)
       --json        Output results as JSON
       --skip-lint   Skip lint check explicitly
 ```
@@ -5684,8 +5698,16 @@ Search paths (in order):
   4. $GT_ROOT/.beads/formulas/ (shared workspace root, if GT_ROOT set)
 
 Commands:
-  list   List available formulas from all search paths
-  show   Show formula details, steps, and composition rules
+  list    List available formulas from all search paths
+  show    Show formula details, steps, and composition rules
+  schema  Show the formula schema index (alias: primitives)
+
+Discovering primitives:
+  bd formula schema                 # list every declared formula struct
+  bd formula schema loop            # show LoopSpec fields, types, and tags
+  bd formula primitives gate        # alias; same handler as 'schema'
+  examples/formulas/primitives/     # curated, smoke-tested wired fixtures
+  website/docs/workflows/formulas.md  # narrative reference
 
 ```
 bd formula
@@ -5734,6 +5756,9 @@ Search paths (in order of priority):
 
 Formulas in earlier paths shadow those with the same name in later paths.
 
+To list the declared formula schema structs an agent can write inside a .formula.toml,
+use 'bd formula schema' (alias: 'bd formula primitives').
+
 Examples:
   bd formula list
   bd formula list --json
@@ -5750,6 +5775,30 @@ bd formula list [flags]
       --type string   Filter by type (workflow, expansion, aspect, convoy)
 ```
 
+#### bd formula schema
+
+Show the formula schema index: every exported struct declared
+in a .formula.toml/.formula.json, with field names, types, and tags.
+
+The index is generated from internal/formula/types.go via go:generate; the
+struct definitions are the source of truth, so this list cannot drift. It is
+structural reference, not proof that every declared runtime behavior is wired.
+
+Examples:
+  bd formula schema                 # list every declared schema struct
+  bd formula schema loop            # show LoopSpec fields
+  bd formula primitives gate        # alias; shows Gate fields
+  bd formula schema --json          # machine-readable index
+
+Curated smoke-tested fixtures for wired primitives live in
+examples/formulas/primitives/ (with a smoke harness that proves they work).
+
+```
+bd formula schema [primitive]
+```
+
+**Aliases:** primitives
+
 #### bd formula show
 
 Show detailed information about a formula.
@@ -5760,6 +5809,9 @@ Displays:
   - Steps with dependencies
   - Composition rules (extends, aspects, expansions)
   - Bond points for external composition
+
+To inspect the structure of an individual primitive (e.g. LoopSpec, Gate)
+rather than a user-authored formula, use 'bd formula schema &lt;primitive&gt;'.
 
 Examples:
   bd formula show shiny
