@@ -56,6 +56,7 @@ Reference for bd Latest. Generated from `bd help --all`.
   - [bd todo add](#bd-todo-add) — Add a new TODO item
   - [bd todo done](#bd-todo-done) — Mark TODO(s) as done
   - [bd todo list](#bd-todo-list) — List TODO items
+- [bd unclaim](#bd-unclaim) — Release a claimed issue
 - [bd update](#bd-update) — Update one or more issues
 
 ### Views & Reports:
@@ -517,7 +518,7 @@ bd create [title] [flags]
   -s, --status string           Initial status
       --stdin                   Read description from stdin (alias for --body-file -)
       --title string            Issue title (alternative to positional argument)
-  -t, --type string             Issue type (bug|feature|task|epic|chore|decision); custom types require types.custom config; aliases: enhancement/feat→feature, dec/adr→decision (default "task")
+  -t, --type string             Issue type (bug|feature|task|epic|chore|decision|spike|story|milestone); custom types require types.custom config; aliases: enhancement/feat→feature, dec/adr→decision (default "task")
       --validate                Validate description contains required sections for issue type
       --waits-for string        Spawner issue ID to wait for (creates waits-for dependency for fanout gate)
       --waits-for-gate string   Gate type: all-children (wait for all) or any-children (wait for first) (default "all-children")
@@ -1151,6 +1152,7 @@ Example:
   bd q "Fix login bug"           # Outputs: bd-a1b2
   ISSUE=$(bd q "New feature")    # Capture ID in variable
   bd q "Task" | xargs bd show    # Pipe to other commands
+  bd q "Subtask" --parent=bd-a1b2  # Hierarchical child (outputs: bd-a1b2.1)
 
 ```
 bd q [title] [flags]
@@ -1160,6 +1162,7 @@ bd q [title] [flags]
 
 ```
   -l, --labels strings    Labels
+      --parent string     Parent issue ID for hierarchical child (e.g., 'bd-a3f8e9')
   -p, --priority string   Priority (0-4 or P0-P4) (default "2")
   -t, --type string       Issue type (default "task")
 ```
@@ -1511,6 +1514,28 @@ bd todo list [flags]
       --all   Show all TODOs including completed
 ```
 
+### bd unclaim
+
+Release a claimed issue by clearing the assignee and resetting status to 'open'.
+
+Use this when an agent crashes mid-work or you need to abandon a claimed task.
+The issue becomes available for re-claiming by other agents.
+
+Examples:
+  bd unclaim bd-123
+  bd unclaim bd-123 --reason "Agent crashed"
+  bd unclaim bd-123 bd-456
+
+```
+bd unclaim [id...] [flags]
+```
+
+**Flags:**
+
+```
+  -r, --reason string   Reason for unclaiming
+```
+
 ### bd update
 
 Update one or more issues.
@@ -1728,7 +1753,7 @@ bd lint [issue-id...] [flags]
 
 ```
   -s, --status string   Filter by status (default: open, use 'all' for all)
-  -t, --type string     Filter by issue type (bug, task, feature, epic)
+  -t, --type string     Filter by issue type (bug, task, feature, epic, decision, spike, story, chore, milestone)
 ```
 
 ### bd stale
@@ -1819,16 +1844,23 @@ bd statuses
 
 List all valid issue types that can be used with bd create --type.
 
-Core work types (bug, task, feature, chore, epic, decision) are always valid.
+Core work types (bug, task, feature, chore, epic, decision, spike, story, milestone) are always valid.
 Additional types require configuration via types.custom in .beads/config.yaml.
 
 Examples:
   bd types              # List all types with descriptions
+  bd types --sections   # List required sections for each type
   bd types --json       # Output as JSON
 
 
 ```
-bd types
+bd types [flags]
+```
+
+**Flags:**
+
+```
+      --sections   Show required sections for each issue type
 ```
 
 ## Dependencies & Structure:
@@ -2983,7 +3015,7 @@ bd dolt
 Identify and drop leftover test and agent databases that accumulate
 on the shared Dolt server from interrupted test runs and terminated agents.
 
-Stale database prefixes: testdb_*, doctest_*, doctortest_*, beads_pt*, beads_vr*, beads_t*
+Stale database prefixes: testdb_*, beads_test*, beads_pt*, beads_vr*, doctest_*, doctortest_*, benchdb_*
 
 These waste server memory and can degrade performance under concurrent load.
 Use --dry-run to see what would be dropped without actually dropping.
@@ -3679,6 +3711,11 @@ Config options:
 - no-git-ops: When true, outputs stealth mode (no git commands in session close protocol).
   Set via: bd config set no-git-ops true
   Useful when you want to control when commits happen manually.
+- agent.profile: Explicit policy profile for git/commit authority wording
+  (conservative | minimal | team-maintainer; default conservative).
+  Set via: bd config set agent.profile team-maintainer
+  Or per-session: BD_AGENT_PROFILE=team-maintainer (env var takes precedence).
+  See docs/SETUP.md#policy-profiles for what each profile means.
 
 	Workflow customization:
 	- Place a .beads/PRIME.md file in the local clone or resolved workspace to override the default output entirely.
@@ -4137,6 +4174,13 @@ Subcommands:
   schema      Apply pending schema migrations (idempotent)
   sync        Set up sync.branch workflow for multi-clone setups
 
+On a remote-backed database with pending schema migrations bd refuses to
+migrate in place (#4259): migrating two clones independently forks the schema
+so bd dolt pull can no longer merge — the break is silent and unrecoverable.
+Use --force to confirm you are the single designated migrator, after which you
+should publish the migrated schema with 'bd dolt push'. The env-var equivalent
+BD_ALLOW_REMOTE_MIGRATE=1 remains supported for scripted/CI use.
+
 
 ```
 bd migrate [flags]
@@ -4146,6 +4190,7 @@ bd migrate [flags]
 
 ```
       --dry-run          Show what would be done without making changes
+      --force            Bypass the remote-migrate gate as the single designated migrator (equivalent to BD_ALLOW_REMOTE_MIGRATE=1)
       --inspect          Show migration plan and database state for AI agent analysis
       --json             Output migration statistics in JSON format
       --update-repo-id   Update repository ID (use after changing git remote)
@@ -4242,7 +4287,8 @@ bd migrate schema [flags]
 **Flags:**
 
 ```
-      --json   Output in JSON format
+      --force   Bypass the remote-migrate gate as the single designated migrator (equivalent to BD_ALLOW_REMOTE_MIGRATE=1)
+      --json    Output in JSON format
 ```
 
 #### bd migrate sync
@@ -5123,6 +5169,18 @@ Type Filtering (--push only):
   --include-ephemeral       Include ephemeral issues (wisps, etc.); default is to exclude
   --parent TICKET           Only push this ticket and its descendants
   --relations               Import Linear relations as bd dependencies on pull
+
+Persistent push-direction ID filters (workflow artifacts, sandbox beads, etc.):
+  bd config set linear.exclude_id_prefix "hw-mol-"
+  bd config set linear.exclude_id_patterns "-wisp-,sandbox-,scratch-"
+
+  exclude_id_prefix is a single case-sensitive prefix on the bead ID.
+  exclude_id_patterns is a comma-separated list of case-sensitive substrings
+  (matched anywhere in the ID). Both are combined as a union: a bead
+  matching either rule is skipped from push (no create, no update). Beads
+  with an existing external_ref that NOW match are silently skipped on
+  future syncs; the Linear-side issue persists — archive/delete it manually
+  if desired.
 
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
@@ -6487,7 +6545,13 @@ Examples:
   bd mol ready --gated --json    # JSON output for automation
 
 ```
-bd mol ready --gated
+bd mol ready --gated [flags]
+```
+
+**Flags:**
+
+```
+      --gated   Find molecules ready for gate-resume dispatch (always on for this subcommand)
 ```
 
 #### bd mol seed
