@@ -312,6 +312,7 @@ These flags apply to all commands:
       --global                    Use the global shared-server database (beads_global)
       --ignore-schema-skew        Proceed despite forward schema drift (some queries may fail)
       --json                      Output in JSON format
+      --no-color                  Disable color output (also: NO_COLOR=1 or CLICOLOR=0)
       --profile                   Generate CPU profile for performance analysis
   -q, --quiet                     Suppress non-essential output (errors only)
       --readonly                  Read-only mode: block write operations (for worker sandboxes)
@@ -949,6 +950,8 @@ bd list [flags]
       --empty-description            Filter issues with empty or missing description
       --exclude-label strings        Exclude issues that have ANY of these labels
       --exclude-type strings         Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)
+      --external-contains string     Filter by external ref substring (case-insensitive)
+      --external-ref string          Filter by exact external_ref value
       --flat                         Disable tree format and use legacy flat list output
       --format string                Output format: 'digraph' (for golang.org/x/tools/cmd/digraph), 'dot' (Graphviz), or Go template
       --has-metadata-key string      Filter issues that have this metadata key set
@@ -1748,7 +1751,7 @@ Section requirements by type:
   bug:      Steps to Reproduce, Acceptance Criteria
   task:     Acceptance Criteria
   feature:  Acceptance Criteria
-  epic:     Success Criteria
+  epic:     Success Criteria (or Acceptance Criteria)
   chore:    (none)
 
 Examples:
@@ -2145,6 +2148,7 @@ For epics, shows all children and their dependencies.
 For regular issues, shows the issue and its direct dependencies.
 
 With --all, shows all open issues grouped by connected component.
+With --open, filters to only open/actionable issues (compact layer format).
 
 Display formats:
   (default)        DAG with columns and box-drawing edges (terminal-native)
@@ -2152,6 +2156,7 @@ Display formats:
   --compact        Tree format, one line per issue, more scannable
   --dot            Graphviz DOT format (pipe to dot -Tsvg &gt; graph.svg)
   --html           Self-contained interactive HTML with D3.js visualization
+  --open           Open issues only, compact layers (LLM-friendly)
 
 The graph shows execution order:
 - Layer 0 / leftmost = no dependencies (can start immediately)
@@ -2167,6 +2172,8 @@ Examples:
   bd graph --dot issue-id | dot -Tpng &gt; graph.png  # PNG via Graphviz
   bd graph --html issue-id &gt; graph.html  # Interactive browser view
   bd graph --all --html &gt; all.html       # All issues, interactive
+  bd graph --open issue-id       # Open issues only, layered by blocking order
+  bd graph --all --open          # All open issues, compact layers
 
 ```
 bd graph [issue-id] [flags]
@@ -2181,6 +2188,7 @@ bd graph [command]
       --compact   Tree format, one line per issue, more scannable
       --dot       Output Graphviz DOT format (pipe to: dot -Tsvg > graph.svg)
       --html      Output self-contained interactive HTML (redirect to file)
+      --open      Show only open issues (filters out closed/deferred), forces compact layer format
 ```
 
 #### bd graph check
@@ -3746,9 +3754,10 @@ Config options:
   See docs/getting-started/ide-setup.md#policy-profiles for what each profile means.
 
 	Workflow customization:
-	- Place a .beads/PRIME.md file in the local clone or resolved workspace to override the default output entirely.
+	- Place a .beads/PRIME.md file in the local clone or resolved workspace to override the default workflow text. Persistent memories (from bd remember) are still appended so memory injection keeps working under a custom template.
 	- Use --export to dump the default content for customization.
-	- Use --memories-only for hook contexts that should inject only persistent memories.
+	- Use --memories-only for hook contexts that should inject only persistent memories; this returns only the memories section even when a custom PRIME.md is present.
+	- Use --no-memories to omit the persistent memories section (useful when the memories section is large and would dominate a context budget). --memories-only takes precedence if both are set.
 
 Memory injection caps:
 	Large memory sets can exceed what a session-start hook host will ingest,
@@ -3775,6 +3784,7 @@ bd prime [flags]
       --max-memory-chars int   Cap the total bytes of injected memory entries, at whole-memory boundaries; section header and banner are not counted (0 = unlimited; falls back to the prime.max-memory-chars config key)
       --mcp                    Force MCP mode (minimal output)
       --memories-only          Output only persistent memories for compact hook contexts
+      --no-memories            Omit the persistent memories section (ignored when --memories-only is set, which wins)
       --stealth                Stealth mode (no git operations, flush only)
 ```
 
