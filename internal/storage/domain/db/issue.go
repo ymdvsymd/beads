@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
@@ -90,6 +91,19 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	}
 	if len(updates) == 0 {
 		return nil
+	}
+
+	// Bound the VARCHAR(255) assignment columns before touching SQL, mirroring
+	// issueops.updateIssueInTx: an over-length assignee/owner aborts with a typed
+	// ErrFieldTooLong instead of a raw backend "data too long" error.
+	for _, field := range []string{"assignee", "owner"} {
+		if raw, ok := updates[field]; ok {
+			if val, ok := raw.(string); ok {
+				if err := types.CheckFieldLen(field, val); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	table := pickIssueTable(opts.UseWispsTable)
@@ -229,6 +243,12 @@ func coerceStatus(v any) types.Status {
 func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, opts domain.IssueTableOpts) (domain.ClaimRowResult, error) {
 	if id == "" {
 		return domain.ClaimRowResult{}, errors.New("db: Claim: id must not be empty")
+	}
+	// The CAS below writes assignee = actor. actor is user-settable (--actor /
+	// BEADS_ACTOR), so bound it against the VARCHAR(255) assignee column up front
+	// and return a typed ErrFieldTooLong rather than a raw backend error.
+	if err := types.CheckFieldLen("actor", actor); err != nil {
+		return domain.ClaimRowResult{}, err
 	}
 
 	oldIssue, err := r.Get(ctx, id, opts)
@@ -556,6 +576,17 @@ func pickIssueTable(useWisps bool) string {
 
 //nolint:gosec // G201: table is a hardcoded constant ("issues" or "wisps")
 func insertIssueRow(ctx context.Context, runner Runner, table string, issue *types.Issue) error {
+	// Bound the VARCHAR(255) assignment columns at the raw-SQL chokepoint, so
+	// every proxied-server (uow) create — single, batch, and import — rejects an
+	// over-length assignee/owner with a typed ErrFieldTooLong instead of a raw
+	// backend "data too long" error. Mirrors ValidateWithCustom on the embedded
+	// create path.
+	if err := types.CheckFieldLen("assignee", issue.Assignee); err != nil {
+		return err
+	}
+	if err := types.CheckFieldLen("owner", issue.Owner); err != nil {
+		return err
+	}
 	_, err := runner.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (
 			id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -899,6 +930,70 @@ func (r *issueSQLRepositoryImpl) GetStatistics(ctx context.Context) (*types.Stat
 		stats.ReadyIssues = 0
 	}
 	return stats, nil
+}
+
+func (r *issueSQLRepositoryImpl) CountIssues(ctx context.Context, query string, filter types.IssueFilter) (int64, error) {
+	n, err := issueops.CountIssuesInTx(ctx, r.runner, query, filter)
+	if err != nil {
+		return 0, fmt.Errorf("db: IssueSQLRepository.CountIssues: %w", err)
+	}
+	return int64(n), nil
+}
+
+func (r *issueSQLRepositoryImpl) CountIssuesByGroup(ctx context.Context, filter types.IssueFilter, groupBy string) (map[string]int, error) {
+	out, err := issueops.CountIssuesByGroupInTx(ctx, r.runner, filter, groupBy)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.CountIssuesByGroup: %w", err)
+	}
+	return out, nil
+}
+
+func (r *issueSQLRepositoryImpl) History(ctx context.Context, id string) ([]*storage.HistoryEntry, error) {
+	out, err := issueops.HistoryInTx(ctx, r.runner, id)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.History: %w", err)
+	}
+	return out, nil
+}
+
+func (r *issueSQLRepositoryImpl) IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error) {
+	events, err := issueops.GetEventsInTx(ctx, r.runner, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.IterEvents: %w", err)
+	}
+	return storage.NewSliceIter(events), nil
+}
+
+func (r *issueSQLRepositoryImpl) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
+	out, err := issueops.GetStaleIssuesInTx(ctx, r.runner, filter)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.GetStaleIssues: %w", err)
+	}
+	return out, nil
+}
+
+func (r *issueSQLRepositoryImpl) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error) {
+	out, err := issueops.GetEpicsEligibleForClosureInTx(ctx, r.runner)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.GetEpicsEligibleForClosure: %w", err)
+	}
+	return out, nil
+}
+
+func (r *issueSQLRepositoryImpl) UnclaimIssue(ctx context.Context, id, actor string, force bool) error {
+	if err := issueops.UnclaimIssueInTx(ctx, r.runner, id, actor, force); err != nil {
+		return fmt.Errorf("db: IssueSQLRepository.UnclaimIssue: %w", err)
+	}
+	return nil
+}
+
+func (r *issueSQLRepositoryImpl) ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, actor string) ([]types.ReclaimedLease, error) {
+	cutoff := time.Now().UTC().Add(-olderThan)
+	out, err := issueops.ReclaimExpiredLeasesInTx(ctx, r.runner, cutoff, actor)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.ReclaimExpiredLeases: %w", err)
+	}
+	return out, nil
 }
 
 const deleteBatchSize = 200
