@@ -783,6 +783,12 @@ func (w WorkType) IsValid() bool {
 
 // Dependency represents a relationship between issues
 type Dependency struct {
+	// ID is the dependency row's deterministic surrogate primary key,
+	// depid.New(issue_id, target) — a UUIDv5 that is stable and globally unique
+	// across the durable and wisp dependency tables. Populated only by reads
+	// that select it (e.g. GetDependentRecords, which keysets on it); left empty
+	// by the source-keyed reads that never needed it.
+	ID          string         `json:"id,omitempty"`
 	IssueID     string         `json:"issue_id"`
 	DependsOnID string         `json:"depends_on_id"`
 	Type        DependencyType `json:"type"`
@@ -1066,6 +1072,7 @@ type EventType string
 const (
 	EventCreated           EventType = "created"
 	EventUpdated           EventType = "updated"
+	EventClaimed           EventType = "claimed"
 	EventStatusChanged     EventType = "status_changed"
 	EventCommented         EventType = "commented"
 	EventClosed            EventType = "closed"
@@ -1298,6 +1305,23 @@ type IssueFilter struct {
 	StartedAfter  *time.Time
 	StartedBefore *time.Time
 
+	// Keyset pagination over the (created_at DESC, id ASC) total order.
+	//
+	// When AfterCreatedAt != nil the query is restricted to rows strictly after
+	// the keyset position (AfterCreatedAt, AfterID) under that order — i.e.
+	// (created_at < AfterCreatedAt) OR (created_at = AfterCreatedAt AND id > AfterID).
+	// id is the primary key, so the tie-break is total: a same-second group
+	// larger than one page still pages completely with no dropped or duplicated
+	// row (unlike a created_at-only cursor, which loses same-second overflow).
+	// AfterID is meaningful only when AfterCreatedAt is set; "" starts the
+	// same-second group from its first id.
+	//
+	// This composes with every other filter (including CreatedBefore, which it
+	// does not replace). Pair it with SortBy="created", SortDesc=false so the
+	// ORDER BY is created_at DESC, id ASC — the order the predicate assumes.
+	AfterCreatedAt *time.Time
+	AfterID        string
+
 	// Empty/null checks
 	EmptyDescription bool
 	NoAssignee       bool
@@ -1315,6 +1339,12 @@ type IssueFilter struct {
 
 	// Pinned filtering
 	Pinned *bool // Filter by pinned flag (nil = any, true = only pinned, false = only non-pinned)
+
+	// Blocked filtering: the denormalized, transitive is_blocked column (direct ∨
+	// inherited parent-child ∨ waits-for gate), maintained by the write paths and
+	// index-backed by idx_issues_is_blocked(is_blocked, status). The projection
+	// column alone is not a filter; this optional predicate makes it one.
+	IsBlocked *bool // nil = any, true = only is_blocked, false = only unblocked
 
 	// Template filtering
 	IsTemplate *bool // Filter by template flag (nil = any, true = only templates, false = exclude templates)
