@@ -266,7 +266,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectDoltStatusRows(mock)
 	mock.ExpectQuery("(?s)SELECT t\\.TABLE_NAME\\s+FROM INFORMATION_SCHEMA\\.TABLES t").
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("schema_migrations"))
-	// DOLT_ADD and DOLT_COMMIT run through drainCall (QueryContext) so their
+	// DOLT_ADD and DOLT_COMMIT run through DrainCall (QueryContext) so their
 	// proc result sets are consumed on the pinned conn; mock them as queries.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('-f', ?)")).
 		WithArgs("schema_migrations").
@@ -320,7 +320,10 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 
 	expectIgnorePatternSeedNoop(mock)
 	// migrationWorkNeeded: main cursor behind -> work needed (short-circuits).
-	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	// Two behind, not one: 0061 is a pure version anchor (SELECT 1, touches no
+	// table), so the guard shape needs 0060 — which alters `issues` — among
+	// the pending migrations.
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-2)
 	// dirtyBeforeAll: `issues` dirty (working set only, not staged).
 	expectDoltStatusDirtyIssues(mock)
 	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
@@ -329,9 +332,9 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	// auxRekeyResumePending: no local_metadata table, no crashed rekey pass.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	// pendingMigrationDirtyTables: cursor read, then the pending latest
-	// migration's SQL touches `issues` -> DirtyTablesError.
-	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	// pendingMigrationDirtyTables: cursor read, then pending 0060's SQL
+	// touches `issues` -> DirtyTablesError.
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-2)
 }
 
 func expectDoltStatusDirtyIssues(mock sqlmock.Sqlmock) {
