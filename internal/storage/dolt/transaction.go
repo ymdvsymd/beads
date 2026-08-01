@@ -33,6 +33,7 @@ type doltTransaction struct {
 	// role: it deliberately drops wisp_* tables because they are dolt-ignored.
 	wroteRegularDep bool
 	wroteWispDep    bool
+	lifecycle       bool
 }
 
 func (t *doltTransaction) txFor(table string) *sql.Tx {
@@ -66,6 +67,31 @@ func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn f
 	return s.withRetry(ctx, func() error {
 		return s.runDoltTransaction(ctx, commitMsg, fn)
 	})
+}
+
+// RunInIssueLifecycleTransaction runs a lifecycle transition and its durable
+// side effects through one SQL transaction and one Dolt commit attempt.
+func (s *DoltStore) RunInIssueLifecycleTransaction(ctx context.Context, commitMsg string, fn func(tx storage.IssueLifecycleTransaction) error) error {
+	return s.withRetryTx(ctx, func(sqlTx *sql.Tx) error {
+		tx := &doltTransaction{regularTx: sqlTx, ignoredTx: sqlTx, store: s, lifecycle: true}
+		if err := fn(tx); err != nil {
+			return err
+		}
+		tables := tx.dirtyTableNames()
+		if len(tables) == 0 {
+			return nil
+		}
+		return s.doltAddAndCommitInTx(ctx, sqlTx, tables, commitMsg)
+	})
+}
+
+func (t *doltTransaction) dirtyTableNames() []string {
+	tables := make([]string, 0, len(t.dirty.DirtyTables()))
+	for table := range t.dirty.DirtyTables() {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
+	return tables
 }
 
 func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
@@ -650,10 +676,22 @@ func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates ma
 		}
 	}
 
-	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, t.txFor(table), id, updates, actor); err != nil {
+	update := issueops.UpdateIssueWithoutEventInTx
+	if t.lifecycle {
+		update = issueops.UpdateIssueInTx
+	}
+	result, err := update(ctx, t.txFor(table), id, updates, actor)
+	if err != nil {
 		return wrapExecError("update issue in tx", err)
 	}
+	if !result.Changed {
+		return nil
+	}
 	t.dirty.MarkDirty(table)
+	if t.lifecycle {
+		_, _, eventTable, _ := issueops.WispTableRouting(table == "wisps")
+		t.dirty.MarkDirty(eventTable)
+	}
 	return nil
 }
 
@@ -674,18 +712,48 @@ func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason stri
 	}
 	t.dirty.MarkDirty(table)
 	t.dirty.MarkDirty(eventTable)
+	if result.IssueRowsChanged {
+		t.dirty.MarkDirty("issues")
+	}
 	return nil
 }
 
-func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
-	table := "issues"
+// ReopenIssueWithResult reopens an issue within this transaction and reports
+// whether the lifecycle state changed.
+func (t *doltTransaction) ReopenIssueWithResult(ctx context.Context, id string, reason string, actor string) (bool, error) {
+	table, eventTable := "issues", "events"
 	if t.isActiveWisp(ctx, id) {
+		table, eventTable = "wisps", "wisp_events"
+	}
+	result, err := issueops.ReopenIssueInTx(ctx, t.txFor(table), id, reason, actor)
+	if err != nil {
+		return false, wrapExecError("reopen issue in tx", err)
+	}
+	if result.Changed {
+		t.dirty.MarkDirty(table)
+		t.dirty.MarkDirty(eventTable)
+		if result.IssueRowsChanged {
+			t.dirty.MarkDirty("issues")
+		}
+	}
+	return result.Changed, nil
+}
+
+func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
+	isWisp := t.isActiveWisp(ctx, id)
+	table := "issues"
+	if isWisp {
 		table = "wisps"
 	}
 	if err := issueops.DeleteIssueInTx(ctx, t.txFor(table), id); err != nil {
 		return wrapExecError("delete issue in tx", err)
 	}
-	t.dirty.MarkDirty(table)
+	// Mark every table the ON DELETE CASCADE fans out to, not just the row's
+	// own table: the cascaded deletions are invisible to the SQL we issue, so
+	// staging only `issues` leaves them uncommitted in the working set.
+	for _, cascaded := range issueops.DeleteCascadeTables(isWisp) {
+		t.dirty.MarkDirty(cascaded)
+	}
 	return nil
 }
 
