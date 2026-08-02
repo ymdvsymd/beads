@@ -31,6 +31,18 @@ func TestIssueOperationsUpdateClosePolicy(t *testing.T) {
 	conformance.RunIssueOperationsUpdateClosePolicy(t, ctx, fixture)
 }
 
+func TestIssueOperationsUpdateAssigneeTransferFence(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateAssigneeTransferFence(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateClosedFieldsMatchClose(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateClosedFieldsMatchClose(t, ctx, fixture)
+}
+
 func newDoltIssueOperationsFixture(t *testing.T) (conformance.IssueOperationsStagingFixture, context.Context, func()) {
 	t.Helper()
 	store, storeCleanup := setupTestStore(t)
@@ -46,6 +58,7 @@ func newDoltIssueOperationsFixture(t *testing.T) (conformance.IssueOperationsSta
 		Operations:  operations,
 		CreateIssue: store.CreateIssue,
 		SetConfig:   store.SetConfig,
+		UpdateRaw:   store.UpdateIssue,
 		QueryScalar: func(ctx context.Context, query string, args []any, dest ...any) error {
 			return store.db.QueryRowContext(ctx, query, args...).Scan(dest...)
 		},

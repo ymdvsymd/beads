@@ -31,6 +31,16 @@ func TestIssueOperationsUpdateClosePolicy(t *testing.T) {
 	conformance.RunIssueOperationsUpdateClosePolicy(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsUpdateAssigneeTransferFence(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateAssigneeTransferFence(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateClosedFieldsMatchClose(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateClosedFieldsMatchClose(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance.IssueOperationsStagingFixture {
 	t.Helper()
 	operations, provider := newRealIssueOperationsWithProvider(t, ctx)
@@ -51,6 +61,11 @@ func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance
 		SetConfig: func(ctx context.Context, key, value string) error {
 			return RunTx(ctx, provider, func(ctx context.Context, uw UnitOfWork) (string, error) {
 				return "set " + key, uw.ConfigUseCase().SetConfig(ctx, key, value)
+			})
+		},
+		UpdateRaw: func(ctx context.Context, id string, updates map[string]any, actor string) error {
+			return RunTx(ctx, provider, func(ctx context.Context, uw UnitOfWork) (string, error) {
+				return "raw update " + id, uw.IssueUseCase().UpdateIssue(ctx, id, updates, actor)
 			})
 		},
 		QueryScalar: func(ctx context.Context, query string, args []any, dest ...any) error {
