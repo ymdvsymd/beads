@@ -214,7 +214,7 @@ func addDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	//nolint:gosec // G201: sourceTable is from WispTableRouting ("issues" or "wisps")
 	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT issue_type FROM %s WHERE id = ?`, sourceTable), dep.IssueID).Scan(&sourceType); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, fmt.Errorf("issue %s not found", dep.IssueID)
+			return false, MissingDependencySource(dep.IssueID, dep.DependsOnID)
 		}
 		return false, fmt.Errorf("failed to check issue existence: %w", err)
 	}
@@ -229,7 +229,7 @@ func addDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		//nolint:gosec // G201: targetTable is from WispTableRouting ("issues" or "wisps")
 		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT issue_type FROM %s WHERE id = ?`, targetTable), dep.DependsOnID).Scan(&targetType); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return false, fmt.Errorf("issue %s not found", dep.DependsOnID)
+				return false, MissingDependencyTarget(dep.IssueID, dep.DependsOnID)
 			}
 			return false, fmt.Errorf("failed to check target issue existence: %w", err)
 		}
@@ -290,7 +290,7 @@ func addDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	//nolint:gosec // G201: writeTable from WispTableRouting; targetCol from DepTargetKind.Column()
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (id, issue_id, %s, type, created_at, created_by, metadata, thread_id)
-		VALUES (?, ?, ?, ?, NOW(), ?, ?, ?)
+		VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?, ?)
 	`, writeTable, targetCol), depid.New(dep.IssueID, dep.DependsOnID), dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
 		return false, fmt.Errorf("failed to add dependency: %w", err)
 	}

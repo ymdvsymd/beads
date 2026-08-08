@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/issueops"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 func TestRegistered(t *testing.T) {
@@ -663,6 +664,9 @@ func (s *configStore) Counter() (issueops.Counter, error) {
 func (s *configStore) WorkspaceConfig() (issueops.WorkspaceConfig, error) {
 	return nil, &storage.ErrUnsupported{Op: "WorkspaceConfig", Backend: "jira-config-stub"}
 }
+func (s *configStore) Memories() (memoryops.Memories, error) {
+	return nil, &storage.ErrUnsupported{Op: "Memories", Backend: "jira-config-stub"}
+}
 func (s *configStore) StatsReporter() (issueops.StatsReporter, error) {
 	return nil, &storage.ErrUnsupported{Op: "StatsReporter", Backend: "jira-config-stub"}
 }
@@ -884,6 +888,16 @@ func (s *configStore) IterWisps(_ context.Context, _ types.WispFilter) (storage.
 }
 
 func (s *configStore) Close() error { return nil }
+
+func (s *configStore) RecordProvenanceEvent(_ context.Context, _ types.ProvenanceEvent) (string, bool, error) {
+	return "", false, nil
+}
+func (s *configStore) GetProvenanceEvents(_ context.Context, _, _ string) ([]types.ProvenanceEvent, error) {
+	return nil, nil
+}
+func (s *configStore) GetProvenanceByRef(_ context.Context, _ string) ([]types.ProvenanceEvent, error) {
+	return nil, nil
+}
 
 func TestFetchIssuesIncludesPullJQLInQuery(t *testing.T) {
 	var capturedJQL string

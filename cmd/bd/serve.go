@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/contextinfo"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/issueops"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // serveCmdName is the command name, shared with the root command's post-run
@@ -179,6 +180,7 @@ func runServe() error {
 			AllowNonLoopback:  serveAllowNonLoopback,
 			Reader:            roles.reader,
 			Claimer:           roles.claimer,
+			Lifecycle:         roles.lifecycle,
 			Settings:          roles.settings,
 			Stats:             roles.stats,
 			CycleDetector:     roles.cycles,
@@ -190,6 +192,8 @@ func runServe() error {
 			Sweeper:           roles.sweeper,
 			Deleter:           roles.deleter,
 			BatchCreator:      roles.batchCreator,
+			DependencyEditor:  roles.dependencyEditor,
+			Memories:          roles.memories,
 			Workspace:         info,
 			SchemaVersion:     JSONSchemaVersion,
 			Mode:              serveResolvedMode(info, db),
@@ -432,6 +436,7 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 	for _, b := range []binding{
 		{"issue reader", func() (err error) { roles.reader, err = src.IssueReader(); return }},
 		{"issue claimer", func() (err error) { roles.claimer, err = src.IssueClaimer(); return }},
+		{"issue lifecycle", func() (err error) { roles.lifecycle, err = src.IssueLifecycle(); return }},
 		{"workspace config", func() (err error) { roles.settings, err = src.WorkspaceConfig(); return }},
 		{"stats reporter", func() (err error) { roles.stats, err = src.StatsReporter(); return }},
 		{"cycle detector", func() (err error) { roles.cycles, err = src.CycleDetector(); return }},
@@ -443,6 +448,8 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 		{"sweeper", func() (err error) { roles.sweeper, err = src.Sweeper(); return }},
 		{"deleter", func() (err error) { roles.deleter, err = src.Deleter(); return }},
 		{"batch creator", func() (err error) { roles.batchCreator, err = src.BatchCreator(); return }},
+		{"dependency editor", func() (err error) { roles.dependencyEditor, err = src.DependencyEditor(); return }},
+		{"memories", func() (err error) { roles.memories, err = src.Memories(); return }},
 	} {
 		if err := b.get(); err != nil {
 			return serveRoles{}, fmt.Errorf("%s: %w", b.name, err)
@@ -458,6 +465,7 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 type serveRoles struct {
 	reader       issueops.Reader
 	claimer      issueops.Claimer
+	lifecycle    issueops.Lifecycle
 	settings     issueops.WorkspaceConfig
 	stats        issueops.StatsReporter
 	cycles       issueops.CycleDetector
@@ -469,6 +477,15 @@ type serveRoles struct {
 	sweeper      issueops.Sweeper
 	deleter      issueops.Deleter
 	batchCreator issueops.BatchCreator
+	// dependencyEditor is the second role here whose accessor recurses through
+	// the hook decorator, so taking it off the peeled store is not optional:
+	// HookFiringStore.DependencyEditor fires the workspace's update hook per
+	// edited source issue, and this server documents that hooks do not fire.
+	dependencyEditor issueops.DependencyEditor
+	// memories is the one role here that is not an issueops role: the memory
+	// plane is user data riding in the config table under its own merge class,
+	// so it has its own leaf package.
+	memories memoryops.Memories
 }
 
 // serveResolvedMode labels the topology for the startup log line. Cosmetic —

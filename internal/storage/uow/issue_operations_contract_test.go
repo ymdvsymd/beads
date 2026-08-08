@@ -32,6 +32,16 @@ func TestIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	conformance.RunIssueOperationsCreateInheritsParentLabels(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsCreateRefusesAForeignIDPrefix(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateRefusesAForeignIDPrefix(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func TestIssueOperationsUpdateFoldsMetadataIntoOneEvent(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsUpdateFoldsMetadataIntoOneEvent(t, ctx, newUOWIssueOperationsFixture(t, ctx))
@@ -110,6 +120,26 @@ func TestIssueOperationsUpdateProvenanceLabelsHistory(t *testing.T) {
 func TestIssueOperationsUpdatePersistentPreservesUnversionedClass(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsUpdatePersistentPreservesUnversionedClass(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
 func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance.IssueOperationsStagingFixture {

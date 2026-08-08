@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/issueops"
+	"github.com/steveyegge/beads/memoryops"
 )
 
 // These tests cover the OTHER database source: a backend whose facade is a
@@ -251,6 +253,143 @@ func (c *roleBatchCreator) createRequests() []issueops.CreateBatchRequest {
 	return append([]issueops.CreateBatchRequest(nil), c.requests...)
 }
 
+// roleDependencyEditor is the store-shaped source's graph-write role.
+//
+// It records the request each method was handed, because what is worth
+// asserting at this seam is that the WIRE's members reach the role unrewritten.
+// The graph rules themselves — the cycle gate, the hierarchy refusal, the type
+// conflict, the endpoint existence checks — belong to the conformance contract
+// over DependencyEditor, and the handler tests drive them by handing this fake
+// the typed error the role would have raised.
+type roleDependencyEditor struct {
+	addErr    error
+	removed   bool
+	removeErr error
+
+	mu      sync.Mutex
+	adds    []issueops.AddDependenciesRequest
+	removes []issueops.RemoveDependencyRequest
+}
+
+func (e *roleDependencyEditor) AddDependencies(_ context.Context, req issueops.AddDependenciesRequest) (issueops.AddDependenciesResult, error) {
+	e.mu.Lock()
+	e.adds = append(e.adds, req)
+	e.mu.Unlock()
+	if e.addErr != nil {
+		return issueops.AddDependenciesResult{}, e.addErr
+	}
+	// The role's own echo: all-or-nothing means it is either every requested
+	// edge or the call failed.
+	return issueops.AddDependenciesResult{Added: slices.Clone(req.Edges)}, nil
+}
+
+func (e *roleDependencyEditor) RemoveDependency(_ context.Context, req issueops.RemoveDependencyRequest) (issueops.RemoveDependencyResult, error) {
+	e.mu.Lock()
+	e.removes = append(e.removes, req)
+	e.mu.Unlock()
+	if e.removeErr != nil {
+		return issueops.RemoveDependencyResult{}, e.removeErr
+	}
+	return issueops.RemoveDependencyResult{Removed: e.removed}, nil
+}
+
+func (e *roleDependencyEditor) addRequests() []issueops.AddDependenciesRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]issueops.AddDependenciesRequest(nil), e.adds...)
+}
+
+func (e *roleDependencyEditor) removeRequests() []issueops.RemoveDependencyRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]issueops.RemoveDependencyRequest(nil), e.removes...)
+}
+
+// roleMemories is the store-shaped source's persistent-memory role — the one
+// role of the set that is not an issueops role.
+//
+// It records the request each method was handed, because what is worth
+// asserting at this seam is that the WIRE's parameters reach the role
+// unrewritten: the key derivation, the search folding and the plane filtering
+// all belong to the conformance contract, not to a handler test.
+type roleMemories struct {
+	remembered memoryops.RememberResult
+	recalled   memoryops.RecallResult
+	forgotten  memoryops.ForgetResult
+	listed     memoryops.ListResult
+	err        error
+
+	mu       sync.Mutex
+	remember []memoryops.RememberRequest
+	recall   []memoryops.RecallRequest
+	forget   []memoryops.ForgetRequest
+	list     []memoryops.ListRequest
+}
+
+func (m *roleMemories) Remember(_ context.Context, req memoryops.RememberRequest) (memoryops.RememberResult, error) {
+	m.mu.Lock()
+	m.remember = append(m.remember, req)
+	m.mu.Unlock()
+	if m.err != nil {
+		return memoryops.RememberResult{}, m.err
+	}
+	return m.remembered, nil
+}
+
+func (m *roleMemories) Recall(_ context.Context, req memoryops.RecallRequest) (memoryops.RecallResult, error) {
+	m.mu.Lock()
+	m.recall = append(m.recall, req)
+	m.mu.Unlock()
+	if m.err != nil {
+		return memoryops.RecallResult{}, m.err
+	}
+	return m.recalled, nil
+}
+
+func (m *roleMemories) Forget(_ context.Context, req memoryops.ForgetRequest) (memoryops.ForgetResult, error) {
+	m.mu.Lock()
+	m.forget = append(m.forget, req)
+	m.mu.Unlock()
+	if m.err != nil {
+		return memoryops.ForgetResult{}, m.err
+	}
+	return m.forgotten, nil
+}
+
+func (m *roleMemories) List(_ context.Context, req memoryops.ListRequest) (memoryops.ListResult, error) {
+	m.mu.Lock()
+	m.list = append(m.list, req)
+	m.mu.Unlock()
+	if m.err != nil {
+		return memoryops.ListResult{}, m.err
+	}
+	return m.listed, nil
+}
+
+func (m *roleMemories) rememberRequests() []memoryops.RememberRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]memoryops.RememberRequest(nil), m.remember...)
+}
+
+func (m *roleMemories) recallRequests() []memoryops.RecallRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]memoryops.RecallRequest(nil), m.recall...)
+}
+
+func (m *roleMemories) forgetRequests() []memoryops.ForgetRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]memoryops.ForgetRequest(nil), m.forget...)
+}
+
+func (m *roleMemories) listRequests() []memoryops.ListRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]memoryops.ListRequest(nil), m.list...)
+}
+
 type roleClaimer struct {
 	result issueops.ClaimResult
 	err    error
@@ -273,6 +412,84 @@ func (c *roleClaimer) claimRequests() []issueops.ClaimRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]issueops.ClaimRequest(nil), c.claims...)
+}
+
+// roleLifecycle is the store-shaped source's guarded-mutation role. Every case
+// hands Listen a COMPLETE source, so this exists partly to be a placeholder —
+// but the close tests drive it directly, which is what the claim precedent
+// calls the wire edge on a fake role: the path split, the media type, the body
+// rules and the problem shapes, with the transaction and the policy left to the
+// integration test against real Dolt.
+type roleLifecycle struct {
+	closeResult  issueops.CloseResult
+	closeErr     error
+	reopenResult issueops.ReopenResult
+	reopenErr    error
+	updateResult issueops.UpdateResult
+	updateErr    error
+
+	mu      sync.Mutex
+	closes  []issueops.CloseRequest
+	reopens []issueops.ReopenRequest
+	updates []issueops.UpdateRequest
+}
+
+func (l *roleLifecycle) Create(_ context.Context, _ issueops.CreateRequest) (issueops.CreateResult, error) {
+	return issueops.CreateResult{}, errors.New("create is not published on this surface")
+}
+
+func (l *roleLifecycle) Update(_ context.Context, req issueops.UpdateRequest) (issueops.UpdateResult, error) {
+	l.mu.Lock()
+	l.updates = append(l.updates, req)
+	l.mu.Unlock()
+	if l.updateErr != nil {
+		return issueops.UpdateResult{}, l.updateErr
+	}
+	return l.updateResult, nil
+}
+
+// updateRequests is closeRequests' twin, and the one the patch tests read the
+// whole projection off: an empty list means nothing reached the role.
+func (l *roleLifecycle) updateRequests() []issueops.UpdateRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]issueops.UpdateRequest(nil), l.updates...)
+}
+
+func (l *roleLifecycle) Close(_ context.Context, req issueops.CloseRequest) (issueops.CloseResult, error) {
+	l.mu.Lock()
+	l.closes = append(l.closes, req)
+	l.mu.Unlock()
+	if l.closeErr != nil {
+		return issueops.CloseResult{}, l.closeErr
+	}
+	return l.closeResult, nil
+}
+
+func (l *roleLifecycle) Reopen(_ context.Context, req issueops.ReopenRequest) (issueops.ReopenResult, error) {
+	l.mu.Lock()
+	l.reopens = append(l.reopens, req)
+	l.mu.Unlock()
+	if l.reopenErr != nil {
+		return issueops.ReopenResult{}, l.reopenErr
+	}
+	return l.reopenResult, nil
+}
+
+// reopenRequests is closeRequests' twin: an empty list means nothing reached
+// the role.
+func (l *roleLifecycle) reopenRequests() []issueops.ReopenRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]issueops.ReopenRequest(nil), l.reopens...)
+}
+
+// closeRequests is how a case asserts that a refusal happened at the wire edge:
+// an empty list means nothing reached the role.
+func (l *roleLifecycle) closeRequests() []issueops.CloseRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]issueops.CloseRequest(nil), l.closes...)
 }
 
 type roleSettings struct {
@@ -369,6 +586,9 @@ func rolesConfig(cfg Config) Config {
 	if cfg.Claimer == nil {
 		cfg.Claimer = &roleClaimer{}
 	}
+	if cfg.Lifecycle == nil {
+		cfg.Lifecycle = &roleLifecycle{}
+	}
 	if cfg.Settings == nil {
 		cfg.Settings = &roleSettings{}
 	}
@@ -401,6 +621,12 @@ func rolesConfig(cfg Config) Config {
 	}
 	if cfg.BatchCreator == nil {
 		cfg.BatchCreator = &roleBatchCreator{}
+	}
+	if cfg.DependencyEditor == nil {
+		cfg.DependencyEditor = &roleDependencyEditor{}
+	}
+	if cfg.Memories == nil {
+		cfg.Memories = &roleMemories{}
 	}
 	return cfg
 }
@@ -503,9 +729,9 @@ func countedPage() []*types.IssueWithCounts {
 //
 // The two refusals are different mistakes and must stay distinguishable. A
 // PARTIAL set is the dangerous one: a Config carrying a reader and no claimer
-// would bind, answer every read, and fail the one write on this surface with a
-// nil dereference — at claim time, in a handler, on a live server. Each role an
-// operation reaches has a row below for that reason.
+// would bind, answer every read, and fail every claim with a nil dereference —
+// at claim time, in a handler, on a live server. Each role an operation reaches
+// has a row below for that reason.
 func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -645,6 +871,25 @@ func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 		{
 			name:    "a provider and a batch creator",
 			cfg:     Config{Provider: &fakeProvider{}, BatchCreator: &roleBatchCreator{}},
+			wantErr: "exactly one database source",
+		},
+		{
+			// The role that is not an issueops role. It is in the same
+			// all-or-nothing set for the same reason: without it the server
+			// binds, advertises the memory operations, and nil-dereferences on
+			// the first request that reaches one.
+			name:    "no memories role",
+			cfg:     rolesConfigWithout(func(c *Config) { c.Memories = nil }),
+			wantErr: "no database source",
+		},
+		{
+			name:    "a memories role alone",
+			cfg:     Config{Memories: &roleMemories{}},
+			wantErr: "no database source",
+		},
+		{
+			name:    "a provider and a memories role",
+			cfg:     Config{Provider: &fakeProvider{}, Memories: &roleMemories{}},
 			wantErr: "exactly one database source",
 		},
 		{

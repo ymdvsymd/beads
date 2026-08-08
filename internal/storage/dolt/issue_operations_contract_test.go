@@ -31,10 +31,22 @@ func TestIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	conformance.RunIssueOperationsCreateInheritsParentLabels(t, ctx, fixture)
 }
 
+func TestIssueOperationsCreateRefusesAForeignIDPrefix(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsCreateRefusesAForeignIDPrefix(t, ctx, fixture)
+}
+
 func TestIssueOperationsUpdateFoldsMetadataIntoOneEvent(t *testing.T) {
 	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
 	defer cleanup()
 	conformance.RunIssueOperationsUpdateFoldsMetadataIntoOneEvent(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t, ctx, fixture)
 }
 
 func TestIssueOperationsUpdateClosePolicy(t *testing.T) {
@@ -125,6 +137,30 @@ func TestIssueOperationsUpdatePersistentPreservesUnversionedClass(t *testing.T) 
 	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
 	defer cleanup()
 	conformance.RunIssueOperationsUpdatePersistentPreservesUnversionedClass(t, ctx, fixture)
+}
+
+func TestIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t, ctx, fixture)
 }
 
 func newDoltIssueOperationsFixture(t *testing.T) (conformance.IssueOperationsStagingFixture, context.Context, func()) {

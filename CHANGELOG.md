@@ -7,7 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`bd serve` grows the write half of the agent loop** (v0 wire surface,
+  [#5410](https://github.com/gastownhall/beads/pull/5410),
+  [#5417](https://github.com/gastownhall/beads/pull/5417),
+  [#5422](https://github.com/gastownhall/beads/pull/5422),
+  [#5423](https://github.com/gastownhall/beads/pull/5423),
+  [#5429](https://github.com/gastownhall/beads/pull/5429)). v0 shipped with one
+  mutation, the claim, which meant an HTTP client could take work and had to
+  fork a `bd` subprocess to finish it. Five operations close that loop:
+
+  - `POST /v0/beads/issues/{id}:close` and `POST /v0/beads/issues/{id}:reopen`
+    — the two halves of the lifecycle move. Both are idempotent, and both say
+    so in the body rather than in a status: a close of a closed issue answers
+    `200` with `already_closed: true`, a reopen of an open one
+    `already_open: true`, and each still carries the row.
+  - `PATCH /v0/beads/issues/{id}` — partial update of one issue. The `patch`
+    object publishes thirteen members; four of them (`estimated_minutes`,
+    `external_ref`, `due_at`, `defer_until`) are nullable, and an explicit
+    `null` CLEARS them. That set is closed and machine-checked against the
+    document, so a `null` on any other member is a `400` rather than an
+    unannounced clear. A patch that changes nothing answers `200` with
+    `changed: false`.
+  - `POST /v0/beads/dependencies:add` — up to 100 edges per request, asserted
+    all or none, echoed back in request order. A refusal names the offending
+    edge as `edges[i].member`, so a client learns which edge and which member
+    rather than that something in the batch was wrong.
+  - `POST /v0/beads/dependencies:remove` — removes exactly the edge the body
+    names. Idempotent at the role: an edge that is not there is
+    `removed: false` with a `200`, never a 404, so a replayed teardown does not
+    have to classify an error to discover it already ran.
+
+  **Every one of them carries the claim's posture, unchanged.** The `actor` is
+  caller-asserted provenance for the audit trail and not authenticated
+  identity; hooks do not fire; the per-command auto-commit machinery does not
+  run. The only durable effect is the single storage commit the role makes
+  inside its own transaction, so durability is per request on every write, not
+  just the claim.
+
+  **Three codes join the frozen error vocabulary**, all 409 and all typed so a
+  client never has to substring-match a message. `not_closable` is close policy
+  refusing an unforced close of an issue with open children or a live blocker.
+  `dependency_exists` is the pair that already carries an edge of a DIFFERENT
+  type, and carries `existing_type` and `requested_type`. `dependency_cycle`
+  covers both never-makes-progress refusals: the plain scheduling cycle, and a
+  blocking edge against the issue's own ancestor or descendant — the second
+  carries `issue_id`, `blocker_id` and `blocker_is_ancestor`, and their ABSENCE
+  is what tells a client which of the two it got. Every extension member is
+  read off the refusing transaction's own typed error; the hierarchy members
+  have no other source, since the conflicting edge may exist only inside the
+  batch that was rolled back. An edge naming an endpoint this database can see
+  the absence of is a `400` on `edges[i].issue_id` or `edges[i].depends_on_id`,
+  not a 404: the request BODY is what is wrong, and there is no path id to have
+  missed.
+
+  **`GET /v0/beads/issues/{id}` takes two new parameters.**
+  `include_comments` populates `comments` with the full comment bodies and
+  `include_dependents` populates `dependents` with the issues that depend on
+  this one, each carrying its edge type. Both default to false, because both
+  are extra reads nobody should pay for by accident — and when a caller does
+  not ask, `comment_count`, `dependent_count` and `comments_omitted` still
+  report what was left out, so an absent `comments` is never ambiguous between
+  "no comments" and "not included in this response". A malformed boolean is
+  this operation's own `400 invalid_argument` / `reason: "invalid_value"`,
+  which is deliberately not the `unknown_parameter` a client should read as
+  version skew.
+
+  `GET /v0/beads/context` advertises `issues.close`, `issues.reopen`,
+  `issues.update`, `dependencies.add` and `dependencies.remove` alongside the
+  rest — derived from the registered handlers as always, so probing
+  `capabilities` remains the way to ask one server what it can do.
+
+- **The two dependency-endpoint refusals now carry an identity** (bd-yby99.9).
+  `DependencyEditor.AddDependencies` refuses an edge whose SOURCE names no row,
+  and one whose TARGET names no row this database can see the absence of. Both
+  were "an error" and nothing more — not the same error text on every backend,
+  and impossible to tell apart from an infrastructure failure — which left the
+  role's typed-refusal vocabulary with a hole every other refusal it can raise
+  had already filled. They are now `errors.Is`-matchable as
+  `ErrDependencySourceNotFound` and `ErrDependencyTargetNotFound`, carried by a
+  `*DependencyEndpointNotFoundError` naming the refused edge and which of its
+  endpoints was absent, all three re-exported from the root package beside the
+  conflict types. What is NOT refused is unchanged: an `external:` reference
+  and another repository's id are still accepted as external targets.
+
+  The user-facing message is byte-identical on the embedded and store paths
+  (`issue <id> not found`), and the proxied-server path now renders that
+  message too instead of a raw foreign-key violation — the endpoint is
+  classified from the refusing transaction rather than parsed out of the
+  driver's prose, so the two plumbings agree on the text as well as the type.
+  The shared `DependencyEditor` contract asserts the sentinel and the typed
+  fields for each endpoint, alone in a request and mid-batch, with the
+  mid-batch half reading the graph back at zero edges. `RemoveDependency` is
+  unaffected: a removal that finds no edge is a success, not a refusal.
+
+### Changed
+
+- **`bd search` now includes closed issues by default** (bd-t5yex). The
+  dominant real-world search query is "was this already found/filed/fixed?" —
+  exactly the query where silently excluding closed issues produced a false
+  "no" (downstream repos grew shell wrappers purely to undo the old default).
+  `bd list` keeps its open-only default. Narrow explicitly with `--status open`
+  (or any status list) where the old behavior is wanted; `--status all` still
+  works and is now redundant. Applies to both the embedded and proxied-server
+  paths.
+
+  Two consequences to know: matches beyond `--limit` (default 50) are dropped
+  under a status-blind sort (priority, then created), so a broad query on a
+  large DB can now fill the page with closed matches and silently drop open
+  ones — use `--status open` or raise `--limit` when hunting live work. And
+  `bd query` (plus the HTTP `q=` endpoint) deliberately keeps its closed-
+  exclusion default with opt-in `--all`; only `bd search` changed.
+
 ### Fixed
+
+- **`--dolt-auto-commit batch`/`off` now actually defer version commits in
+  SQL-server mode** (bd-4wamg). The mode was silently inert there: the CLI's
+  auto-commit policy was embedded-only, and the storage layer minted one Dolt
+  commit inside every write transaction regardless — measured at one commit
+  per write through all five configuration paths (flag, config.yaml, env,
+  `bd config set`, no-daemon). The write verbs now thread the batch/off
+  deferral to the storage layer's commit sites, which leave writes in the
+  working set for an explicit commit point (`bd dolt commit`), in server and
+  embedded mode alike. The server-mode **default** changes spelling, not
+  behavior: it used to resolve to `off` (while behaving like `on`); it now
+  resolves to `on`, naming what a default server-mode write has always done.
+  The `--dolt-auto-commit` help also stops claiming `Default: off`. On a
+  shared server, staging is table-level, so an `on`-mode writer's commit may
+  sweep up another client's deferred rows — deferral bounds who *creates*
+  commits, not commit contents.
+
+  Scope: embedded and direct SQL-server modes. Proxied-server routes never
+  apply auto-commit policy (they short-circuit before it resolves), so
+  batch/off remain inert there — tracked as a follow-up. A deployment that
+  had explicitly configured `dolt.auto-commit: off` from the old help text
+  note: in server mode that was behaving like `on`; it now genuinely stops
+  minting version commits until an explicit `bd dolt commit`.
+
+- **The no-ID "last touched issue" fallback on `bd update` / `bd close` is
+  now interactive-only** (bd-m00pb,
+  [#4839](https://github.com/gastownhall/beads/pull/4839)).
+  Previously a scripted `bd update $ID ...` with an accidentally empty `$ID`
+  silently mutated whatever issue was touched last — a real agent session
+  corrupted an unrelated closed bead this way. The missing-ID refusal happens
+  in argument validation, before any store open, migration, or auto-import
+  side effect. The fallback now requires stdin to be a terminal;
+  `BD_NON_INTERACTIVE=1` and `CI=1/true` also disable it. Scripts that
+  intentionally relied on it can set `BD_LAST_TOUCHED_FALLBACK=1` (or `=0` to
+  disable the fallback everywhere). Explicit IDs and `bd show --current` are
+  unaffected.
+
+- **A dated defer now means what it says: the issue returns to the ready front
+  when the date passes** (bd-i8qx8). `bd defer --until` and `bd update --defer`
+  set `status=deferred` plus a `defer_until` timestamp, but nothing ever
+  flipped the status back — so an expired defer stayed invisible to `bd ready`
+  forever until a human ran `bd undefer`. One deployment measured 241 issues
+  (including P1s) silently dark this way, regenerating daily from
+  correct-looking automation.
+
+  Ready-front reads and claims (`bd ready`, `bd ready --claim`, `bd list
+  --ready`, and the serve/proxied Reader roles) now run a lazy wake sweep
+  first: every issue (and wisp) with `status=deferred` and `defer_until <=
+  now` flips to `status=open, defer_until=NULL` — byte-identical to what `bd
+  undefer` writes, so a later dateless re-defer cannot inherit a stale past
+  date. Each wake records a `status_changed` event (actor `bd-defer-wake`).
+
+  What does NOT change: a **dateless** defer (`bd defer` with no `--until`,
+  `defer_until` NULL) is the indefinite icebox and never auto-wakes — `bd
+  undefer` remains its only exit. The sweep is a no-op when nothing has
+  expired (no dolt commit is minted), advisory by contract (a ready listing
+  never fails because the sweep could not run — strict `--readonly` skips it),
+  and identical in embedded, server, and proxied-server modes.
 
 - **`bd delete --cascade` no longer marks LIVE issues as deleted in other
   issues' text** (bd-x82so). When the deletion named a wisp, the set used to
@@ -211,6 +382,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a defaulted host and served the wrong database.
 
 ### Changed
+
+- **BREAKING: `bd config list` and `GET /v0/beads/config` no longer enumerate
+  the `kv.` plane, which is where `bd remember` memories live.** Memories and
+  generic `bd kv` values are stored as config rows under `kv.` — user data
+  riding in the settings table because there is one table, not because they are
+  settings — and both doors onto the settings plane were listing them with
+  their values. On the HTTP door that meant an unauthenticated
+  `GET /v0/beads/config` handed every stored memory to anything that could
+  reach the port, and the surface's redaction is no defence there: it decides
+  on the KEY name, while a memory's content is in the VALUE, so a memory
+  containing a credential under an innocuous slug was served verbatim.
+
+  The exclusion is in the shared role both doors call, not in the HTTP handler,
+  so the CLI and the API cannot drift apart on what a setting is. The whole
+  `kv.` prefix goes, not just `kv.memory.`.
+
+  **What still works:** `bd memories`, `bd recall` and `bd kv list` are
+  unaffected — they read the store directly and are the purpose-built views
+  over those rows. So are `bd prime`'s memory injection and export's memory
+  extraction. Point access is unchanged and deliberately so: `bd config get
+  kv.foo` and `GET /v0/beads/config/kv.foo` still answer a key named exactly,
+  and `bd config set` / `bd config unset` still write and remove one. The
+  enumeration was what made a memory discoverable; naming one you already know
+  is a different question, and refusing it would take away the escape hatch of
+  removing a wedged memory through `bd config unset`.
+
+  **What breaks:** a script parsing `bd config list` or its `--json` output for
+  `kv.` rows. Generic `kv.` rows have no other HTTP view today.
 
 - **BREAKING: `bd --readonly serve` is now refused instead of binding a server
   that cannot do what it advertises.** On a Dolt SQL-server workspace this
@@ -1603,6 +1802,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wisps and embedded mode are unchanged. New metrics
   `bd.claim_verify_lost_total` and `bd.claim_verify_recovered_total` count
   loud failures and converted outcomes.
+
+- **Single-issue `bd create --id P.N` no longer leaves `child_counters` stale**
+  (one root cause of [#4750](https://github.com/gastownhall/beads/issues/4750);
+  the issue stays open — three other drift paths remain). `CreateIssueInTxWithResult`
+  only reconciled `child_counters` when the batch path called
+  `ReconcileChildCounters`; an explicit hierarchical `--id` never advanced the
+  parent's `last_child` high-water mark. Once such children were later
+  archived out of `issues`, `GetNextChildIDTx` no longer saw them and could
+  re-mint an already-used suffix — an ID collision with an archived issue.
+  The single-issue path now calls `ReconcileChildCounters` too, and its
+  changed tables are merged into the result so the reconcile actually gets
+  staged for commit.
 
 ## [1.1.2] - 2026-07-26
 

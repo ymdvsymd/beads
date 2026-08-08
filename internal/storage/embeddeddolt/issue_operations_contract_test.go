@@ -31,6 +31,20 @@ func TestEmbeddedIssueOperationsCreateRefusesAnOccupiedID(t *testing.T) {
 	conformance.RunIssueOperationsCreateRefusesAnOccupiedID(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "occupied"))
 }
 
+func TestEmbeddedIssueOperationsCreateRefusesAForeignIDPrefix(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "foreignpfx")
+	ctx := t.Context()
+	conformance.RunIssueOperationsCreateRefusesAForeignIDPrefix(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "foreignpfx"))
+}
+
+func TestEmbeddedIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "metaorder")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "metaorder"))
+}
+
 func TestEmbeddedIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	te := newTestEnv(t, "inherit")
@@ -148,6 +162,34 @@ func TestEmbeddedIssueOperationsUpdatePersistentPreservesUnversionedClass(t *tes
 	te := newTestEnv(t, "unversioned")
 	ctx := t.Context()
 	conformance.RunIssueOperationsUpdatePersistentPreservesUnversionedClass(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "unversioned"))
+}
+
+func TestEmbeddedIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "createsurface")
+	ctx := t.Context()
+	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "createsurface"))
+}
+
+func TestEmbeddedIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "scalarsurface")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "scalarsurface"))
+}
+
+func TestEmbeddedIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "typevocab")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "typevocab"))
+}
+
+func TestEmbeddedIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "claimrestore")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "claimrestore"))
 }
 
 func newEmbeddedIssueOperationsFixture(t *testing.T, ctx context.Context, te *testEnv, prefix string) conformance.IssueOperationsStagingFixture {

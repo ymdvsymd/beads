@@ -865,6 +865,7 @@ var doltMetrics struct {
 	poolWaitMs           metric.Float64Histogram
 	claimVerifyLost      metric.Int64Counter
 	claimVerifyRecovered metric.Int64Counter
+	ignoredTxFreshPool   metric.Int64Counter
 }
 
 func init() {
@@ -912,6 +913,10 @@ func init() {
 	doltMetrics.claimVerifyRecovered, _ = m.Int64Counter("bd.claim_verify_recovered_total",
 		metric.WithDescription("Indeterminate claim-family commits resolved by re-read (label: op, outcome=applied|replayed)"),
 		metric.WithUnit("{write}"),
+	)
+	doltMetrics.ignoredTxFreshPool, _ = m.Int64Counter("bd.db.ignored_tx_fresh_pool",
+		metric.WithDescription("ignored-tx transactions that fell back to a dedicated single-connection pool instead of borrowing from the main pool"),
+		metric.WithUnit("{tx}"),
 	)
 }
 
@@ -3102,6 +3107,12 @@ func (s *DoltStore) CommitWithConfig(ctx context.Context, message string) error 
 // already committed its SQL mutation, so any publication failure here has an
 // indeterminate durable outcome and must not be replayed.
 func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commitMsg string) error {
+	// Batch/off auto-commit (bd-4wamg): leave the writes in the working set
+	// for a later explicit commit point (bd dolt commit / CommitPending),
+	// matching doltAddAndCommitInTx.
+	if issueops.VersionCommitDeferred(ctx) {
+		return nil
+	}
 	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		conn, err := s.db.Conn(ctx)
 		if err != nil {
@@ -3116,6 +3127,22 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 					fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate))
 			}
 		}
+
+		// Skip the commit when nothing was actually staged (idempotent no-op
+		// write), so Dolt does not log a server-side "nothing to commit" warning
+		// on every reconcile-cadence call. The guard tests the STAGED set rather
+		// than the whole working set because this helper stages only a fixed
+		// table list — an unrelated dirty table must not trigger an empty '-m'
+		// commit. A guard-read failure is NOT a publication failure: nothing has
+		// been committed and nothing is indeterminate, so plain error return.
+		staged, err := issueops.HasStagedChanges(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("check staged changes before commit: %w", err)
+		}
+		if !staged {
+			return nil
+		}
+
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 			return s.recordDoltPublicationFailure(ctx,
