@@ -142,9 +142,25 @@ func TestIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t *test
 	conformance.RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsUpdateStatusCrossingSettlesDependers(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateStatusCrossingSettlesDependers(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsCreateWithDependenciesSettlesInTheCreatingTransaction(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateWithDependenciesSettlesInTheCreatingTransaction(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsClaimLeavesBlockedStateAlone(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsClaimLeavesBlockedStateAlone(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance.IssueOperationsStagingFixture {
 	t.Helper()
 	operations, provider := newRealIssueOperationsWithProvider(t, ctx)
+	kit := newUOWRoleFixtureKit(provider, "bd")
 	return conformance.IssueOperationsStagingFixture{
 		IssuePrefix: "bd",
 		Operations:  operations,
@@ -193,6 +209,7 @@ func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance
 			}
 			return nil
 		},
+		CountHistoryMatching: kit.CountHistoryMatching,
 	}
 }
 
