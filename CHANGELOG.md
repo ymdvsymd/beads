@@ -9,6 +9,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A durable events journal, and `bd events` to read it** (bd-opisf). External
+  tooling that wants to stay in step with a workspace had two options and
+  neither was a feed: a fire-and-forget script hook that may not run, or polling
+  whole snapshots and diffing them — which still misses anything that changed
+  twice between two reads. The journal is the third. Every committed issue
+  mutation writes one ordered record, in the same transaction as the mutation
+  itself, and a consumer replays those records from a checkpoint it can resume.
+  Each record carries the operation, the mutated id, and the issue's full
+  post-mutation snapshot (including `is_blocked`), so a mirror stays correct
+  without re-querying the graph.
+
+  **It is off by default and opt-in per workspace**: `bd config set
+  events-journal true`, or `BD_EVENTS_JOURNAL=1`. Nothing is recorded while it
+  is off, so a workspace that never enables it pays nothing.
+
+  **On means bounded.** Two retention floors define the window every consumer
+  is guaranteed — `events-journal-retain-days` (default 7) and
+  `events-journal-retain-rows` (default 100000), each disabled by setting it to
+  0 — and beads enforces them for you: after a mutating command commits, and on
+  a timer inside `bd serve`, it deletes the prefix the floors do not protect.
+  The pass is throttled by a persisted watermark (about one an hour per
+  workspace — or sooner after a large burst of writes), runs in its own
+  transactions outside the mutation's, is capped at a few batches so a long
+  backlog drains over several commands rather than stalling one, and can never
+  fail a command — a failure is logged and skipped. It maintains the workspace
+  whose command triggered it, so a workspace only ever written remotely (a
+  routed `bd create --repo`) relies on commands run in it, or on its own `bd
+  serve`. Setting both floors to 0 keeps every record forever;
+  `events-journal-auto-prune false` keeps the floors but leaves deletion to you.
+  All four are `config.yaml` keys with `BD_EVENTS_JOURNAL*` environment
+  equivalents.
+
+  `bd events tail --since <seq>` prints records as JSON lines and `--follow`
+  keeps printing them as writes commit; `bd events export` prints the journal
+  from the beginning; `bd events prune --before <seq>` takes an earlier,
+  on-demand cut below the floors — it cannot cut deeper than they allow, so
+  shrinking the retained window means lowering them. The floors are a
+  recent-window guarantee, not a consumer watermark: size them for the longest
+  outage a consumer must survive.
+
+  **A read that cannot resume fails instead of lying.** When `--since` falls
+  below the oldest retained record, the read neither skips ahead to the
+  surviving suffix nor returns an empty success: both are silent record loss
+  that a cursor cannot detect. It exits 1 with a typed
+  `events_journal_truncated` error carrying `since`, `floor` and `head`, so a
+  consumer can choose between resuming at `floor - 1` with a known gap and
+  re-baselining. Under `--json` that is the error payload; mid-`--follow` it is
+  one compact JSON object on a line of the JSONL stream it interrupts, because
+  the consumer on the other end is a line reader. An interior gap — which
+  nothing in bd can produce, since a prune only ever removes a prefix — refuses
+  the same way.
+
+  The journal is clone-local working-set state (`dolt_ignore`d): never
+  versioned, never pushed or federated, per branch, and per replica — each
+  clone counts its own seq space, so a checkpoint from one replica is
+  meaningless against another. `bd dolt pull` and merge-settled changes, raw
+  `bd sql` DML, store-open migrations, and compaction rewrites are not
+  journaled. The record contract and every boundary are documented in
+  [docs/reference/events-journal.md](docs/reference/events-journal.md).
+
+- **`is_blocked` is a documented optional member of the /v0 OpenAPI issue
+  schemas** (bd-opisf) — `Issue`, `IssueWithCounts`, `IssueDetails`,
+  `IssueWithDependencyMetadata` and `TreeNode`, the five welded to the
+  canonical Go struct. It is the persisted readiness projection: true when an
+  open blocking dependency keeps an issue out of the ready set, derived from
+  the dependency graph and maintained by the server, never set by a client. It
+  is omitted when false, so absence means false. Journal snapshots are what set
+  it; readiness itself is computed exactly as before.
+
 - **`bd serve` grows the write half of the agent loop** (v0 wire surface,
   [#5410](https://github.com/gastownhall/beads/pull/5410),
   [#5417](https://github.com/gastownhall/beads/pull/5417),
@@ -104,6 +173,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The settings plane no longer serves the KV plane by any read** (bd-rfwtv,
+  bd-klko9). `bd kv` keys and the `bd remember` memories nested under them are
+  user data stored as config rows; they ride in the settings table without being
+  settings. Listing them was already excluded, but a caller naming an exact key
+  still got the value — and since `bd remember` derives its key from the content
+  it stores, the keys are guessable, so `bd config get kv.memory.<slug>` and
+  `GET /v0/beads/config/kv.memory.<slug>` (a surface with no authentication,
+  whose redaction decides on the key NAME while a memory's secret is in the
+  VALUE) walked around the exclusion.
+
+  A point read of a `kv.` key now answers exactly as a key nothing ever stored
+  does — the echoed key, an empty value, a nil error — so a caller cannot tell a
+  refusal from an absence. `bd config show` no longer prints those rows under
+  `source=database` either; it reads the table raw and prints values in full, so
+  it had inherited neither filter.
+
+  **Nothing is deleted and nothing becomes unreachable.** The rows are
+  untouched, and the surfaces that own them — `bd kv get`, `bd kv list`,
+  `bd recall`, `bd memories` — read the store directly and are unaffected.
+  `bd config set` and `bd config unset` still take a verbatim `kv.` key, which
+  keeps the escape hatch for a wedged memory. What is gone is reading memory
+  contents through `bd config get`, `bd config list` and `bd config show`.
+
+  **This is plane hygiene, not a confidentiality boundary.** `bd serve` has no
+  authentication, and it serves every memory in full through
+  `/v0/beads/memories` by design — anyone who can reach the server can still
+  read them. What this closes is the settings plane's habit of handing user
+  data to callers that asked for configuration: the routes that get republished
+  into agent transcripts and pasted into issues. Do not read it as a fix that
+  makes memories secret from someone who can already reach the port.
+
 - **`bd search` now includes closed issues by default** (bd-t5yex). The
   dominant real-world search query is "was this already found/filed/fixed?" —
   exactly the query where silently excluding closed issues produced a false
@@ -119,6 +219,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones — use `--status open` or raise `--limit` when hunting live work. And
   `bd query` (plus the HTTP `q=` endpoint) deliberately keeps its closed-
   exclusion default with opt-in `--all`; only `bd search` changed.
+
+### Removed
+
+- **BREAKING (published `backend` package): orphan handling is gone** (bd-gwryr).
+  `BatchCreateOptions.OrphanHandling` and its four modes never did anything
+  except cost a query. Removed symbols: `backend.OrphanHandling`,
+  `backend.OrphanAllow`, `backend.OrphanResurrect`, `backend.OrphanSkip`,
+  `backend.OrphanStrict`, and the `storage` originals they aliased
+  (`storage.OrphanHandling` and the same four constants), the
+  `BatchCreateOptions.OrphanHandling` field, and `issueops.CheckOrphan`.
+
+  **Migration for out-of-tree consumers: delete the option.** Every call site
+  in bd passed `OrphanAllow` (or left the field at its zero value, which took
+  the same branch), and `OrphanAllow` is exactly what the code still does —
+  a hierarchical create whose parent is missing is accepted, and the child's
+  auxiliary counter row is skipped because it would have no owner. Only
+  `OrphanStrict` (reject the create) and `OrphanSkip` (silently drop it)
+  behaved differently, and nothing but one conformance case ever passed them;
+  a consumer that relied on either must now check for the parent itself before
+  calling. `OrphanResurrect` was never implemented — it shared a branch with
+  `OrphanAllow`, and the resurrect-a-deleted-parent behavior its doc comment
+  described left with the JSONL sync layer long ago.
+
+  Every hierarchical-ID create paid a `SELECT COUNT(*)` parent-existence probe
+  to feed a switch whose only reachable arm ignored the answer. That query is
+  now gone from the create path.
 
 ### Fixed
 

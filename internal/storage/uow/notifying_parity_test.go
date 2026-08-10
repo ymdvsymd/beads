@@ -111,6 +111,12 @@ func TestNotifyingUOWWrapsEveryMutatingUseCase(t *testing.T) {
 			"DoltRemoteUseCase": "Dolt remotes are repository plumbing; no bead changes and no event to name",
 			"RawSQLUseCase": "the raw escape hatch executes statements this layer cannot read, so it " +
 				"cannot say which bead changed; the DoltStorage chain fires nothing for raw access either",
+			"EventsJournalUseCase": "read-only cursor surface; fires no hooks. Two of its three " +
+				"operations read bd_events_journal (Read, and ReadPage which adds the counter head " +
+				"GET /v0/beads/events pages with) and the third is a prefix delete of records " +
+				"already committed — the delete changes no bead, and the journal itself is written " +
+				"at the issueops seam inside the mutation's own transaction, so everything it " +
+				"records is already covered by the use case that made the change",
 		})
 }
 
@@ -173,10 +179,18 @@ func TestRecordingDependencyUseCaseCoversItsSurface(t *testing.T) {
 	reads := "reads the graph, changes none"
 	assertPartition(t, "DependencyUseCase", interfaceMethods(reflect.TypeOf((*domain.DependencyUseCase)(nil)).Elem()),
 		reflect.TypeOf((*recordingDepUC)(nil)), map[string]string{
-			"CountByIssueID":            reads,
-			"CountByWispID":             reads,
-			"CountsByIssueIDs":          reads,
-			"CountsByWispIDs":           reads,
+			"CountByIssueID":   reads,
+			"CountEdges":       reads,
+			"CountByWispID":    reads,
+			"CountsByIssueIDs": reads,
+			"CountsByWispIDs":  reads,
+			// The two halves of the whole-graph gate issueops.BatchApplier
+			// re-runs at the end of a mixed request. Both are repository PROBES
+			// — an ancestry walk and a reachability walk — so there is nothing
+			// for the recorder to notify about; the writes those gates guard are
+			// recorded by AddDependencies, which is declared below.
+			"ValidateBlockingHierarchy": reads,
+			"CycleThroughEdges":         reads,
 			"DetectCycleReport":         reads,
 			"DetectCycles":              reads,
 			"GetBlockingInfo":           reads,
@@ -268,6 +282,11 @@ func TestNotifyingProviderBuildsRolesOnItself(t *testing.T) {
 		"RunNonTx":      true,
 		"SetPoolLimits": true,
 		"Unwrap":        true,
+		// Events-journal capability plumbing: activation binds on the inner
+		// provider's transactions, and a retention pass writes no bead. Neither
+		// builds a role, so neither can build one "on itself".
+		"SetEventsJournalEnabled": true,
+		"RunEventsMaintenanceTx":  true,
 	}
 
 	var checked int

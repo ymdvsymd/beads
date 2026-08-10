@@ -83,6 +83,7 @@ import (
 	"reflect"
 
 	"github.com/steveyegge/beads/internal/hooks"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
@@ -233,6 +234,10 @@ func (p *notifyingProvider) BlockingAnnotator() (publicops.BlockingAnnotator, er
 
 func (p *notifyingProvider) TreeWalker() (publicops.TreeWalker, error) { return NewTreeWalker(p) }
 
+func (p *notifyingProvider) GraphCounter() (publicops.GraphCounter, error) {
+	return NewGraphCounter(p)
+}
+
 func (p *notifyingProvider) Counter() (publicops.Counter, error) { return NewCounter(p) }
 
 func (p *notifyingProvider) ReadyCounter() (publicops.ReadyCounter, error) {
@@ -265,6 +270,15 @@ func (p *notifyingProvider) DependencyEditor() (publicops.DependencyEditor, erro
 	return NewDependencyEditor(p)
 }
 
+// BatchApplier builds on THIS provider, like every role above it, so the
+// notifications its items produce are the ones the recording use cases already
+// emit for a create, an update, a close and an edge. It needs no recorder of
+// its own for that reason: the role composes those use cases rather than
+// reaching past them.
+func (p *notifyingProvider) BatchApplier() (publicops.BatchApplier, error) {
+	return NewBatchApplier(p)
+}
+
 func (p *notifyingProvider) Deleter() (publicops.Deleter, error) { return NewDeleter(p) }
 
 func (p *notifyingProvider) Sweeper() (publicops.Sweeper, error) { return NewSweeper(p) }
@@ -287,7 +301,20 @@ func (p *notifyingProvider) VersionReconciler() (publicops.VersionReconciler, er
 	return NewVersionReconciler(p)
 }
 
+func (p *notifyingProvider) MetadataCAS() (publicops.MetadataCAS, error) { return NewMetadataCAS(p) }
+
+func (p *notifyingProvider) Releaser() (publicops.Releaser, error) { return NewReleaser(p) }
+
 func (p *notifyingProvider) Memories() (memoryops.Memories, error) { return NewMemories(p) }
+
+// EventsJournalCursor builds on THIS provider, like every role above it, so a
+// journal read taken through a notifying provider still runs in a unit of work
+// this layer opened. Nothing here records, and nothing needs to: this accessor
+// reaches only the READ half of EventsJournalUseCase, which the parity guard
+// exempts for reading state and changing none.
+func (p *notifyingProvider) EventsJournalCursor() (storage.EventsJournalCursor, error) {
+	return NewEventsJournalCursor(p)
+}
 
 // ── Provider capabilities that are not roles ────────────────────────
 
@@ -311,35 +338,77 @@ func (p *notifyingProvider) SetPoolLimits(limits PoolLimits) {
 	}
 }
 
+// SetEventsJournalEnabled forwards durable-journal activation to the provider
+// that actually binds it to a transaction (doltSQLProvider.BeginTx). Activation
+// is per instance, and the instance that matters is the inner one; the wrapper
+// holds no journal state of its own.
+//
+// It fires no hook and records nothing, which is not an omission: the journal
+// is written at the issueops seam inside the mutation's transaction, so every
+// write this wrapper already records is journaled by the layer beneath it.
+func (p *notifyingProvider) SetEventsJournalEnabled(enabled bool) {
+	if configurer, ok := p.inner.(storage.EventsJournalConfigurer); ok {
+		configurer.SetEventsJournalEnabled(enabled)
+	}
+}
+
+// eventsMaintenanceRunner is issueops.EventsMaintenanceRunner under this file's
+// import alias, named once so the forwarder below reads as an ordinary
+// capability check.
+type eventsMaintenanceRunner = storageissueops.EventsMaintenanceRunner
+
+// RunEventsMaintenanceTx forwards one events-journal retention step to the
+// inner provider's transaction machinery. It is maintenance on a dolt_ignored
+// table — a prefix delete of records already committed — so there is nothing
+// for a hook to describe and no bead a script could be handed.
+//
+// A provider that cannot maintain the journal fails here rather than silently
+// succeeding, matching RunNonTx above: the caller logs it and carries on.
+//
+// The forwarder is deliberately not the only defense. Auto-prune's resolution
+// peels ProviderUnwrapper before asserting this capability, so it reaches the
+// inner provider even through a decorator that never declared the method. Both
+// halves are cheap and the failure they prevent — retention silently not
+// running behind a wrapper — is invisible from the outside.
+func (p *notifyingProvider) RunEventsMaintenanceTx(ctx context.Context, fn func(context.Context, storageissueops.DBTX) error) error {
+	runner, ok := p.inner.(eventsMaintenanceRunner)
+	if !ok {
+		return fmt.Errorf("uow: provider %T does not support events-journal maintenance", p.inner)
+	}
+	return runner.RunEventsMaintenanceTx(ctx, fn)
+}
+
 var (
-	_ UnitOfWorkProvider      = (*notifyingProvider)(nil)
-	_ MaintenanceProvider     = (*notifyingProvider)(nil)
-	_ PoolTuner               = (*notifyingProvider)(nil)
-	_ IssueLifecycleSource    = (*notifyingProvider)(nil)
-	_ IssueReaderSource       = (*notifyingProvider)(nil)
-	_ IssueClaimerSource      = (*notifyingProvider)(nil)
-	_ RelationsSource         = (*notifyingProvider)(nil)
-	_ EdgeReaderSource        = (*notifyingProvider)(nil)
-	_ BlockingAnnotatorSource = (*notifyingProvider)(nil)
-	_ TreeWalkerSource        = (*notifyingProvider)(nil)
-	_ CounterSource           = (*notifyingProvider)(nil)
-	_ ReadyCounterSource      = (*notifyingProvider)(nil)
-	_ ReadyClaimerSource      = (*notifyingProvider)(nil)
-	_ QuerierSource           = (*notifyingProvider)(nil)
-	_ StatsReporterSource     = (*notifyingProvider)(nil)
-	_ CycleDetectorSource     = (*notifyingProvider)(nil)
-	_ CommenterSource         = (*notifyingProvider)(nil)
-	_ BatchCloserSource       = (*notifyingProvider)(nil)
-	_ BatchCreatorSource      = (*notifyingProvider)(nil)
-	_ DependencyEditorSource  = (*notifyingProvider)(nil)
-	_ DeleterSource           = (*notifyingProvider)(nil)
-	_ SweeperSource           = (*notifyingProvider)(nil)
-	_ ImporterSource          = (*notifyingProvider)(nil)
-	_ BootstrapperSource      = (*notifyingProvider)(nil)
-	_ InitVerifierSource      = (*notifyingProvider)(nil)
-	_ WorkspaceConfigSource   = (*notifyingProvider)(nil)
-	_ VersionReconcilerSource = (*notifyingProvider)(nil)
-	_ MemoriesSource          = (*notifyingProvider)(nil)
+	_ UnitOfWorkProvider        = (*notifyingProvider)(nil)
+	_ MaintenanceProvider       = (*notifyingProvider)(nil)
+	_ PoolTuner                 = (*notifyingProvider)(nil)
+	_ IssueLifecycleSource      = (*notifyingProvider)(nil)
+	_ IssueReaderSource         = (*notifyingProvider)(nil)
+	_ IssueClaimerSource        = (*notifyingProvider)(nil)
+	_ RelationsSource           = (*notifyingProvider)(nil)
+	_ EdgeReaderSource          = (*notifyingProvider)(nil)
+	_ BlockingAnnotatorSource   = (*notifyingProvider)(nil)
+	_ TreeWalkerSource          = (*notifyingProvider)(nil)
+	_ GraphCounterSource        = (*notifyingProvider)(nil)
+	_ CounterSource             = (*notifyingProvider)(nil)
+	_ ReadyCounterSource        = (*notifyingProvider)(nil)
+	_ ReadyClaimerSource        = (*notifyingProvider)(nil)
+	_ QuerierSource             = (*notifyingProvider)(nil)
+	_ StatsReporterSource       = (*notifyingProvider)(nil)
+	_ CycleDetectorSource       = (*notifyingProvider)(nil)
+	_ CommenterSource           = (*notifyingProvider)(nil)
+	_ BatchCloserSource         = (*notifyingProvider)(nil)
+	_ BatchCreatorSource        = (*notifyingProvider)(nil)
+	_ DependencyEditorSource    = (*notifyingProvider)(nil)
+	_ DeleterSource             = (*notifyingProvider)(nil)
+	_ SweeperSource             = (*notifyingProvider)(nil)
+	_ ImporterSource            = (*notifyingProvider)(nil)
+	_ BootstrapperSource        = (*notifyingProvider)(nil)
+	_ InitVerifierSource        = (*notifyingProvider)(nil)
+	_ WorkspaceConfigSource     = (*notifyingProvider)(nil)
+	_ VersionReconcilerSource   = (*notifyingProvider)(nil)
+	_ MemoriesSource            = (*notifyingProvider)(nil)
+	_ EventsJournalCursorSource = (*notifyingProvider)(nil)
 )
 
 // ── The unit of work ────────────────────────────────────────────────
@@ -828,6 +897,50 @@ func (u *recordingIssueUC) UpdateIssue(ctx context.Context, id string, updates m
 	}
 	u.rec.record(opUpdate, u.snap.issue(ctx, id))
 	return nil
+}
+
+// CompareAndSetMetadataKey records an update for a swap that MOVED the value,
+// and nothing for one that did not — the same line hookMetadataCAS draws on the
+// DoltStorage chain, which fires on_update only when the row changed.
+//
+// It reads the fact rather than inferring it. The use case reports whether a
+// row write landed, which is strictly better than the decorator's comparison of
+// the request's two ends, and it is the only caller of this method that has it.
+//
+// THE SNAPSHOT IS anyPlane, because this role resolves the id across both
+// planes itself: a swap on a wisp is an update to a wisp, and reading only the
+// issues table would record a nil for it.
+func (u *recordingIssueUC) CompareAndSetMetadataKey(ctx context.Context, plan storage.CompareAndSetKeyPlan) (publicops.CompareAndSetKeyResult, bool, error) {
+	result, wrote, err := u.IssueUseCase.CompareAndSetMetadataKey(ctx, plan)
+	if err != nil || !wrote {
+		return result, wrote, err
+	}
+	u.rec.record(opUpdate, u.snap.anyPlane(ctx, plan.IssueID))
+	return result, wrote, nil
+}
+
+// ReleaseIssue records an update for a release that landed.
+//
+// It is DECLARED rather than inherited, which is the whole reason this method
+// exists: an accessor promoted onto an embedder compiles perfectly and records
+// nothing, so a release through a notifying unit of work would silently lose
+// the hook the DoltStorage chain fires for the same write.
+//
+// It reads the ROLE'S OWN verdict — ReleaseResult.Changed — which is the same
+// fact the bool beside it carries and the one a notification is about. An
+// ephemeral release changes a wisp and versions nothing, and it is still an
+// update somebody asked to be notified about.
+//
+// THE SNAPSHOT IS anyPlane, because this role resolves the id across both
+// planes itself: releasing a wisp is an update to a wisp, and reading only the
+// issues table would record a nil for it.
+func (u *recordingIssueUC) ReleaseIssue(ctx context.Context, req publicops.ReleaseRequest) (publicops.ReleaseResult, bool, error) {
+	result, wrote, err := u.IssueUseCase.ReleaseIssue(ctx, req)
+	if err != nil || !result.Changed {
+		return result, wrote, err
+	}
+	u.rec.record(opUpdate, u.snap.anyPlane(ctx, req.IssueID))
+	return result, wrote, nil
 }
 
 func (u *recordingIssueUC) UpdateWisp(ctx context.Context, id string, updates map[string]any, actor string) error {
