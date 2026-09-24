@@ -66,7 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step needs an operator who can confirm every co-resident client is upgraded).
   On a shared Dolt sql-server the guidance still carries #5920's consequence —
   migrating promotes the schema for every co-resident client — and names the
-  `bd migrate schema` consent step the retry needs there.
+  consent step the retry needs there: `bd migrate schema --force`. It is the
+  forced form because this stop always has a remote configured (behind-ness is
+  read from the remote-tracking ref), and the bare `bd migrate schema` consent
+  is only read for a shared database with *no* remote; the flag consents to
+  migrating a remote-backed shared store, and by then the pull has landed the
+  commits the clone was missing. The payload's `docs` link points at the
+  data-behind section rather than the migrate-or-adopt recipe, and that
+  section — plus the upgrade and init-safety ordering rules — now records the
+  `bd dolt pull` exception instead of stating the pull is always refused.
 
   Both existing escape hatches are unchanged: `bd migrate --force` /
   `BD_ALLOW_REMOTE_MIGRATE=1` are still consulted before the smart gate, and
@@ -75,6 +83,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open after upgrading avoids the state entirely.
 
 ### Added
+
+- **`bd backup` works on a proxied-server workspace bd runs the Dolt server
+  for.** `bd backup init`, `sync`, `remove`, `status` and `restore` are routed
+  over the proxied provider; before this, a proxied workspace — the default
+  topology since 1.3.0 — had no backup path at all. `bd backup restore` stops
+  the proxy and its Dolt child before replacing the database and leaves the
+  workspace quiescent, so the next command relaunches against the restored
+  data.
+
+  The family stays **refused by design** on a proxied workspace pointed at a
+  Dolt server bd does not own (an external host, socket, or a beads-team-server
+  database): `CALL DOLT_BACKUP('add', …)` registers the backup remote on the
+  *server*, where it is global to every client connected to it, so one
+  workspace's backup decision would silently become everyone's — the shape
+  `bd backup`'s own help text already warns about for auto-backup. A `file://`
+  destination has a second problem on top, since the server resolves that path
+  on its own filesystem. The refusal keeps the `proxy.backup.unsupported` code
+  and now carries `"reason": "design"`; a backup story for those deployments
+  belongs to whoever runs the server. Whether a *remote-scheme* destination
+  (DoltHub, `aws://`, `gs://`) should eventually be allowed there is recorded as
+  an open question rather than settled — the server pushes those over the
+  network from its own environment, which is the same credential question the
+  next slice has to answer for `dolt push`.
+
+  Backups on this topology are **explicit only**. Auto-backup has no
+  post-command hook on the proxied path, so `backup.enabled=true` does nothing
+  there; `bd backup status` and `bd backup` help now say so instead of
+  attributing the OFF to a missing git remote, which was never the reason on a
+  server topology. Wiring an auto-backup hook through the new routes is left to
+  a later slice.
 
 - **`bd count` supports repeatable `--metadata-field key=value` filters**
   ([#6023](https://github.com/gastownhall/beads/issues/6023)), so callers can
@@ -110,27 +148,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `backend_managed` is false on external proxied topologies, where the dolt
   server is not bd's process to report on.
 
+- **`bd mol ready --gated` no longer refuses under `--proxied-server` when
+  `BEADS_MAX_ROWS` is set**
+  ([#6293](https://github.com/gastownhall/beads/pull/6293)). The proxied
+  capability front door keyed its rules on cobra's leaf name, and `bd ready`
+  and `bd mol ready --gated` share the leaf "ready", so the row cap refusal
+  written for the former also refused the latter — a proxy-supported command
+  with no `--max-rows` flag to refuse. Rules are keyed on the full command
+  path now.
+
 ### Changed
 
 - **Proxied-server refusals now say *why* they refuse.** The JSON a refused
   command prints gains a `reason` field next to the existing `code`, `error`
   and `mutates`: `design` for a refusal that is expected to stay (shared
   history, multi-repo routing, destructive admin, strict `--readonly`) and
-  `unimplemented` for a capability gap with a named owner. Every existing code,
-  message and exit status is unchanged, and `reason` is absent on refusals that
-  report a runtime state rather than a policy, so existing consumers are
-  unaffected. The policy behind it moved into one registry
+  `unimplemented` for a capability gap with a named owner. Adding `reason` left
+  every existing code, message and exit status as it was, and `reason` is absent
+  on refusals that report a runtime state rather than a policy, so existing
+  consumers are unaffected. The policy behind it moved into one registry
   (`cmd/bd/capability_registry.go`) that every command must appear in.
 - **A command with no proxied-server route now fails with a typed error**
   (`proxy.store.unrouted`) instead of the bare string `proxy server store
   should be uow provider`.
+- **`bd backup restore --json` prints a result object on every topology**
+  (`{"restored": true, "source": "<dir>"}`). It previously printed nothing at
+  all, which left a caller unable to tell a completed restore from a silently
+  skipped one. This applies to direct/embedded workspaces too, not only proxied
+  ones.
+- **`bd backup init`, `sync`, `remove` and `restore` no longer print a usage
+  block after a failure.** They now silence cobra's own error and usage
+  rendering like the rest of the CLI, so a failure is one error line on stderr
+  instead of the message followed by `Error: exit code 1` and the full usage
+  text. Exit statuses are unchanged; this applies on every topology.
 
+- **Proxied `--repo` and row-cap refusals are typed again**
+  ([#6293](https://github.com/gastownhall/beads/pull/6293)). `bd list --repo`
+  under `--proxied-server` answers `--json` with the stable
+  `{"code": "proxy.repo.unsupported", …, "mutates": false}` on stdout rather
+  than prose on stderr, and `bd ready --claim --max-rows N` refuses with the
+  same `proxy.max_rows.unsupported` shape as `bd ready --max-rows N`: `--claim`
+  does not exempt a row cap the proxied route cannot enforce either way.
+- **The proxied `bd admin compact` refusal names the command it means**
+  ([#6293](https://github.com/gastownhall/beads/pull/6293)). The message is now
+  "only 'bd admin compact --dolt' is supported in proxied-server mode"; it read
+  "only 'compact --dolt'", which names the root `bd compact` — a different
+  command, with no `--dolt` flag and its own proxied route. Scripts matching
+  the old text need updating.
+- **`bd preflight` honors the `json` config default**
+  ([#6293](https://github.com/gastownhall/beads/pull/6293)). Its `--json` flag
+  is bound to the same global every sibling command binds, so `json: true` in
+  the config file now selects JSON output for `bd preflight` as it already did
+  elsewhere. Previously only the explicit flag was honored — and, because an
+  unbound flag reports as unset, `bd preflight --json` did not reach every
+  JSON-aware renderer.
 - **`bd gate check` resolves bead gates whose target lives in a prefix-routed
   rig** ([#5859](https://github.com/gastownhall/beads/pull/5859)). After a local
   miss, the evaluator follows the target bead ID through `routes.jsonl` and
   reads the owning store without writing to it. This covers explicit gate
   checks in embedded, server, and proxied-server command paths; the legacy
   `<rig>:<bead-id>` await value remains accepted for compatibility.
+
+### Fixed
+
+- **A dotted config key now round-trips: what `bd config set` writes,
+  `bd config get` and bd's own readers find**
+  ([#6574](https://github.com/gastownhall/beads/pull/6574),
+  [#6594](https://github.com/gastownhall/beads/issues/6594), bd-zj95). Setting a
+  key like `sync.remote` or `dolt.host` into a `config.yaml` with no matching
+  section appended a key whose *name* contained the dot — a top-level
+  `sync.remote: "..."` — instead of nesting it under `sync:`. Viper finds a key
+  spelled that way; the direct reader `GetStringFromDir` splits on the dot and
+  walks nested mappings, so it does not. The value was set and invisible at the
+  same time depending on which reader asked, and `bd init --remote` in a fresh
+  workspace was the ordinary way in: the remote was recorded and then not found.
+  New dotted keys are written nested now. An existing flat spelling is updated
+  in place for compatibility with other writers of the shared config file —
+  rewriting that one line and nothing else, the comment on it included — and
+  bd's direct reader recognizes both forms with the same precedence as Viper.
+  `bd doctor` warns when both forms coexist. `bd config unset` removes the
+  nested form — it only ever matched the flat spelling, so unsetting
+  `sync.remote` silently left the remote live. Keys the write does not own,
+  including dotted ones somebody else put there, are left exactly as they are.
+
+  Four things that used to succeed now report an error instead, because each one
+  produced a value no reader could see, or claimed to remove a value it had
+  left live. On `bd config set`: a key under a parent that already holds a value
+  (`sync: enabled`, then `bd config set sync.remote`), and a key in a file whose
+  top level is not a mapping. On `bd config unset`: a key inside a flow-style
+  mapping (`sync: {remote: "..."}`), which bd matches by line and so cannot
+  edit, and a key whose value is a block scalar (`remote: |`, in either
+  spelling), where commenting the key out would leave the body behind as a value
+  of its own. Unsetting a key that is not set remains a successful no-op in
+  every shape.
 
 ## [1.3.0] - 2026-09-15
 
@@ -409,6 +519,22 @@ which dumps the entire release history.)
   `BD_ALLOW_REMOTE_MIGRATE=1` in scripted use. Reads keep working on the
   current schema meanwhile. Embedded (single-user) databases still
   auto-migrate silently, unchanged. (#5920)
+- **Commands that cannot work under `--proxied-server` now refuse before any
+  provider opens** ([#6293](https://github.com/gastownhall/beads/pull/6293)).
+  `bd doctor`, `bd backup`, `bd restore`, `bd diff`, `bd migrate`, `bd branch`,
+  `bd conflicts`, `bd vc`, `bd federation`, `bd repo`, `bd flatten`, `bd sync`,
+  `bd dolt push|pull|commit`, `bd dolt remote add|list|reset-data`, and
+  `bd admin compact` without `--dolt` return a typed refusal carrying a stable
+  code (`proxy.doctor.unsupported` and friends) instead of failing partway
+  through, or silently doing nothing. Two changes worth planning for:
+  - `bd doctor` under `--proxied-server` used to print a note to stderr and
+    exit **0**; it now exits **1** with `proxy.doctor.unsupported`. A script
+    that treated bare `bd doctor` as a no-op in this mode needs to stop calling
+    it, or tolerate the non-zero status.
+  - Under `--json`, a refusal is strict JSON on **stdout**
+    (`{"code": …, "error": …, "mutates": false}`) rather than prose on stderr,
+    so a wrapper parsing stdout gets a machine-readable answer and
+    `"mutates": false` states that the refusal touched nothing.
 
 - The smart migration gate's "auto-migrate as safe first-mover" and
   auto-fast-forward arms are now embedded-only. On a shared server the gate

@@ -360,15 +360,27 @@ func isForcedMigrate(cmd *cobra.Command) bool {
 // open targets `beads_global`, so the block's `bd migrate schema` would
 // migrate the PROJECT database and leave the refusal in place — the working
 // remedy is the same verb with the same flag.
-func printGlobalDatabaseConsentHint(w io.Writer) {
+//
+// It takes the refusal because "the same verb" is not the same verb on every
+// arm: the #6575 data-behind stop on a shared store is remote-backed by
+// construction, and there the bare verb's consent is never read (see
+// schema.SharedConsentCommandForced), so retargeting the bare form would hand
+// the operator a global-scoped command that still cannot succeed. This mirrors
+// the retarget in handleRemoteMigrateGateJSON. A nil error keeps the
+// pre-existing bare-verb wording.
+func printGlobalDatabaseConsentHint(w io.Writer, e *schema.RemoteMigrateGateError) {
 	if !globalFlag {
 		return
+	}
+	consent := schema.SharedConsentCommandGlobal
+	if e != nil && e.IsDataBehind() && e.Shared {
+		consent = schema.SharedConsentCommandForcedGlobal
 	}
 	fmt.Fprintf(w,
 		"\n  This command targeted the global database (--global), so run the\n"+
 			"  migrate step with the same flag:\n"+
 			"        %s\n",
-		schema.SharedConsentCommandGlobal)
+		consent)
 }
 
 // renderTypedOpenError prints the actionable block for the store-open failures
@@ -398,7 +410,7 @@ func renderTypedOpenError(err error) bool {
 			handleRemoteMigrateGateJSON(gateErr)
 		} else {
 			fmt.Fprint(os.Stderr, gateErr.UserMessage())
-			printGlobalDatabaseConsentHint(os.Stderr)
+			printGlobalDatabaseConsentHint(os.Stderr, gateErr)
 		}
 		return true
 	}
@@ -723,6 +735,17 @@ func prepareSelectedNoDBContext(beadsDir string) {
 	prepareSelectedCommandContext(beadsDir, true)
 }
 
+func commandJSONFlagChanged(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Flags().Changed("json") {
+		return true
+	}
+	root := cmd.Root()
+	return root != nil && root.PersistentFlags().Changed("json")
+}
+
 // refreshBoundCommandConfig reapplies config-backed defaults after the command
 // context has been rebound to a resolved target beads directory. This keeps
 // explicit flags authoritative while letting rerouted/explicit-db commands use
@@ -735,7 +758,7 @@ func refreshBoundCommandConfig(cmd *cobra.Command) {
 	if root == nil {
 		root = cmd
 	}
-	if !root.PersistentFlags().Changed("json") && !root.PersistentFlags().Changed("format") {
+	if !commandJSONFlagChanged(cmd) && !root.PersistentFlags().Changed("format") {
 		jsonOutput = config.GetBool("json")
 	}
 	if !root.PersistentFlags().Changed("readonly") {
@@ -1078,7 +1101,7 @@ var rootCmd = &cobra.Command{
 			}
 		}
 		// If flag wasn't explicitly set, use viper value
-		if !cmd.Root().PersistentFlags().Changed("json") && !cmd.Root().PersistentFlags().Changed("format") {
+		if !commandJSONFlagChanged(cmd) && !cmd.Root().PersistentFlags().Changed("format") {
 			jsonOutput = config.GetBool("json")
 		} else {
 			flagOverrides["json"] = struct {
@@ -1273,17 +1296,17 @@ var rootCmd = &cobra.Command{
 					fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 				}
 			}
-			if cmdName == "doctor" && usesProxiedServer() {
+			if beadsDir == "" {
+				beadsDir = beads.FindBeadsDir()
+			}
+			if commandRegistryPath(cmd) == "doctor" && usesProxiedServer() {
 				// Refuse only on a real refusal. The registry validator
 				// returns nil for doctor subcommands, and returning early on
 				// that would skip the legacy-store guard and autocommit-mode
 				// resolution every other skipsStoreInit command still runs.
-				if err := validateProxyRegistryBeforeProvider(cmd); err != nil {
+				if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 					return err
 				}
-			}
-			if beadsDir == "" {
-				beadsDir = beads.FindBeadsDir()
 			}
 			if err := guardLegacyNoStoreCommand(cmd, beadsDir); err != nil {
 				isMigrationCommand := false
@@ -1491,7 +1514,7 @@ var rootCmd = &cobra.Command{
 			if err := validateProxyCapabilitiesBeforeProvider(cmd); err != nil {
 				return err
 			}
-			if err := validateProxyRegistryBeforeProvider(cmd); err != nil {
+			if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 				return err
 			}
 		}
