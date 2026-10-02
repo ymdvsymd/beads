@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/testutil/bazeltest"
+	"github.com/steveyegge/beads/internal/versioncheck"
 )
 
 func TestCheckResult_Passed(t *testing.T) {
@@ -419,31 +421,226 @@ func TestRunBeadsPollutionCheck_Clean(t *testing.T) {
 	}
 }
 
-func TestRunVersionSyncCheck_ScriptFallback(t *testing.T) {
-	// Run from a temp dir where scripts/check-versions.sh does not exist.
-	// The fallback inline logic should be used, resulting in a skipped result
-	// because version.go won't be found either.
+func TestRunVersionSyncCheck_GenericFallback(t *testing.T) {
+	// An unrelated directory retains the generic inline Go/Nix behavior.
 	origDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "cmd", "bd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"go.mod":            "module example.com/unrelated\n\ngo 1.26.5\n",
+		"cmd/bd/version.go": "package main\n\nvar Version = \"2.3.4\"\n",
+		"default.nix":       "{ version = \"2.3.4\"; }\n",
+	} {
+		if err := os.WriteFile(
+			filepath.Join(dir, filepath.FromSlash(path)),
+			[]byte(content),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
 	defer os.Chdir(origDir)
 
 	result := runVersionSyncCheck()
-	// Without version.go present, fallback should skip
-	if !result.Skipped {
-		// Could also pass if default.nix is also missing — both are acceptable fallback outcomes
-		if result.Passed && strings.Contains(result.Output, "not found") {
-			return // acceptable: nix not found skip
+	if !result.Passed || result.Skipped {
+		t.Fatalf("generic version fallback failed: %+v", result)
+	}
+	if result.Command != "Compare cmd/bd/version.go and default.nix" {
+		t.Fatalf("command = %q, want generic fallback", result.Command)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "default.nix"),
+		[]byte("{ version = \"9.9.9\"; }\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result = runVersionSyncCheck()
+	if result.Passed || !strings.Contains(result.Output, "version.go=2.3.4, default.nix=9.9.9") {
+		t.Fatalf("generic mismatch was not preserved: %+v", result)
+	}
+}
+
+func TestRunVersionSyncCheck_BeadsUsesBuiltInAuthority(t *testing.T) {
+	root := writeBeadsVersionFixture(t, "1.1.0")
+	// The historical entrypoint is intentionally hostile: production preflight
+	// must use the Go package directly, not execute this file or ambient bash.
+	if err := os.WriteFile(
+		filepath.Join(root, "scripts", "check-versions.sh"),
+		[]byte("#!/bin/sh\nexit 86\n"),
+		0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	originalDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalDirectory) })
+	t.Setenv("PATH", "")
+
+	result := runVersionSyncCheck()
+	if !result.Passed {
+		t.Fatalf("built-in Beads version check failed: %s", result.Output)
+	}
+	if result.Command != "built-in Beads release version check" {
+		t.Fatalf("command = %q, want built-in authority", result.Command)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(root, "npm-package", "package.json"),
+		[]byte(`{"version":"9.9.9"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result = runVersionSyncCheck()
+	if result.Passed {
+		t.Fatal("mismatched released metadata unexpectedly passed")
+	}
+	if !strings.Contains(result.Output, "npm package.json: 9.9.9 (expected 1.1.0)") {
+		t.Fatalf("unexpected mismatch output: %q", result.Output)
+	}
+	// A bare update-versions.sh re-run no-ops on a drifted file, so the check
+	// carries the remedies that work, and the human view (which prints the
+	// first 500 bytes of a failed check) shows all of them for one drift.
+	remedy := versioncheck.Report{CanonicalVersion: "1.1.0"}.MismatchRemedy()
+	if !strings.HasSuffix(result.Output, "\n"+remedy) {
+		t.Fatalf("mismatch output lacks the drift remedy: %q", result.Output)
+	}
+	if strings.Contains(result.Output, "Run: scripts/update-versions.sh") {
+		t.Fatalf("mismatch output prescribes a bare update-versions.sh run: %q", result.Output)
+	}
+	if shown := truncateOutput(result.Output, 500); strings.HasSuffix(shown, "(truncated)") {
+		t.Fatalf("human output cuts the remedy for one drifted file: %q", shown)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(root, "npm-package", "package.json"),
+		[]byte(`{"version":"1.1.0"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, ".githooks", "pre-push"),
+		[]byte(
+			"# --- BEGIN BEADS INTEGRATION v9.9.9 ---\n"+
+				"body\n# --- END BEADS INTEGRATION v1.1.0 ---\n",
+		),
+		0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result = runVersionSyncCheck()
+	if result.Passed {
+		t.Fatal("mismatched tracked hook marker unexpectedly passed")
+	}
+	if !strings.Contains(
+		result.Output,
+		".githooks/pre-push BEGIN marker: 9.9.9 (expected 1.1.0)",
+	) {
+		t.Fatalf("unexpected tracked-hook mismatch output: %q", result.Output)
+	}
+}
+
+func TestRunBeadsVersionSyncCheck_UVLockFreshness(t *testing.T) {
+	root := writeBeadsVersionFixture(t, "1.1.0")
+	tests := []struct {
+		name        string
+		check       versioncheck.UVLockChecker
+		wantPassed  bool
+		wantContain string
+		wantAbsent  string
+	}{
+		{
+			name:       "uv unavailable is a soft skip",
+			check:      func(string) (bool, error) { return false, nil },
+			wantPassed: true,
+			wantAbsent: "uv lock --check",
+		},
+		{
+			name:        "fresh lock passes",
+			check:       func(string) (bool, error) { return true, nil },
+			wantPassed:  true,
+			wantContain: "MCP uv.lock: fresh (uv lock --check)",
+		},
+		{
+			name: "stale lock fails",
+			check: func(string) (bool, error) {
+				return true, errors.New("lockfile needs regeneration")
+			},
+			wantPassed:  false,
+			wantContain: "MCP uv.lock: stale — run: uv lock --directory integrations/beads-mcp",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := runBeadsVersionSyncCheckWithUV(root, test.check)
+			if result.Passed != test.wantPassed {
+				t.Fatalf("Passed = %v, want %v; result: %+v", result.Passed, test.wantPassed, result)
+			}
+			if !strings.Contains(result.Output, test.wantContain) {
+				t.Fatalf("Output = %q, want substring %q", result.Output, test.wantContain)
+			}
+			if test.wantAbsent != "" && strings.Contains(result.Output, test.wantAbsent) {
+				t.Fatalf("Output = %q, want %q absent", result.Output, test.wantAbsent)
+			}
+		})
+	}
+}
+
+func writeBeadsVersionFixture(t *testing.T, version string) string {
+	t.Helper()
+	root := t.TempDir()
+	// The Windows PE numeric fields must be purely numeric, so they carry the
+	// prerelease-stripped form.
+	base, _, _ := strings.Cut(version, "-")
+	files := map[string]string{
+		"go.mod":                                           "module github.com/steveyegge/beads\n\ngo 1.26.5\n",
+		"cmd/bd/version.go":                                "package main\n\nvar Version = \"" + version + "\"\n",
+		"scripts/update-versions.sh":                       "#!/bin/sh\n",
+		"integrations/beads-mcp/pyproject.toml":            "[project]\nversion = \"" + version + "\"\n",
+		"integrations/beads-mcp/src/beads_mcp/__init__.py": "__version__ = \"" + version + "\"\n",
+		"integrations/beads-mcp/uv.lock":                   "[[package]]\nname = \"beads-mcp\"\nversion = \"" + version + "\"\n",
+		"plugins/beads/.claude-plugin/plugin.json":         `{"version":"` + version + `"}`,
+		"plugins/beads/.codex-plugin/plugin.json":          `{"version":"` + version + `"}`,
+		".claude-plugin/marketplace.json":                  `{"plugins":[{"version":"` + version + `"}]}`,
+		"npm-package/package.json":                         `{"version":"` + version + `"}`,
+		"plugins/beads/.copilot-plugin/plugin.json":        `{"version":"` + version + `"}`,
+		"cmd/bd/winres/winres.json": `{"RT_VERSION":{"#1":{"0000":{` +
+			`"fixed":{"file_version":"` + base + `","product_version":"` + base + `"},` +
+			`"info":{"0409":{"FileVersion":"` + version +
+			`","ProductVersion":"` + version + `"}}}}}}`,
+		"cmd/bd/winres/manifest.xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
+			"<assembly>\n  <assemblyIdentity\n    type=\"win32\"\n" +
+			"    version=\"" + base + ".0\"\n    processorArchitecture=\"*\"/>\n</assembly>\n",
+		".githooks/pre-push": "# --- BEGIN BEADS INTEGRATION v" + version + " ---\n" +
+			"body\n# --- END BEADS INTEGRATION v" + version + " ---\n",
+	}
+	for relativePath, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(relativePath))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create parent for %s: %v", relativePath, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", relativePath, err)
 		}
 	}
-	if result.Command == "scripts/check-versions.sh" {
-		t.Fatal("expected fallback logic, not script invocation")
-	}
+	return root
 }
 
 // writeMarkerDir creates a temp dir containing the given marker files (each
@@ -544,29 +741,37 @@ func TestIsBeadsRepo(t *testing.T) {
 	}
 }
 
-// TestPreflightJSONFlagBindsGlobal pins both halves of preflight's --json
-// binding, which is one flag serving two masters. Setting it must write the
-// package global, or every jsonOutput reader (including the front-door refusal
+// TestPreflightJSONInheritsRootFlag pins preflight's --json contract now that
+// the command inherits the root persistent flag instead of registering a local
+// copy. A local copy would shadow the inherited one and is what
+// TestNoSubcommandShadowsRootJSONFlag forbids, so the first check rejects a
+// local flag rather than requiring one.
+//
+// The binding this pins is unchanged, only re-keyed: the root flag is
+// BoolVar'd to the same package global (main.go), so setting it must write
+// jsonOutput, or every jsonOutput reader (including the front-door refusal
 // renderers) stays in text mode while the user asked for JSON. Leaving it
 // unset must report unchanged to commandJSONFlagChanged, which is what lets a
-// config-file `json: true` reach preflight the way it reaches its siblings —
-// a deliberate behavior change from the unbound shadow this replaced, and the
-// reason the CHANGELOG calls it out.
+// config-file `json: true` reach preflight the way it reaches its siblings.
 //
 // The last two subtests drive that config half rather than only asserting the
 // negative direction. flag.Value.Set never sets Changed (only FlagSet.Set
 // does), so the Changed==true branch of commandJSONFlagChanged needs its own
-// case, and the behavior the CHANGELOG announces — configured `json: true`
-// with no flag flipping jsonOutput — only happens inside
-// refreshBoundCommandConfig, so it has to be driven through that function.
-func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
-	flag := preflightCmd.Flags().Lookup("json")
-	if flag == nil {
-		t.Fatal("preflight has no --json flag")
-	}
+// case — driven through the root flag, which is the one an inheriting command
+// now has — and the configured `json: true` with no flag flipping jsonOutput
+// only happens inside refreshBoundCommandConfig, so it has to be driven
+// through that function.
+func TestPreflightJSONInheritsRootFlag(t *testing.T) {
 	rootJSON := preflightCmd.Root().PersistentFlags().Lookup("json")
 	if rootJSON == nil {
 		t.Fatal("root has no persistent --json flag")
+	}
+	// --json is inherited from rootCmd as a persistent flag; a local copy
+	// would shadow it (see TestNoSubcommandShadowsRootJSONFlag). Comparing
+	// against the root flag rather than requiring nil tolerates a sibling test
+	// having already merged the root persistent flags into this command's set.
+	if f := preflightCmd.Flags().Lookup("json"); f != nil && f != rootJSON {
+		t.Error("preflight must not register a local --json; it inherits the root flag")
 	}
 	// refreshBoundCommandConfig consults config only when neither --json nor
 	// its hidden --format alias was given, so this test owns that flag's
@@ -577,15 +782,13 @@ func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
 	}
 
 	oldGlobal := jsonOutput
-	oldValue, oldChanged := flag.Value.String(), flag.Changed
-	oldRootChanged := rootJSON.Changed
+	oldValue, oldRootChanged := rootJSON.Value.String(), rootJSON.Changed
 	oldFormatChanged := rootFormat.Changed
 	// refreshBoundCommandConfig reapplies every config-backed default, not
 	// just json; restore the rest so this test cannot leak into siblings.
 	oldReadonly, oldActor, oldAutoCommit := readonlyMode, actor, doltAutoCommit
 	t.Cleanup(func() {
-		_ = flag.Value.Set(oldValue)
-		flag.Changed = oldChanged
+		_ = rootJSON.Value.Set(oldValue)
 		rootJSON.Changed = oldRootChanged
 		rootFormat.Changed = oldFormatChanged
 		jsonOutput = oldGlobal
@@ -593,9 +796,9 @@ func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
 		config.ResetForTesting()
 	})
 
-	t.Run("flag writes the package global", func(t *testing.T) {
+	t.Run("inherited flag writes the package global", func(t *testing.T) {
 		jsonOutput = false
-		if err := flag.Value.Set("true"); err != nil {
+		if err := rootJSON.Value.Set("true"); err != nil {
 			t.Fatal(err)
 		}
 		if !jsonOutput {
@@ -604,7 +807,6 @@ func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
 	})
 
 	t.Run("neither flag set reports unchanged", func(t *testing.T) {
-		flag.Changed = false
 		rootJSON.Changed = false
 		if commandJSONFlagChanged(preflightCmd) {
 			t.Fatal("preflight reported an explicit --json with neither flag set; the config-file json default would never apply")
@@ -612,9 +814,8 @@ func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
 	})
 
 	t.Run("explicit --json reports changed", func(t *testing.T) {
-		flag.Changed = false
 		rootJSON.Changed = false
-		if err := preflightCmd.Flags().Set("json", "true"); err != nil {
+		if err := preflightCmd.Root().PersistentFlags().Set("json", "true"); err != nil {
 			t.Fatal(err)
 		}
 		if !commandJSONFlagChanged(preflightCmd) {
@@ -629,7 +830,6 @@ func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
 		}
 		config.Set("json", true)
 
-		flag.Changed = false
 		rootJSON.Changed = false
 		rootFormat.Changed = false
 		jsonOutput = false
