@@ -76,7 +76,7 @@ func TestDeleteBatchDryRunHonorsForce(t *testing.T) {
 	store, rootCtx, jsonOutput, quietFlag = s, ctx, false, true
 	t.Cleanup(func() { store, rootCtx, jsonOutput, quietFlag = oldStore, oldRootCtx, oldJSON, oldQuiet })
 
-	if err := deleteBatch(nil, []string{parent.ID}, true, true, false, false, false); err != nil {
+	if err := deleteBatch(nil, []string{parent.ID}, true, true, false, false, false, nil); err != nil {
 		t.Fatalf("forced dry-run rejected a dependent issue: %v", err)
 	}
 	if issue, err := s.GetIssue(ctx, parent.ID); err != nil || issue == nil {
@@ -154,14 +154,16 @@ func TestBulkDeleteNoResurrection(t *testing.T) {
 		t.Errorf("After delete: expected %d issues in DB, got %d", expectedRemaining, stats.TotalIssues)
 	}
 
+	// GetIssue reports a missing issue as storage.ErrNotFound.
 	for _, id := range toDelete {
 		issue, err := s.GetIssue(ctx, id)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
 		if err != nil {
 			t.Fatalf("GetIssue failed for %s: %v", id, err)
 		}
-		if issue != nil {
-			t.Errorf("Deleted issue %s was resurrected!", id)
-		}
+		t.Errorf("Deleted issue %s was resurrected: %+v", id, issue)
 	}
 }
 
