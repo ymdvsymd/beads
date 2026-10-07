@@ -4,11 +4,14 @@ Thank you for your interest in contributing to bd! This document provides guidel
 
 ## Issues and pull requests
 
-GitHub Issues is the public tracker, and every pull request links a
-documented issue. The issue is where the context lives: why the change is
-needed, what it affects, and how we will know it works. File it with the bug
-or feature form before or alongside your pull request; it does not need
-maintainer approval first.
+GitHub Issues is the public tracker. Use an issue when it adds context
+reviewers need: a user-visible bug, a behavior or design change worth
+discussing first, or work that spans several pull requests. The issue holds
+why the change is needed, what it affects, and how we will know it works; file
+it with the bug or feature form before or alongside your pull request, and it
+does not need maintainer approval first. Small, self-explanatory changes
+(typos, flaky tests, refactors, CI or docs tweaks) can go straight to a pull
+request whose description explains the why.
 
 ### Triage labels
 
@@ -53,7 +56,8 @@ area is reviewed first.
 - Go (see `go.mod` for the required version; currently 1.26+)
 - Git
 - A C compiler (CGO is required for the embedded Dolt database)
-- golangci-lint v2.10.1 for the required local lint gate
+- [Bazelisk](https://github.com/bazelbuild/bazelisk) (installed as `bazel`) for
+  the required lint and vet gate (`make ci-pr-lint`) and the pre-commit hook
 - ICU headers are **not required** for building -- see [engdocs/ICU-POLICY.md](engdocs/ICU-POLICY.md)
 
 ### Getting Started
@@ -88,7 +92,7 @@ beads/
 │   ├── types/           # Core data types (Issue, Dependency, etc.)
 │   └── storage/         # Storage interface and implementations
 │       └── dolt/        # Dolt database backend
-├── .golangci.yml        # Linter configuration
+├── .golangci.yml        # Linter configuration (applied by nogo, tools/nogo)
 └── .github/workflows/   # CI/CD pipelines
 ```
 
@@ -111,23 +115,24 @@ We follow standard Go conventions:
 
 ### Linting
 
-Use the same pinned golangci-lint version and repository-owned wrapper as CI:
+Lint and vet run as nogo under Bazel: go test's vet checks plus the
+golangci-lint linters `.golangci.yml` enables, the same analyzers CI gates on.
 
 ```bash
-# Install the version pinned by CI
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
-
-# Run the required formatting and lint contract
+# Run the required lint and vet gate (native, windows and darwin)
 make ci-pr-lint
+
+# Faster: only the Bazel packages of your changed Go files
+make lint-changed
 ```
 
-`make ci-pr-lint` must pass with zero issues. It checks formatting, lints the
-repository's normal `gms_pure_go` build, and cross-lints Windows-only non-CGO
-code. Accepted intentional patterns are encoded narrowly in `.golangci.yml`;
-do not ignore a failing baseline. See [engdocs/LINTING.md](engdocs/LINTING.md)
-for the full policy.
+`make ci-pr-lint` must pass with zero issues. It analyzes the repository's
+normal `gms_pure_go` build and cross-checks the Windows- and macOS-only
+non-cgo code. Accepted intentional patterns are encoded narrowly in
+`.golangci.yml`; do not ignore a failing baseline. See
+[engdocs/LINTING.md](engdocs/LINTING.md) for the full policy.
 
-CI runs the same required wrapper on all pull requests.
+CI runs the same analyzers on all pull requests, in the Bazel test lane.
 
 ## Making Changes
 
@@ -140,14 +145,14 @@ engine, or expand the database schema when issue metadata is sufficient.
 
 ### Workflow
 
-1. Find or file a documented issue (see [Issues and pull requests](#issues-and-pull-requests))
+1. If the change warrants one, find or file an issue (see [Issues and pull requests](#issues-and-pull-requests))
 2. Fork the repository and create a feature branch (`git checkout -b feature/my-feature`)
 3. Make your changes
 4. Add tests for new functionality
 5. Run tests and linter locally
 6. Commit your changes with clear messages
 7. Push to your fork
-8. Open a pull request whose description says `Closes #<issue>`
+8. Open a pull request that explains the change and says `Closes #<issue>` when there is one
 
 ### Commit Messages
 

@@ -88,8 +88,6 @@ var retiredTiers = []retiredTier{
 			"build-artifacts":            "BUILD_ARTIFACTS",
 			"pr-core-wrapper":            "PR_CORE_WRAPPER",
 			"check-cmd-bd-puregeo-tests": "CHECK_CMD_BD_PUREGEO_TESTS",
-			"test-domain-uow":            "TEST_DOMAIN_UOW",
-			"contract-corpus":            "CONTRACT_CORPUS",
 		},
 		bazelLanes: []string{bazelJobName, bazelPureJobName, bazelDoltJobName},
 	},
@@ -1204,9 +1202,6 @@ func TestBazelRetiredLanesCheckListedTestsRan(t *testing.T) {
 // check_shard_coverage.py itself, on a synthetic BEP, test.xml files and
 // shard script.
 func TestCheckShardCoverageScript(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold no tools/bazel Python")
-	}
 	requireHostTool(t, "bash")
 	python := requireHostTool(t, "python3")
 	script := filepath.Join(sourceRepoRoot(t), "tools", "bazel", "check_shard_coverage.py")
@@ -1371,9 +1366,6 @@ esac
 // must really not be a test (TestMain takes *testing.M). Otherwise the
 // checker reports a listed test that "did not run" on every real run.
 func TestShardScriptsListOnlyRealTests(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold neither the shard scripts' sources nor tools/bazel")
-	}
 	// The CI shard scripts use bash 4 associative arrays (Linux runners only).
 	requireAutofixBash(t)
 	root := sourceRepoRoot(t)
@@ -1543,20 +1535,14 @@ func TestShardScriptsListOnlyRealTests(t *testing.T) {
 // otherwise force a full repack and conflict on unrelated shard lines (see
 // --repack below for the explicit opt-in to that). Run --check here so a
 // block with missing/stale/duplicate names fails go test ./scripts/...
-// (and so scripts-go-checks, which runs on fork PRs) instead of only
+// (//scripts:scripts_test under Bazel) instead of only
 // surfacing as a test silently never running in any shard. The legacy
 // 15-shard block is deliberately excluded: its header documents that it is
 // frozen and must not be regenerated (see
 // .github/scripts/proxied-cmd-test-shards.txt and engdocs/TESTING.md), so a
 // --check against it would always fail by design.
 func TestProxiedShardManifestGeneratorNotStale(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold neither the generator's sources nor cmd/bd")
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
-	}
+	python := requireHostTool(t, "python3")
 	root := sourceRepoRoot(t)
 	cmd := exec.Command(python, "scripts/ci/gen_proxied_shard_manifest.py", "30", "--weights=duration", "--check")
 	cmd.Dir = root
@@ -1666,49 +1652,39 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 
 	// Committed rc files: only .bazelrc. .bazelrc.local and user.bazelrc are
 	// developer-local (gitignored) and would be try-imported into CI runs.
-	if os.Getenv("TEST_SRCDIR") == "" {
-		if git, err := exec.LookPath("git"); err == nil {
-			out, err := exec.Command(git, "-C", root, "ls-files").Output()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				base := filepath.Base(f)
-				if strings.Contains(base, "bazelrc") && f != ".bazelrc" && f != setupBazelActionDir+"/write-bazelrc.sh" {
-					t.Errorf("committed rc file %s: .bazelrc's try-import would load it into every CI run", f)
-				}
-			}
+	for _, f := range repoFiles(t, root) {
+		base := filepath.Base(f)
+		if strings.Contains(base, "bazelrc") && f != ".bazelrc" && f != setupBazelActionDir+"/write-bazelrc.sh" {
+			t.Errorf("committed rc file %s: .bazelrc's try-import would load it into every CI run", f)
 		}
 	}
 
 	// The scripts every lane's test runs under or through, and the whole
 	// setup-bazel action (its generated rc applies to every command).
-	if os.Getenv("TEST_SRCDIR") == "" {
-		scriptNarrow := regexp.MustCompile(`-test\.(short|run|skip|list|bench)|BEADS_TEST_SKIP|BEADS_TEST_EMBEDDED_DOLT|BEADS_TEST_PROXIED_SERVER|BEADS_TEST_ENV_RUN_DOLT|BEADS_TEST_REQUIRE_DOLT_CONTAINER|BEADS_TEST_DOLT_SERVER\b|TESTBRIDGE_TEST_ONLY|test_filter|test_arg|_filters\b|cache_test_results|eviction_retries|flaky|runs_per_test|test_sharding_strategy`)
-		files, _ := filepath.Glob(filepath.Join(root, "tools", "bazel", "*.sh"))
-		action, _ := filepath.Glob(filepath.Join(root, setupBazelActionDir, "*"))
-		files = append(files, action...)
-		if len(files) < 5 {
-			t.Fatalf("found only %v", files)
+	scriptNarrow := regexp.MustCompile(`-test\.(short|run|skip|list|bench)|BEADS_TEST_SKIP|BEADS_TEST_EMBEDDED_DOLT|BEADS_TEST_PROXIED_SERVER|BEADS_TEST_ENV_RUN_DOLT|BEADS_TEST_REQUIRE_DOLT_CONTAINER|BEADS_TEST_DOLT_SERVER\b|TESTBRIDGE_TEST_ONLY|test_filter|test_arg|_filters\b|cache_test_results|eviction_retries|flaky|runs_per_test|test_sharding_strategy`)
+	files, _ := filepath.Glob(filepath.Join(root, "tools", "bazel", "*.sh"))
+	action, _ := filepath.Glob(filepath.Join(root, setupBazelActionDir, "*"))
+	files = append(files, action...)
+	if len(files) < 5 {
+		t.Fatalf("found only %v", files)
+	}
+	for _, f := range files {
+		rel, _ := filepath.Rel(root, f)
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, f := range files {
-			rel, _ := filepath.Rel(root, f)
-			data, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatal(err)
+		for i, line := range strings.Split(string(data), "\n") {
+			code := strings.TrimSpace(line)
+			if strings.HasPrefix(code, "#") {
+				continue
 			}
-			for i, line := range strings.Split(string(data), "\n") {
-				code := strings.TrimSpace(line)
-				if strings.HasPrefix(code, "#") {
-					continue
-				}
-				if scriptNarrow.MatchString(code) {
-					t.Errorf("%s:%d %q can select, skip or re-run the retired tiers' lanes' tests", rel, i+1, code)
-				}
-				for _, m := range regexp.MustCompile(`--config=([A-Za-z0-9_-]+)`).FindAllStringSubmatch(code, -1) {
-					if !rcEnabled[m[1]] {
-						t.Errorf("%s:%d enables --config=%s for every command", rel, i+1, m[1])
-					}
+			if scriptNarrow.MatchString(code) {
+				t.Errorf("%s:%d %q can select, skip or re-run the retired tiers' lanes' tests", rel, i+1, code)
+			}
+			for _, m := range regexp.MustCompile(`--config=([A-Za-z0-9_-]+)`).FindAllStringSubmatch(code, -1) {
+				if !rcEnabled[m[1]] {
+					t.Errorf("%s:%d enables --config=%s for every command", rel, i+1, m[1])
 				}
 			}
 		}
@@ -1718,20 +1694,15 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 	// legacy jobs run the same scripts, so they are not changed here): the
 	// command that runs the selected tests is pinned exactly, and nothing
 	// else in them may select, skip, export a tier switch or run tests.
-	if os.Getenv("TEST_SRCDIR") == "" {
-		for _, c := range bazelShardScripts {
-			for _, e := range shardScriptNarrowing(c, readPolicyFile(t, root, c.script)) {
-				t.Error(e)
-			}
+	for _, c := range bazelShardScripts {
+		for _, e := range shardScriptNarrowing(c, readPolicyFile(t, root, c.script)) {
+			t.Error(e)
 		}
 	}
 
 	// The lanes' targets (tagged embedded, dolt-server-proxied or
 	// dolt-server-integration): exactly these, with exactly these args and
 	// env (the legacy jobs' flags; the shard scripts add the rest).
-	if os.Getenv("TEST_SRCDIR") != "" {
-		return // scripts_test's runfiles hold no other package's BUILD
-	}
 	type target struct {
 		args []string
 		env  map[string]string
@@ -1759,6 +1730,14 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 				"BEADS_TEST_BD_BINARY": "$(rlocationpath :bd_for_tests)", "BEADS_TEST_DOLT_SERVER": "local", "BEADS_TEST_GIT_IDENTITY": "1",
 				"BEADS_TEST_GOFMT": "$(rlocationpath @go_sdk//:bin/gofmt)", "BEADS_TEST_PROXIED_SERVER": "1",
 				"BEADS_TEST_REQUIRE_DOLT_CONTAINER": "1", "BEADS_TEST_REQUIRE_SOCAT": "1", "GOMAXPROCS": "4",
+			},
+		},
+		"//cmd/bd:bd_managed_local_test": {
+			[]string{"$(rootpath :bd_test)", "-test.run=^TestManagedLocalProxied", "-test.timeout=15m"},
+			map[string]string{
+				"BEADS_TEST_BD_BINARY": "$(rlocationpath :bd_for_tests)", "BEADS_TEST_DOLT_SERVER": "local",
+				"BEADS_TEST_GOFMT": "$(rlocationpath @go_sdk//:bin/gofmt)", "BEADS_TEST_PREFLIGHT_GO": "$(rlocationpath :preflight_go_fixture)",
+				"BEADS_TEST_PROXIED_LOCAL": "1", "BEADS_TEST_REQUIRE_DOLT_CONTAINER": "1", "BEADS_TEST_SKIP": "dolt",
 			},
 		},
 		"//internal/storage/dolt:dolt_server_conformance_test": {
@@ -1838,6 +1817,18 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 	// pinned ones above, and no .bzl macro, may select, skip or switch off
 	// tests through its args, env or anything else.
 	ruleNarrow := regexp.MustCompile(`-test\.(short|run|skip|list|bench)|BEADS_TEST_SKIP|BEADS_TEST_EMBEDDED_DOLT|TESTBRIDGE_TEST_ONLY|test_filter|flaky\s*=\s*(True|1|[A-Za-z_])`)
+	// Second runs over tests another target already runs in full: the
+	// selection is the point (a required-suite contract that checks it), and
+	// nothing leaves the lanes. Pinned to exactly these args.
+	extraRunVariants := map[string][]string{
+		// The doc-freshness suite (also run by //scripts:scripts_test) under
+		// -required-suite, as pr.yml's former Linux doc-freshness leg ran it.
+		"//scripts:doc_freshness_required_test": {
+			"-test.count=1",
+			"-test.run=^(TestDocFreshness.*|TestRequiredSuiteContract)$$",
+			"-required-suite=doc-freshness",
+		},
+	}
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -1868,7 +1859,18 @@ func TestBazelRetiredLanesCannotBeNarrowed(t *testing.T) {
 		for _, unit := range units {
 			if !isBzl {
 				if name := nameRe.FindStringSubmatch(unit); name != nil {
-					if _, pinned := want["//"+pkg+":"+name[1]]; pinned {
+					label := "//" + pkg + ":" + name[1]
+					if _, pinned := want[label]; pinned {
+						continue
+					}
+					if wantArgs, ok := extraRunVariants[label]; ok {
+						var args []string
+						for _, q := range quoted.FindAllStringSubmatch(bazelAttrBlock(unit, "args"), -1) {
+							args = append(args, q[1])
+						}
+						if !reflect.DeepEqual(args, wantArgs) {
+							t.Errorf("%s args = %q, want exactly %q", label, args, wantArgs)
+						}
 						continue
 					}
 				}
@@ -1958,7 +1960,7 @@ var bazelDoltServerRCLines = map[string][]string{
 // D2 step 2, as review F2/F4 for embedded: the proxied and server lanes run
 // exactly `bazel test //... --config=<config>` (plus nightly's BAZEL_FRESH)
 // with a BEP and nothing else, their configs are exactly the pinned lines,
-// and only test:docker and test:fresh set result caching.
+// and only test:fresh sets result caching.
 func TestBazelRetiredLanesArePinned(t *testing.T) {
 	workflow := readCIWorkflow(t, bazelWorkflowName)
 	for lane, config := range bazelRetiredLaneConfigs {
@@ -2006,13 +2008,13 @@ func TestBazelRetiredLanesArePinned(t *testing.T) {
 		}
 	}
 	// A later --cache_test_results (any config the lanes use) would win.
-	// Only the docker lane and nightly's --config=fresh (appended only when
-	// the caller asks, ci_merge_queue_test.go) turn result caching off.
-	allowed := map[string]bool{"test:docker --nocache_test_results": true, bazelFreshRCLine: true}
+	// Only nightly's --config=fresh (appended only when the caller asks,
+	// ci_merge_queue_test.go) turns result caching off.
+	allowed := map[string]bool{bazelFreshRCLine: true}
 	for _, line := range strings.Split(rc, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "#") && strings.Contains(line, "cache_test_results") && !allowed[line] {
-			t.Errorf(".bazelrc %q: only test:docker and test:fresh set test result caching", line)
+			t.Errorf(".bazelrc %q: only test:fresh sets test result caching", line)
 		}
 	}
 }
@@ -2099,9 +2101,6 @@ func shardScriptNarrowing(c bazelShardScript, src string) []string {
 // The shard script check itself, on the real scripts and on narrowing edits
 // of one (review F2 mutations m2 and m3).
 func TestShardScriptNarrowingCheck(t *testing.T) {
-	if os.Getenv("TEST_SRCDIR") != "" {
-		t.Skip("scripts_test's runfiles hold no .github/scripts")
-	}
 	root := sourceRepoRoot(t)
 	scripts := map[string]bool{}
 	for _, c := range bazelShardScripts {
