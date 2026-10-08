@@ -787,8 +787,8 @@ go_test(
         "global_identity_integration_test.go",
         "gomodcache_rehome_test.go",
         "graph_apply_execution_test.go",
-        "graph_apply_execution_unit_test.go",
         "graph_apply_test.go",
+        "graph_apply_thread_spawner_embedded_test.go",
         "graph_embedded_test.go",
         "graph_export_test.go",
         "graph_proxied_integration_test.go",
@@ -819,9 +819,12 @@ go_test(
         "identity_preview_gate_test.go",
         "identity_preview_refusal_test.go",
         "if_revision_embedded_test.go",
+        "if_revision_gc_matcher_embedded_test.go",
         "if_revision_proxied_close_delete_test.go",
+        "if_revision_proxied_integration_test.go",
         "if_revision_reassign_fence_embedded_test.go",
         "if_revision_reassign_fence_proxied_test.go",
+        "if_revision_reopen_embedded_test.go",
         "if_revision_test.go",
         "import_chunking_embedded_test.go",
         "import_chunking_test.go",
@@ -1551,8 +1554,7 @@ sh_test(
 # instead of skipping every Dolt-gated test into a cached pass. These are
 # the cmd/bd tests no other lane runs: every other configuration of bd_test
 # passes BEADS_TEST_SKIP=dolt (prcore/ci, integration) or runs only its
-# manifest (bd_embedded_test, bd_proxied_test), and so does nightly.yml's
-# go test job. No -test.run/-test.skip: the Go binary shards
+# manifest (bd_embedded_test, bd_proxied_test). No -test.run/-test.skip: the Go binary shards
 # itself over every top-level test (rules_go's TEST_SHARD_INDEX), so each
 # runs in exactly one shard, and check_testcases.py fails a shard that ran
 # none. It repeats bd_test's `env` (the wrapper cannot inherit it).
