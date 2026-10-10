@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `issueops.LeaseReclaimer`, the stale-lease sweep behind `bd reclaim`, is a
+  role on every leg (dolt, embedded dolt, the unit-of-work provider and the
+  HTTP client), and `bd serve` publishes it as `POST /v0/beads/issues:reclaim`
+  behind the new `issues.reclaim` capability (additive; `wire_revision` is
+  unchanged). Every reverted row mints a new revision, reported per entry as
+  `revision`, so a holder that writes with its pre-reclaim token gets a version
+  mismatch. An id that is not a stale lease is left out of the answer, not
+  refused. `bd reclaim` now runs the role on both routes, which changes four
+  things a script can see: its `--json` entries gain `revision`; the
+  workspace's `on_update` hook fires once per reverted row (the raw path fired
+  none); `--id` now accepts at most 1000 ids per run (more is refused, never
+  truncated); and the role records its own version commit, honoring
+  `dolt.auto-commit` the way `bd prune` does, as
+  `bd: reclaim N expired lease(s)` on both routes. Over a connected HTTP
+  workspace `bd reclaim` now works instead of refusing.
+- **`bd show --comments-tail N`** renders only the last N comments in text
+  output (including under `--watch`)
+  ([#6618](https://github.com/gastownhall/beads/pull/6618)), preceded by one
+  elision line naming how many older ones were hidden. A render-only cap for
+  fat, append-only beads whose full comment history is hundreds of KB —
+  description and metadata are unchanged, and omitting the flag (or passing
+  `0`) is byte-identical to today's output. JSON output is untouched;
+  `--include-comments` still streams every comment there.
+
 - `bd create --graph` now plans its batch through `issueops.BatchApplier`
   instead of the old `buildDomainGraphPlan` path, so a graph create gets the
   same atomic multi-row semantics as `bd batch apply`. A `waits-for` edge's
@@ -111,6 +135,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   will not send, and value constraints (`maxLength`, `pattern` and the
   like) are outside the digest: such changes need their own review against
   `wire_revision`.
+- `cmd/bd` registers the http client backend built on top of the v0 `bd
+  serve` wire (`internal/httpclient`), so a workspace whose
+  `.beads/metadata.json` selects `"backend": "http"` opens over HTTP through
+  the ordinary `OpenBestAvailable` path, exactly like a registered extension
+  backend does. A new `bd connect <url>` command performs the handshake
+  (`api_version`, wire revision, and — with `--expect-project-id` — workspace
+  identity) and writes nothing until it succeeds; it then records the
+  per-user activation sidecar (`.beads/http_target.json`, never
+  git-tracked — `cmd/bd/doctor/gitignore.go` now requires it and its local
+  metadata sidecar `http_local_metadata.json` be ignored) and sets
+  `metadata.json`'s backend to `"http"`. `bd connect` refuses a plain `http://`
+  URL to a non-loopback host (a bearer credential would cross the network in
+  the clear) unless `--allow-plaintext` is given, and refuses to switch a
+  workspace that already selects a different backend unless `--force`. A
+  credential is never accepted on the command line or written to disk; it
+  comes from the same ladder every http request already uses
+  (`BEADS_HTTP_TOKEN=host[:port]=<token>`, then
+  `BEADS_HTTP_TOKEN_COMMAND=host[:port]=<command>`, then the credentials
+  file, then none); both variables take only that host-scoped form, and a
+  bare value is refused, since it would be sent to whatever server the
+  workspace's `http_target.json` names. The external-dependency policy
+  decorator (`internal/storage/externaldeps`) still wraps an http store, and
+  stands down only when the server's handshake advertises
+  `policy.external_dependencies` (that server has already applied the policy
+  before answering); against any other server it applies the policy
+  client-side, around the http store's own served roles. Externally blocked
+  issues drop out of `bd ready`'s page, total, and count (the v0 wire cannot
+  express an id exclusion) and out of `bd ready --claim`, `bd close` refuses
+  them without `--force`, and `bd dep tree` shows their external leaves.
+  `bd close --claim-next` refuses over http before anything closes, since
+  the wire's batch close cannot carry the claim; its error says to close
+  without it and then run `bd ready --claim`.
+- The public `backend/http` package (`bdhttp`) is the out-of-tree door onto
+  this backend for an embedder that links beads as a library rather than
+  running `cmd/bd`: `Register(Options)` adds `"http"` to the registry and
+  installs its transport, `Open`/`Handshake` dial a server directly with no
+  workspace on disk, and the existing public `beads.OpenBestAvailableWith`
+  takes a per-call `OpenOptions.Credential` through it — the case a
+  multi-tenant embedder serving many workspaces needs, where a
+  process-global credential cannot stand in for one tenant's own.
+  EXPERIMENTAL, pin an exact beads version.
 
 ### Changed
 
@@ -187,8 +252,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   amendment to a released migration must land as a new migration (0070+, or
   ignored 0028+, as of this change) so installed schemas and freshly-migrated
   ones cannot fork.
+- **BREAKING: the close guards now hold for every close operation, not only
+  `bd close`.** The template read-only guard, the pin guard and the assignee
+  authority fence (be-035) used to be a pre-read in `cmd/bd`, so a close
+  through `bd serve` (`POST /v0/beads/issues/{id}:close`), `issues:batchClose`,
+  a `close` item of `issues:batchApply`, or a library caller of
+  `issueops.Lifecycle.Close`, `BatchCloser` or `BatchApplier` closed a
+  template, a pinned issue, or a bead another actor holds that `bd close`
+  refused. They now live in the role, inside the close's own transaction, on
+  every backend: a template refuses with `*issueops.TemplateReadOnlyError` (no
+  bypass), and unless `Force` is set a pinned issue refuses with
+  `*issueops.PinnedError` and another actor's bead with
+  `*issueops.CloseNotAssigneeError` (matching `ErrNotOwner`). Over HTTP they
+  are `409` `template_read_only`, `issue_pinned` and `not_assignee` (the
+  holder in `assignee`, also on a batch-close outcome), and the client
+  rebuilds the same typed errors. `bd close` prints the same lines and exits
+  as before, and `bd close --if-revision`, which skipped the guards, now
+  applies them too. Two paths stay outside the guards. The raw storage
+  `CloseIssue`, which the molecule auto-close, a `close` line of `bd batch`
+  and the other closes `cmd/bd` makes outside `bd close` use, runs neither the
+  guards nor close policy on dolt, embedded or proxied; over HTTP it now sends
+  `force`, so there it also stops applying close policy, and only a template
+  refuses. A status update into the done category (`bd update -s closed`, a
+  `PATCH` whose `status` is done, an `update` item of `issues:batchApply`)
+  answers to close policy only, as before, so it still closes a pinned issue
+  or another actor's bead. Migration: HTTP and library callers that close
+  pinned issues or beads another actor holds must send `force` (`Force` on the
+  request), or reclaim the bead first; the close operations never close a
+  template, forced or not (pour it instead).
+- **BREAKING (out-of-tree storage backends): a create without a priority now
+  arrives as priority 0 with `DefaultPriority` set.** `bd create` without
+  `--priority`, a `bd create --graph` node without `priority` and a
+  `bd create --file` template without a valid `### Priority` used to reach a
+  backend's `IssueLifecycle().Create`, `BatchCreator().CreateBatch` and
+  `BatchApplier().ApplyBatch` as priority 2. They now arrive as priority 0
+  with `issueops.CreateRequest.DefaultPriority` (or `BatchCreateItem` /
+  `CreateItem.DefaultPriority`) set, as does an HTTP create without
+  `priority` when `bd serve` fronts the backend. The fields are additive, so
+  such a backend compiles unchanged, but the shared preparation that applies
+  the default lives under `internal/`, so a backend that ignores the flag now
+  stores P0 (critical) for those `bd create` paths, and still stores P0 for
+  that HTTP create. Migration: store `issueops.DefaultCreatePriority` when
+  `DefaultPriority` is set, and refuse `DefaultPriority` with a non-zero
+  priority as `ErrValidation`; `conformance.RunRoleContracts` checks both
+  through `RunLifecycleCreateAppliesTheDefaultPriority`,
+  `RunBatchCreatorAppliesTheDefaultPriority` and
+  `RunBatchApplyAppliesTheDefaultPriority`.
 
 ### Fixed
+- **An update of a template is now refused for every caller, not only
+  `bd update`.** The template guard used to be a pre-read in `cmd/bd`, so an
+  update through `bd serve` (`PATCH /v0/beads/issues/{id}`), an `update` item
+  of `issues:batchApply`, or a library caller of `issueops.Lifecycle.Update` or
+  `BatchApplier` edited a template that `bd update` refused. It now lives in
+  the role, in the update's own transaction, on every backend: any update
+  naming a template refuses with `*issueops.TemplateReadOnlyError` (matching
+  `ErrTemplateReadOnly`), whatever its patch and force flags, after the
+  compare-and-set guards. Over HTTP it is `409` `template_read_only`, and the
+  client rebuilds the same typed error. HTTP and library callers that edited
+  templates are now refused (pour the template instead) unless they set the
+  new `UpdateRequest.AllowTemplate` (`allow_template` on the PATCH body), which
+  stands the guard down for that one request. `bd update`, `bd assign` and the
+  proxied `bd tag` print the same line as before; `bd label` and
+  `bd set-state` set `AllowTemplate` and keep editing templates as they always
+  have. A batch create that makes a template and splices its metadata still
+  lands: the splice finishes the create. Version skew: a new `bd` against an
+  older `bd serve` (no `issues.update.allowTemplate` token in the handshake)
+  refuses a single template update itself before dialing, and never sends
+  `allow_template` to it. A batch `update` item gets no such check (its target
+  resolves on the server), so through an older `bd serve` it still edits a
+  template. An older `bd label` or `bd set-state` against a new `bd serve`
+  cannot send `allow_template`, so it now gets `409` `template_read_only` on a
+  template; upgrade the client. Not yet moved: `bd comment`, `bd note`,
+  `bd priority` and `bd tag` still refuse templates with their own pre-read in
+  `cmd/bd` (their direct-route writes do not go through `Lifecycle.Update`), so
+  for those four the guard lives only in the CLI. Claim, reopen, `:casMetadata`
+  and the served `addComment` have no template check at all yet (bd-jkp9v3):
+  `POST /v0/beads/issues/{id}:claim` (`issueops.Claimer`) still claims a
+  template that a `PATCH` with `claim: true` refuses. Close's guards move to
+  the role in their own change (#7425).
+- The dotted-id hierarchy refusal (a child such as `bd-abc.1` may not carry an
+  explicit edge to its own ancestor, other than the parent-child edge to its
+  immediate parent) moved from `cmd/bd` into the library as
+  `issueops.CheckDottedChildDependency` / `*issueops.DottedChildDependencyError`
+  (unwraps to `ErrValidation`). Every `DependencyEditor` (dolt, embedded,
+  unit of work, HTTP) and every `BatchApplier` dep_add item now enforces it, so
+  an HTTP `dependencies:add`, a `batch:apply` edge and `bd create --graph`'s own
+  edges are refused like `bd dep add` (HTTP: 400 `invalid_argument`). `bd dep
+  add`, `bd dep --blocks`, `bd link` and `bd dep add --file` print the same
+  messages as before, and a `bd batch` script's `dep add` line, which neither
+  backend checked, is now refused with that message and rolls the whole batch
+  back. The refusal is decided from the two ids, ahead of every check that
+  reads the stored graph, so for a child whose parent-child edge is already
+  stored (a `bd create --parent` child) an HTTP caller now gets that 400 where
+  it used to get 409 `dependency_cycle` (a blocking type) or
+  `dependency_exists` (any other type).
+- An HTTP create (`issues:create`, `issues:batchCreate`, a `batch:apply`
+  create item) that omits `priority` now stores the create default, P2, as the
+  spec documents, instead of P0 (critical). The default lives in one place:
+  `issueops.CreateRequest.DefaultPriority` (and `BatchCreateItem` /
+  `CreateItem.DefaultPriority`) asks the shared create preparation to store
+  `issueops.DefaultCreatePriority`; the handlers set it for an absent member,
+  the HTTP client omits `priority` for it only when the server advertises the
+  new additive `issues.create.defaultPriority` handshake token (an older
+  `bd serve` reads an absent `priority` as P0, so a new client sends `2`
+  explicitly to it), and `bd create` (no `--priority`),
+  `bd create --graph` (a node without `priority`) and `bd create --file` (a
+  template without `### Priority`) rely on it rather than spelling 2. An
+  explicit `0` is still P0, and `DefaultPriority` with a non-zero priority is
+  `ErrValidation`. CLI output is unchanged on the in-tree backends, except
+  that `bd create --file` now warns on stderr about a `### Priority` it cannot
+  parse, as it already did for `### Type`, rather than dropping it silently.
+  The client decides from the handshake its store cached (once per command
+  in `bd`), so a create that lands on an older build behind the same URL (a
+  `bd serve` rolled back under a live store, or mixed builds during a
+  rollout) still stores P0, with no error on either side.
+  Out-of-tree storage backends must now honor `DefaultPriority`; see the
+  BREAKING (out-of-tree storage backends) entry under `### Changed`.
 - **PRs based on `hotfix/**` branches now run full CI, not just
   cross-version historical smokes and triage labeling.** `pr.yml`,
   `pr-risk.yml`, `conformance.yml`, `cross-version-smoke.yml` and
@@ -1220,15 +1400,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the stale side. Only `bd init`'s own open gets this wording; every other
   open, including the library API, `bd doctor --fix` and `bd bootstrap`, keeps
   the existing message.
-
-- **`bd show --comments-tail N`** renders only the last N comments in text
-  output (including under `--watch`)
-  ([#6618](https://github.com/gastownhall/beads/pull/6618)), preceded by one
-  elision line naming how many older ones were hidden. A render-only cap for
-  fat, append-only beads whose full comment history is hundreds of KB —
-  description and metadata are unchanged, and omitting the flag (or passing
-  `0`) is byte-identical to today's output. JSON output is untouched;
-  `--include-comments` still streams every comment there.
 
 ### Changed
 

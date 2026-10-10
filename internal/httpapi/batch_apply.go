@@ -434,7 +434,9 @@ func applyCreateItem(prefix string, encoded json.RawMessage, raw map[string]json
 		issue.NoHistory = *wire.NoHistory
 	}
 
-	item := &issueops.CreateItem{Key: derefString(wire.Key), Issue: issue}
+	// An absent `priority` is the role's default (CreateItem.DefaultPriority),
+	// never a 0 — which is P0 — made up here.
+	item := &issueops.CreateItem{Key: derefString(wire.Key), Issue: issue, DefaultPriority: wire.Priority == nil}
 	refs, res := applyMetadataRefs(prefix, raw)
 	if res != nil {
 		return nil, res
@@ -1053,6 +1055,14 @@ func (s *Server) failApplyBatch(w http.ResponseWriter, r *http.Request, request 
 	case errors.Is(err, issueops.ErrCloseBlocked):
 		s.fail(w, r, at(closeBlockedResult(err,
 			"an item closes a blocked issue", "clear the blocker, or send the item's force flag"), ""))
+
+	// An update item naming a template, or the close guards on a close item:
+	// the shared mapping, carrying the holder for not_assignee, plus the item
+	// members.
+	case errors.Is(err, issueops.ErrTemplateReadOnly),
+		errors.Is(err, issueops.ErrPinned),
+		errors.As(err, new(*issueops.CloseNotAssigneeError)):
+		s.fail(w, r, at(ClassifyError(err), ""))
 
 	case errors.Is(err, storage.ErrAlreadyClaimed):
 		res := at(newResult(CodeAlreadyClaimed,

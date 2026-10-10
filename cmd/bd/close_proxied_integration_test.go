@@ -283,6 +283,14 @@ func TestProxiedServerClose(t *testing.T) {
 			t.Errorf("close_reason: got %q, want %q", got, "wontfix")
 		}
 	})
+}
+
+// TestProxiedServerCloseB holds more of TestProxiedServerClose's cases, split
+// off so the bd_proxied_test shard manifest can place them on another shard.
+func TestProxiedServerCloseB(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
 
 	t.Run("close_with_comment_alias", func(t *testing.T) {
 		t.Parallel()
@@ -348,14 +356,16 @@ func TestProxiedServerClose(t *testing.T) {
 			t.Errorf("expected 'not found' error, got: %s", out)
 		}
 	})
-
 }
 
-// TestProxiedServerClose3 is the second half of TestProxiedServerClose,
-// split off (as TestProxiedServerClose2 was before it) so that no single
-// top-level suite carries 23 bd-init subtests: that one parent alone cost
-// ~2060 slot-seconds under -test.parallel=4 and pushed its 15-shard legacy
-// shard past go test's 15m timeout on every run (gastownhall/beads#7151).
+// TestProxiedServerClose3 was split off TestProxiedServerClose (as
+// TestProxiedServerClose2 was before it) so that no single top-level suite
+// carries 23 bd-init subtests: that one parent alone cost ~2060
+// slot-seconds under -test.parallel=4 and pushed its 15-shard legacy shard
+// past go test's 15m timeout on every run (gastownhall/beads#7151). Those
+// 23 now sit in TestProxiedServerClose, TestProxiedServerCloseB,
+// TestProxiedServerClose3 and TestProxiedServerClose4. Its own second half
+// is TestProxiedServerClose4.
 func TestProxiedServerClose3(t *testing.T) {
 	requireSharedProxiedServer(t)
 	t.Parallel()
@@ -754,6 +764,14 @@ func TestProxiedServerClose2(t *testing.T) {
 			t.Errorf("expected single-issue error, got: %s", out)
 		}
 	})
+}
+
+// TestProxiedServerClose2B holds more of TestProxiedServerClose2's cases, split
+// off so the bd_proxied_test shard manifest can place them on another shard.
+func TestProxiedServerClose2B(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
 
 	t.Run("close_suggest_next_multiple_ids_fails", func(t *testing.T) {
 		t.Parallel()

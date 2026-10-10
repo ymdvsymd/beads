@@ -161,6 +161,27 @@ const CapIssuesSweepLimit = "issues.sweep.limit"
 // predate it; it refuses locally before the dial when the token is absent.
 const CapBatchApplyDepAddLineage = "issues.batchApply.depAddLineage"
 
+// CapIssuesUpdateAllowTemplate is the behavior capability that advertises
+// two things together: updateIssue enforces the role's template read-only
+// refusal, and UpdateIssueRequest's `allow_template` member (update.go) stands
+// it down for one request (the caller edits a template deliberately). An
+// older server predating this token answers the member with
+// `400 invalid_argument`/`unknown_parameter` and applies no template guard,
+// so a client that does not see the token refuses a template update itself
+// before the dial and sends the request without the member. That fallback
+// covers updateIssue only: an applyBatch `update` item gets no client-side
+// check (its target resolves on the server), so through an older server it
+// still edits a template (bd-jkp9v3).
+const CapIssuesUpdateAllowTemplate = "issues.update.allowTemplate"
+
+// CapIssuesCreateDefaultPriority is the behavior capability that advertises
+// that issues.create, issues.batchCreate and issues.batchApply's create items
+// store the create default priority (P2) for a request whose `priority` member
+// is ABSENT. An older server predating this token reads an absent priority as
+// 0 and stores P0 (critical), so a client that does not see the token MUST
+// send the default explicitly rather than omit the member.
+const CapIssuesCreateDefaultPriority = "issues.create.defaultPriority"
+
 // customMethodTarget splits the custom method off the segment the router
 // matched, and reports the row that claims it.
 //
@@ -784,6 +805,17 @@ var routeTable = []route{
 		handler:     (*Server).handleBatchGetIssues,
 	},
 	{
+		op:     OpReclaimIssues,
+		method: http.MethodPost,
+		// A literal collection-level custom method, registered and preferred
+		// over the claim's wildcard for the sweep row's reason: without it,
+		// a reclaim would parse as a claim of an issue called ":reclaim".
+		pattern:     "/v0/beads/issues:reclaim",
+		capability:  "issues.reclaim",
+		implemented: true,
+		handler:     (*Server).handleReclaimIssues,
+	},
+	{
 		op:     OpAddDependencies,
 		method: http.MethodPost,
 		// A collection-level custom method beside :remove below, and a LITERAL
@@ -911,7 +943,7 @@ func (r route) specPathOf() string {
 var behaviorCapabilities = []string{
 	CapProjectEnforce, CapBatchApplyLarge, CapIssuesListSort, CapIssuesCountScope,
 	CapIssuesSweepWispsPlane, CapIssuesSweepLiveDependents, CapIssuesSweepLimit,
-	CapBatchApplyDepAddLineage,
+	CapBatchApplyDepAddLineage, CapIssuesUpdateAllowTemplate, CapIssuesCreateDefaultPriority,
 }
 
 // Capabilities lists what this build advertises in ContextResponse.capabilities:

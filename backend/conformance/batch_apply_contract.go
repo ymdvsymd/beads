@@ -882,9 +882,12 @@ func RunBatchApplyEvaluatesExpectedAssigneeAsModified(t *testing.T, ctx context.
 // close it. The refusal is the assertion; the rollback of the parent it created
 // is what says the refusal took the request with it.
 //
-// POSITIVE HALF: the identical request with Force lands, which is the whole of
-// what Force does ("bypasses blocker and open-child close policy, and nothing
-// else") and the proof that the refusal was the policy rather than the shape.
+// POSITIVE HALF: the identical request with Force lands, and that is the proof
+// the refusal was the policy rather than the shape. Force "bypasses blocker and
+// open-child close policy, the pin and the assignee fence, and never the
+// template guard" (batchapplier.go), and the parent trips no guard — the
+// unforced half reached the policy, which the guards run before — so the
+// policy is the only refusal Force had to waive.
 func RunBatchApplyClosePolicyEvaluatesAtTheCloseItem(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
 	t.Helper()
 	parent := fixture.IssuePrefix + "-closepolicy-parent"
@@ -924,7 +927,7 @@ func RunBatchApplyClosePolicyEvaluatesAtTheCloseItem(t *testing.T, ctx context.C
 		t.Errorf("%s status = %q under Force, want %q", parent, got, types.StatusClosed)
 	}
 	if got := batchApplyColumn(t, ctx, fixture, "status", child); got != string(types.StatusOpen) {
-		t.Errorf("%s status = %q, want %q: Force bypasses the close policy and nothing else", child, got, types.StatusOpen)
+		t.Errorf("%s status = %q, want %q: Force waives the parent's close policy, it does not close the child", child, got, types.StatusOpen)
 	}
 	assertBatchApplyTypedEdgeCount(t, ctx, fixture, child, parent, string(publicops.DepParentChild), 1)
 }
@@ -2491,4 +2494,288 @@ func batchApplyHistoryMatching(t *testing.T, ctx context.Context, fixture BatchA
 		t.Fatalf("CountHistoryMatching(%q): %v", pattern, err)
 	}
 	return count
+}
+
+// RunBatchApplyUpdateItemsRefuseATemplate pins that an update item answers to
+// Lifecycle.Update's template guard: an item targeting a template refuses with
+// an *ItemError carrying *TemplateReadOnlyError, whatever force flags it
+// carries, and the request is all or nothing, so the create ahead of it does
+// not land and the template is untouched.
+func RunBatchApplyUpdateItemsRefuseATemplate(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
+	t.Helper()
+	template := fixture.IssuePrefix + "-tmplupd-template"
+	bystander := fixture.IssuePrefix + "-tmplupd-bystander"
+	seeded := batchApplyIssue(template, "a template")
+	seeded.IsTemplate = true
+	if err := fixture.CreateIssue(ctx, seeded, "seed"); err != nil {
+		t.Fatalf("seed %s: %v", template, err)
+	}
+
+	update := batchApplyUpdate(publicops.Ref{ID: template}, publicops.IssuePatch{
+		Title:  publicops.Field[string]{Set: true, Value: "edited"},
+		Status: publicops.Field[publicops.Status]{Set: true, Value: types.StatusClosed},
+	})
+	update.Update.ForceClosePolicy = true
+	_, err := fixture.BatchApplier.ApplyBatch(ctx, publicops.ApplyBatchRequest{
+		Actor:         "apply-writer",
+		ForceIDPrefix: true,
+		Items: []publicops.ApplyItem{
+			batchApplyCreate("bystander", batchApplyIssue(bystander, "must not land beside a refusal")),
+			update,
+		},
+	})
+	var itemErr *publicops.ItemError
+	if !errors.As(err, &itemErr) {
+		t.Fatalf("an update item on template %s: error = %v, want an *ItemError", template, err)
+	}
+	if itemErr.Kind != publicops.ItemUpdate || itemErr.Index != 1 {
+		t.Errorf("ItemError = %#v, want the update item at index 1", itemErr)
+	}
+	var refusal *publicops.TemplateReadOnlyError
+	if !errors.As(err, &refusal) || refusal.IssueID != template {
+		t.Errorf("update item on template = %v, want *TemplateReadOnlyError naming %s", err, template)
+	}
+	assertBatchApplyRowCount(t, ctx, fixture, "issues", bystander, 0)
+	if got := batchApplyColumn(t, ctx, fixture, "title", template); got != "a template" {
+		t.Errorf("%s title after the refusal = %q, want it untouched", template, got)
+	}
+	if got := batchApplyColumn(t, ctx, fixture, "status", template); got != string(types.StatusOpen) {
+		t.Errorf("%s status after the refusal = %q, want it untouched", template, got)
+	}
+}
+
+// RunBatchApplySplicesTheMetadataOfATemplateItCreates is the template guard's
+// boundary: the one write a template legitimately takes inside a batch is a
+// CREATE item that makes it and asks for a metadata splice. The splice runs as
+// an update of the row the request itself is creating, after every id exists,
+// and it must land — the template is being written, not modified — so a guard
+// placed where the splice reaches it would refuse a template's own creation.
+func RunBatchApplySplicesTheMetadataOfATemplateItCreates(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
+	t.Helper()
+	created := fixture.IssuePrefix + "-tmplsplice-created"
+	fresh := batchApplyIssue(created, "a template this request creates")
+	fresh.IsTemplate = true
+	item := batchApplyCreate("created", fresh)
+	item.Create.MetadataRefs = map[string]publicops.Ref{"gc.self": {Key: "created"}}
+	batchApplyMust(t, ctx, fixture, publicops.ApplyBatchRequest{
+		Actor: "apply-writer", ForceIDPrefix: true, Items: []publicops.ApplyItem{item},
+	})
+	if _, ok := batchApplyMetadataKey(t, ctx, fixture, created, "gc.self"); !ok {
+		t.Errorf("%s carries no gc.self key: the splice that finishes a template's own create must land", created)
+	}
+}
+
+// RunBatchApplyCloseItemsAnswerToTheCloseGuards pins that a close item answers
+// to the close guards Lifecycle.Close states, under CloseRequest's rules: a
+// template refuses forced or not, a pin and another actor's bead refuse unless
+// the item's Force is set. A refusal is the item's *ItemError carrying the
+// guard's typed error, and the request is all or nothing, so the create item
+// ahead of it does not land.
+//
+// The assignee case is AS-MODIFIED: the holder is set by an update item of the
+// same request, so a guard that read the row before the request began — or not
+// at all — closes it.
+func RunBatchApplyCloseItemsAnswerToTheCloseGuards(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
+	t.Helper()
+	template := fixture.IssuePrefix + "-closeguard-template"
+	pinned := fixture.IssuePrefix + "-closeguard-pinned"
+	held := fixture.IssuePrefix + "-closeguard-held"
+	bystander := fixture.IssuePrefix + "-closeguard-bystander"
+	for _, issue := range []*types.Issue{
+		{ID: template, IsTemplate: true},
+		{ID: pinned, Pinned: true},
+		{ID: held},
+	} {
+		issue.Title, issue.Status, issue.Priority, issue.IssueType = issue.ID, types.StatusOpen, 2, types.TypeTask
+		if err := fixture.CreateIssue(ctx, issue, "seed"); err != nil {
+			t.Fatalf("seed %s: %v", issue.ID, err)
+		}
+	}
+
+	plan := func(target string, force bool, extra ...publicops.ApplyItem) publicops.ApplyBatchRequest {
+		closeItem := batchApplyClose(publicops.Ref{ID: target})
+		closeItem.Close.Force = force
+		items := []publicops.ApplyItem{batchApplyCreate("bystander", batchApplyIssue(bystander, "must not land beside a refusal"))}
+		items = append(items, extra...)
+		return publicops.ApplyBatchRequest{Actor: "apply-closer", ForceIDPrefix: true, Items: append(items, closeItem)}
+	}
+	refused := func(label string, request publicops.ApplyBatchRequest, check func(error)) {
+		t.Helper()
+		_, err := fixture.BatchApplier.ApplyBatch(ctx, request)
+		var itemErr *publicops.ItemError
+		if !errors.As(err, &itemErr) {
+			t.Fatalf("%s: error = %v, want an *ItemError", label, err)
+		}
+		if itemErr.Kind != publicops.ItemClose || itemErr.Index != len(request.Items)-1 {
+			t.Errorf("%s: ItemError = %#v, want the close item at index %d", label, itemErr, len(request.Items)-1)
+		}
+		check(err)
+		assertBatchApplyRowCount(t, ctx, fixture, "issues", bystander, 0)
+	}
+
+	for _, force := range []bool{false, true} {
+		refused("template close item", plan(template, force), func(err error) {
+			var refusal *publicops.TemplateReadOnlyError
+			if !errors.As(err, &refusal) || refusal.IssueID != template {
+				t.Errorf("template close item (force=%v) = %v, want *TemplateReadOnlyError naming %s", force, err, template)
+			}
+		})
+	}
+	refused("pinned close item", plan(pinned, false), func(err error) {
+		var refusal *publicops.PinnedError
+		if !errors.As(err, &refusal) || refusal.IssueID != pinned {
+			t.Errorf("pinned close item = %v, want *PinnedError naming %s", err, pinned)
+		}
+	})
+	assign := batchApplyUpdate(publicops.Ref{ID: held}, publicops.IssuePatch{Assignee: publicops.Field[string]{Set: true, Value: "holder"}})
+	refused("held close item", plan(held, false, assign), func(err error) {
+		var refusal *publicops.CloseNotAssigneeError
+		if !errors.As(err, &refusal) {
+			t.Errorf("close item on a bead an earlier item assigned away = %v, want *CloseNotAssigneeError", err)
+			return
+		}
+		if refusal.IssueID != held || refusal.Assignee != "holder" || refusal.Actor != "apply-closer" {
+			t.Errorf("assignee refusal = %#v, want IssueID %q, Assignee holder, Actor apply-closer", refusal, held)
+		}
+	})
+	for _, id := range []string{template, pinned, held} {
+		if got := batchApplyColumn(t, ctx, fixture, "status", id); got != string(types.StatusOpen) {
+			t.Errorf("%s status after the refusals = %q, want it still open", id, got)
+		}
+	}
+
+	// The item's Force waives the pin and the assignee fence.
+	forcedPin := plan(pinned, true)
+	forcedPin.Items = forcedPin.Items[1:]
+	batchApplyMust(t, ctx, fixture, forcedPin)
+	forcedHeld := plan(held, true, assign)
+	forcedHeld.Items = forcedHeld.Items[1:]
+	batchApplyMust(t, ctx, fixture, forcedHeld)
+	for _, id := range []string{pinned, held} {
+		if got := batchApplyColumn(t, ctx, fixture, "status", id); got != string(types.StatusClosed) {
+			t.Errorf("%s status under the item's Force = %q, want %q", id, got, types.StatusClosed)
+		}
+	}
+}
+
+// RunBatchApplyRefusesADottedChildGatedOnItsOwnParent pins the dotted-id
+// hierarchy rule (publicops.CheckDottedChildDependency) on a dep_add item: an
+// edge from a dotted-id child to its own ancestor is refused with an
+// *ItemError naming the edge, and the whole request rolls back. The rule is
+// applied to the RESOLVED ids, so a key bound to a dotted child this request
+// creates — the `bd create --graph` shape — is refused like a stored id.
+//
+// POSITIVE HALF: the parent-child edge to the immediate dotted parent lands.
+//
+// WITH THE HIERARCHY STORED: once that edge exists (the shape `bd create
+// --parent` leaves), a blocking edge on the same pair is still this validation
+// refusal, not the hierarchy conflict the stored edge would raise (which does
+// not match ErrValidation) — the rule reads only the resolved ids, so it
+// answers first — and the stored edge survives.
+func RunBatchApplyRefusesADottedChildGatedOnItsOwnParent(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
+	t.Helper()
+	parent := fixture.IssuePrefix + "-dotted"
+	child := parent + ".1"
+	minted := parent + ".2"
+	batchApplySeedIssue(t, ctx, fixture, parent, types.StatusOpen)
+	batchApplySeedIssue(t, ctx, fixture, child, types.StatusOpen)
+
+	for _, refused := range []struct {
+		name  string
+		items []publicops.ApplyItem
+		index int
+	}{
+		{"a stored child blocking on its parent", []publicops.ApplyItem{
+			batchApplyDepAdd(publicops.Ref{ID: child}, publicops.Ref{ID: parent}, publicops.DepBlocks, ""),
+		}, 0},
+		{"a child this request creates blocking on its parent", []publicops.ApplyItem{
+			batchApplyCreate("child", batchApplyIssue(minted, "the new child")),
+			batchApplyDepAdd(publicops.Ref{Key: "child"}, publicops.Ref{ID: parent}, publicops.DepBlocks, ""),
+		}, 1},
+	} {
+		_, err := fixture.BatchApplier.ApplyBatch(ctx, publicops.ApplyBatchRequest{
+			Actor:         "apply-writer",
+			ForceIDPrefix: true,
+			Items:         refused.items,
+		})
+		if !errors.Is(err, publicops.ErrValidation) {
+			t.Errorf("%s: error = %v, want ErrValidation", refused.name, err)
+			continue
+		}
+		var itemErr *publicops.ItemError
+		if !errors.As(err, &itemErr) {
+			t.Errorf("%s: error = %v, want an *ItemError naming the edge item", refused.name, err)
+			continue
+		}
+		if itemErr.Index != refused.index || itemErr.Kind != publicops.ItemDepAdd {
+			t.Errorf("%s: ItemError = %#v, want Index %d and Kind %q", refused.name, itemErr, refused.index, publicops.ItemDepAdd)
+		}
+	}
+	assertBatchApplyEdgeCount(t, ctx, fixture, child, parent, 0)
+	assertBatchApplyRowCount(t, ctx, fixture, "issues", minted, 0)
+
+	batchApplyMust(t, ctx, fixture, publicops.ApplyBatchRequest{
+		Actor: "apply-writer",
+		Items: []publicops.ApplyItem{
+			batchApplyDepAdd(publicops.Ref{ID: child}, publicops.Ref{ID: parent}, publicops.DepParentChild, ""),
+		},
+	})
+	assertBatchApplyEdgeCount(t, ctx, fixture, child, parent, 1)
+
+	_, err := fixture.BatchApplier.ApplyBatch(ctx, publicops.ApplyBatchRequest{
+		Actor: "apply-writer",
+		Items: []publicops.ApplyItem{
+			batchApplyDepAdd(publicops.Ref{ID: child}, publicops.Ref{ID: parent}, publicops.DepBlocks, ""),
+		},
+	})
+	var itemErr *publicops.ItemError
+	if !errors.Is(err, publicops.ErrValidation) || !errors.As(err, &itemErr) {
+		t.Errorf("blocks on a parent whose parent-child edge is stored: error = %v, want an *ItemError matching ErrValidation", err)
+	}
+	assertBatchApplyEdgeCount(t, ctx, fixture, child, parent, 1)
+}
+
+// RunBatchApplyAppliesTheDefaultPriority pins CreateItem.DefaultPriority: a
+// create item that asks for the default stores publicops.DefaultCreatePriority,
+// and one naming priority 0 stores P0. `bd create --graph` sends a node without
+// a priority this way, and so does an HTTP batch apply create item without one.
+// A create item asking for the default while naming a priority is
+// ErrValidation and writes nothing, as it is for Lifecycle.Create.
+func RunBatchApplyAppliesTheDefaultPriority(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
+	t.Helper()
+	unset := batchApplyMintedIssue("defaulted")
+	unset.Priority = 0
+	zero := batchApplyMintedIssue("critical")
+	zero.Priority = 0
+	result := batchApplyMust(t, ctx, fixture, publicops.ApplyBatchRequest{
+		Actor: "apply-writer",
+		Items: []publicops.ApplyItem{
+			{Kind: publicops.ItemCreate, Create: &publicops.CreateItem{Key: "d", Issue: unset, DefaultPriority: true}},
+			{Kind: publicops.ItemCreate, Create: &publicops.CreateItem{Key: "z", Issue: zero}},
+		},
+	})
+	for key, want := range map[string]int{"d": publicops.DefaultCreatePriority, "z": 0} {
+		id := result.Keys[key]
+		if id == "" {
+			t.Fatalf("key %q bound no id: %v", key, result.Keys)
+		}
+		if got := batchApplyCount(t, ctx, fixture, "SELECT priority FROM issues WHERE id = ?", []any{id}); got != want {
+			t.Errorf("stored priority of %s (%s) = %d, want %d", key, id, got, want)
+		}
+	}
+
+	conflict := fixture.IssuePrefix + "-prio-conflict"
+	clash := batchApplyIssue(conflict, conflict)
+	clash.Priority = 3
+	_, err := fixture.BatchApplier.ApplyBatch(ctx, publicops.ApplyBatchRequest{
+		Actor:         "apply-writer",
+		ForceIDPrefix: true,
+		Items: []publicops.ApplyItem{
+			{Kind: publicops.ItemCreate, Create: &publicops.CreateItem{Key: "c", Issue: clash, DefaultPriority: true}},
+		},
+	})
+	if !errors.Is(err, publicops.ErrValidation) {
+		t.Fatalf("DefaultPriority with priority 3: err = %v, want ErrValidation", err)
+	}
+	assertBatchApplyRowCount(t, ctx, fixture, "issues", conflict, 0)
 }

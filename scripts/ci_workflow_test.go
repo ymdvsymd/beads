@@ -1779,7 +1779,7 @@ const (
 // bazel.yml's jobs: the rbe job that decides the execution mode, the
 // --config=ci lane, one job per CI job a Bazel config mirrors, and the two
 // package gates (F3), sorted alphabetically to match TestBazelWorkflowJobsAndExecutionMode's sort.Strings.
-var bazelJobNames = []string{bazelCmdDoltJobName, bazelDoltJobName, bazelEmbedJobName, bazelIntegJobName, bazelProxiedJobName, bazelPureJobName, bazelReleaseCrossJobName, bazelServerJobName, bazelJobName, bazelPackageMCPJobName, bazelPackageNPMJobName, bazelRBEJobName, bazelRBEPrewarmJobName}
+var bazelJobNames = []string{bazelCmdDoltJobName, bazelDoltJobName, bazelEmbedJobName, bazelIntegJobName, bazelProxiedJobName, bazelPureJobName, bazelReleaseCrossJobName, bazelServerJobName, bazelJobName, bazelPackageMCPJobName, bazelPackageNPMJobName, bazelRBEJobName, bazelRBEPrewarmJobName, bazelRRCSeedJob, bazelRRCVerifyJob}
 
 // The lanes that only run remotely (skipped unless the rbe job chose remote);
 // bazel-integration runs remotely or with the read-only cache (bazelIntegIf);
@@ -1941,8 +1941,8 @@ const bazelIntegIf = "${{ (needs.rbe.outputs.enabled == 'true' || needs.rbe.outp
 const bazelPackageGatesIf = "${{ inputs.package-gates == 'on' }}"
 
 // F3: the package gates' runners (bazelPackageRunsOn, in
-// ci_blacksmith_runner_test.go with the other runner sizes) are larger than
-// bazel.yml's usual 2 vCPU because they run pytest/npm on the runner itself.
+// ci_blacksmith_runner_test.go with the other runner sizes) are sized for
+// pytest/npm on the runner itself, not for a Bazel client alone.
 // Mode remote only: the gates take no rbe-fork certificate, so fork modes
 // (enabled too) build bd with go build on a GitHub-hosted runner, as before.
 
@@ -2148,6 +2148,9 @@ func TestBazelWorkflowJobsAndExecutionMode(t *testing.T) {
 		if !reflect.DeepEqual([]string(job.Needs), []string{bazelRBEJobName}) {
 			t.Errorf("%s needs = %v, want [%s]", name, job.Needs, bazelRBEJobName)
 		}
+		if isBazelRRCJob(name) {
+			continue // runner, if and setup-bazel: bazel_rrc_test.go
+		}
 		// F3: the package gates use larger runners (bazelPackageRunsOn) and
 		// their own if (the caller's package-gates input, not the rbe job's
 		// mode - they never skip for execution-mode reasons).
@@ -2164,11 +2167,11 @@ func TestBazelWorkflowJobsAndExecutionMode(t *testing.T) {
 			// lane does: its build is --config=integration's.
 			wantJobIf = bazelIntegIf
 		} else if name == bazelRBEPrewarmJobName {
-			// Same runs-on ternary as every other lane (wantRunsOn, set
-			// above); only the if differs. Not a lane: never uses
+			// The lanes' runs-on ternary at 2 vCPU (no Bazel client); only
+			// the size and the if differ. Not a lane: never uses
 			// setup-bazel, so wantJobSetupEnv is moot (the per-step check
 			// below only fires for a setup-bazel step).
-			wantJobIf = bazelRBEPrewarmIf
+			wantJobRunsOn, wantJobIf = bazelPrewarmRunsOn, bazelRBEPrewarmIf
 		}
 		if job.RunsOn != wantJobRunsOn {
 			t.Errorf("%s runs-on = %q, want %q", name, job.RunsOn, wantJobRunsOn)
@@ -2711,8 +2714,8 @@ func TestBazelLaneIsGated(t *testing.T) {
 		"rbe-mode":    "${{ jobs." + bazelRBEJobName + ".outputs.mode }}",
 	}
 	for name, job := range workflow.Jobs {
-		if name == bazelRBEJobName {
-			continue
+		if name == bazelRBEJobName || isBazelRRCJob(name) {
+			continue // the rrc jobs never run in a PR call (bazel_rrc_test.go)
 		}
 		_, gated := bazelLaneGateIDs[name]
 		_, advisory := bazelAdvisoryLanes[name]
@@ -2756,14 +2759,15 @@ func TestBazelLaneIsGated(t *testing.T) {
 	}
 
 	// One caller on PR events: pr.yml's bazel job, with the four RBE secrets
-	// only, read-only contents, and no if (the rbe job decides).
+	// only, bazelCallPermissions (contents: read, plus what the rrc jobs,
+	// which never run on a PR, ask for), and no if (the rbe job decides).
 	pr := readCIWorkflow(t, "pr.yml")
 	bazel := pr.job(t, "bazel")
 	if bazel.Uses != "./.github/workflows/"+bazelWorkflowName || bazel.If != "" || len(bazel.Needs) != 0 {
 		t.Errorf("pr.yml bazel job uses=%q if=%q needs=%v; want an unconditional call of %s", bazel.Uses, bazel.If, bazel.Needs, bazelWorkflowName)
 	}
-	if !reflect.DeepEqual(bazel.Permissions, map[string]any{"contents": "read"}) {
-		t.Errorf("pr.yml bazel job permissions = %v, want contents: read", bazel.Permissions)
+	if !reflect.DeepEqual(bazel.Permissions, bazelCallPermissions) {
+		t.Errorf("pr.yml bazel job permissions = %v, want %v", bazel.Permissions, bazelCallPermissions)
 	}
 	if !reflect.DeepEqual(bazel.With, bazelPRCallWith) {
 		t.Errorf("pr.yml bazel job with = %v, want exactly %v (no rbe or other override)", bazel.With, bazelPRCallWith)
@@ -3039,6 +3043,11 @@ func bazelLaneRunModes(t *testing.T, lane, ifExpr string, with map[string]string
 		// bazelAdvisoryLanes' name-specific exception in
 		// TestBazelGateSimulation below).
 		return map[string]bool{"remote": true}
+	case bazelRRCSeedJobIf, bazelRRCVerifyJobIf:
+		// The remote repo contents cache's writer (push to main) and
+		// nightly check (schedule, dispatch): never in a pull_request,
+		// merge_group or pull_request_target call, in any mode.
+		return map[string]bool{}
 	}
 	t.Fatalf("%s if = %q: teach bazelLaneRunModes which modes run it", lane, ifExpr)
 	return nil
@@ -4182,12 +4191,13 @@ func TestBazelDoltServerTiers(t *testing.T) {
 	}{
 		// +2 over the earlier counts: the CI analytics summary/upload steps
 		// (S3; see bazel-test's "CI analytics summary" comment), added to
-		// every lane job ahead of the result recorder.
-		{bazelProxiedJobName, "doltserver-proxied", "bazel-proxied-testlogs", 10},
+		// every lane job ahead of the result recorder. +1: the remote repo
+		// contents cache reader (TestBazelRRCReadSteps).
+		{bazelProxiedJobName, "doltserver-proxied", "bazel-proxied-testlogs", 11},
 		// One more than bazel-proxied: a "Shard balance" step (rbe-ci-cost-
 		// latency-study.md recommendation 4), since this is the tier whose
 		// last shard has trailed the rest by 4.3-4.5 min in 2 of 8 runs.
-		{bazelServerJobName, "doltserver-integration", "bazel-server-storage-testlogs", 11},
+		{bazelServerJobName, "doltserver-integration", "bazel-server-storage-testlogs", 12},
 	} {
 		job := workflow.job(t, c.job)
 		if job.TimeoutMinutes == 0 || job.TimeoutMinutes > 30 {
@@ -4195,7 +4205,7 @@ func TestBazelDoltServerTiers(t *testing.T) {
 		}
 		assertBazelTierStep(t, job, c.job, c.config)
 		if n := len(job.Steps); n != c.wantSteps {
-			t.Errorf("%s has %d steps, want %d (checkout, setup-bazel, the flaky query, the tier, check_testcases.py, check_shard_coverage.py, [shard_budget.py,] log upload, CI analytics summary, CI analytics upload, result recorder)", c.job, n, c.wantSteps)
+			t.Errorf("%s has %d steps, want %d (checkout, the rrc reader, setup-bazel, the flaky query, the tier, check_testcases.py, check_shard_coverage.py, [shard_budget.py,] log upload, CI analytics summary, CI analytics upload, result recorder)", c.job, n, c.wantSteps)
 		}
 		logs := job.step(t, "Upload test logs")
 		if logs.If != "${{ failure() && steps.test.outcome != 'skipped' }}" || logs.With["name"] != c.logs || !strings.HasPrefix(logs.Uses, "actions/upload-artifact@") {
@@ -4341,6 +4351,7 @@ func TestBazelEmbeddedJobRunsEmbeddedTier(t *testing.T) {
 		job, script, pkg, target string
 	}{
 		{"test-embedded-cmd", ".github/scripts/embedded-test-shard.sh", "cmd/bd", "bd_embedded_test"},
+		{"test-embedded-cmd", ".github/scripts/embedded-test-shard.sh", "cmd/bd", "bd_embedded_part2_test"},
 		{"test-embedded-storage", ".github/scripts/embedded-storage-test-shard.sh", "internal/storage/embeddeddolt", "embeddeddolt_embedded_test"},
 	}
 	for _, c := range sharded {
@@ -4384,18 +4395,40 @@ func TestBazelEmbeddedJobRunsEmbeddedTier(t *testing.T) {
 	}
 	// The cmd jobs' subprocess bd is the race build, as //cmd/bd:bd is
 	// under --config=embedded (bd_for_tests never is).
-	rule := bazelRuleBlock(readPolicyFile(t, sourceRepoRoot(t), "cmd/bd/BUILD.bazel"), "bd_embedded_test")
-	if !strings.Contains(rule, `"BEADS_TEST_BD_BINARY": "$(rlocationpath :bd)"`) {
-		t.Errorf("cmd/bd:bd_embedded_test must run the race //cmd/bd:bd as BEADS_TEST_BD_BINARY:\n%s", rule)
+	for _, name := range embeddedCmdTargets {
+		rule := bazelRuleBlock(readPolicyFile(t, sourceRepoRoot(t), "cmd/bd/BUILD.bazel"), name)
+		if !strings.Contains(rule, `"BEADS_TEST_BD_BINARY": "$(rlocationpath :bd)"`) {
+			t.Errorf("cmd/bd:%s must run the race //cmd/bd:bd as BEADS_TEST_BD_BINARY:\n%s", name, rule)
+		}
 	}
 
 	// The retired test-embedded-conformance job's two partitions, frozen.
+	// Core runs as two targets: embeddeddolt_conformance_core_test runs the
+	// job's core selector but also skips conformanceCoreSlowGroups, which
+	// embeddeddolt_conformance_core_slow_test runs instead, so between them
+	// they run every core group exactly once.
 	conformance := map[string]string{
 		"core":  `/tmp/embeddeddolt-test -test.v -test.count=1 -test.timeout=30m -test.run '^TestConformance$' -test.skip '^TestConformance$/^Audit$'`,
 		"audit": `/tmp/embeddeddolt-test -test.v -test.count=1 -test.timeout=30m -test.run '^TestConformance$/^Audit$'`,
 	}
+	slow := strings.Join(conformanceCoreSlowGroups, "|")
+	// What each target's rule must say instead of the job's own selector.
+	retarget := map[string]map[string]string{
+		"embeddeddolt_conformance_core_test": {
+			`"-test.skip=^TestConformance$$/^Audit$$",`: `"-test.skip=^TestConformance$$/^(Audit|` + slow + `)$$",`,
+		},
+		"embeddeddolt_conformance_core_slow_test": {
+			`"-test.run=^TestConformance$$",`:           `"-test.run=^TestConformance$$/^(` + slow + `)$$",`,
+			`"-test.skip=^TestConformance$$/^Audit$$",`: "",
+		},
+	}
 	quoted := regexp.MustCompile(`(-test\.[a-z]+) '([^']*)'|(-test\.[a-z]+=\S+|-test\.v)`)
-	for partition, target := range map[string]string{"core": "embeddeddolt_conformance_core_test", "audit": "embeddeddolt_conformance_audit_test"} {
+	for _, c := range []struct{ partition, target string }{
+		{"core", "embeddeddolt_conformance_core_test"},
+		{"core", "embeddeddolt_conformance_core_slow_test"},
+		{"audit", "embeddeddolt_conformance_audit_test"},
+	} {
+		partition, target := c.partition, c.target
 		run := conformance[partition]
 		fields := strings.Fields(run)
 		if len(fields) == 0 || fields[0] != "/tmp/embeddeddolt-test" {
@@ -4403,15 +4436,22 @@ func TestBazelEmbeddedJobRunsEmbeddedTier(t *testing.T) {
 		}
 		var want []string
 		for _, m := range quoted.FindAllStringSubmatch(run, -1) {
+			var w string
 			switch {
 			case m[1] != "":
-				want = append(want, `"`+m[1]+"="+strings.ReplaceAll(m[2], "$", "$$")+`",`)
+				w = `"` + m[1] + "=" + strings.ReplaceAll(m[2], "$", "$$") + `",`
 			case strings.HasPrefix(m[3], "-test.timeout="):
 				// Documented deviation: Bazel kills at 1200s without a
 				// goroutine dump, so the variant's Go timeout is 19m.
-				want = append(want, `"-test.timeout=19m",`)
+				w = `"-test.timeout=19m",`
 			default:
-				want = append(want, `"`+m[3]+`",`)
+				w = `"` + m[3] + `",`
+			}
+			if r, ok := retarget[target][w]; ok {
+				w = r
+			}
+			if w != "" {
+				want = append(want, w)
 			}
 		}
 		if len(want) < 4 {
@@ -4425,6 +4465,14 @@ func TestBazelEmbeddedJobRunsEmbeddedTier(t *testing.T) {
 		}
 	}
 }
+
+// conformanceCoreSlowGroups are the conformance.RunAll groups
+// embeddeddolt_conformance_core_slow_test runs and
+// embeddeddolt_conformance_core_test skips. The core target skips only these
+// names, so a group renamed or added in RunAll still runs there: a name here
+// that RunAll no longer has matches nothing in either target and loses no
+// group, only the split (core gets slower again).
+var conformanceCoreSlowGroups = []string{"ReadyCountsPageChunking", "Portable"}
 
 // bazel-pure replaces pr.yml's check-cmd-bd-puregeo-tests job: the same pure
 // cmd/bd test selector, the same pure build set, and the js/wasm hook test
@@ -4749,12 +4797,15 @@ func TestBazelRBEJobDecidesOnce(t *testing.T) {
 		"enabled": "${{ steps.decide.outputs.enabled }}",
 		"mode":    "${{ steps.decide.outputs.mode }}",
 		"tier":    "${{ steps.decide.outputs.tier }}",
+		// The remote repo contents cache's switch, from decide's mode
+		// (TestBazelRRCModeStep).
+		"rrc": "${{ steps.rrc.outputs.rrc }}",
 	}
 	if !reflect.DeepEqual(job.Outputs, wantOutputs) {
 		t.Errorf("%s outputs = %v, want %v", bazelRBEJobName, job.Outputs, wantOutputs)
 	}
-	if len(job.Steps) != 3 {
-		t.Fatalf("%s has %d steps, want the decision step and the worker-env preflight's checkout and check", bazelRBEJobName, len(job.Steps))
+	if len(job.Steps) != 4 {
+		t.Fatalf("%s has %d steps, want the decision step, the rrc step and the worker-env preflight's checkout and check", bazelRBEJobName, len(job.Steps))
 	}
 	step := job.Steps[0]
 	wantEnv := map[string]string{

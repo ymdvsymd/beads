@@ -255,6 +255,31 @@ func TestBatchApplyContract(t *testing.T) {
 		defer cancel()
 		conformance.RunBatchApplyRefusesAnUnusableRequest(t, ctx, fixture)
 	})
+	t.Run("UpdateItemsRefuseATemplate", func(t *testing.T) {
+		ctx, cancel := testContext(t)
+		defer cancel()
+		conformance.RunBatchApplyUpdateItemsRefuseATemplate(t, ctx, fixture)
+	})
+	t.Run("SplicesTheMetadataOfATemplateItCreates", func(t *testing.T) {
+		ctx, cancel := testContext(t)
+		defer cancel()
+		conformance.RunBatchApplySplicesTheMetadataOfATemplateItCreates(t, ctx, fixture)
+	})
+	t.Run("CloseItemsAnswerToTheCloseGuards", func(t *testing.T) {
+		ctx, cancel := testContext(t)
+		defer cancel()
+		conformance.RunBatchApplyCloseItemsAnswerToTheCloseGuards(t, ctx, fixture)
+	})
+	t.Run("RefusesADottedChildGatedOnItsOwnParent", func(t *testing.T) {
+		ctx, cancel := testContext(t)
+		defer cancel()
+		conformance.RunBatchApplyRefusesADottedChildGatedOnItsOwnParent(t, ctx, fixture)
+	})
+	t.Run("AppliesTheDefaultPriority", func(t *testing.T) {
+		ctx, cancel := testContext(t)
+		defer cancel()
+		conformance.RunBatchApplyAppliesTheDefaultPriority(t, ctx, fixture)
+	})
 }
 
 // newDoltBatchApplyFixture composes the frozen role kit with this backend's

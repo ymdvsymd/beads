@@ -37,9 +37,11 @@ go_test(
         "bazel_cache_mode_test.go",
         "bazel_farm_workflow_test.go",
         "bazel_fork_mode_test.go",
+        "bazel_go_repository_tools_test.go",
         "bazel_hermetic_cc_test.go",
         "bazel_policy_test.go",
         "bazel_rbe_prewarm_test.go",
+        "bazel_rrc_test.go",
         "ci_actions_policy_test.go",
         "ci_analytics_workflow_test.go",
         "ci_blacksmith_runner_test.go",
@@ -59,6 +61,7 @@ go_test(
         "pr_risk_bazel_coverage_test.go",
         "rbe_worker_env_test.go",
         "repo_helpers_test.go",
+        "worker_env_autosync_test.go",
     ],  # keep
     data = [
         "//:repo_other_files",
@@ -159,6 +162,7 @@ go_test(
         "//:nested_go_modules",
         "//:repo_go_test_srcs",
         "//cmd/bd:repo_other_files",
+        "//internal/httpclient:repo_other_files",
         "//internal/storage/dolt:repo_other_files",
         "//internal/storage/embeddeddolt:repo_other_files",
         "//tests/regression:repo_other_files",

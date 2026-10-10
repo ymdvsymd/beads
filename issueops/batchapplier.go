@@ -100,11 +100,16 @@ type CreateItem struct {
 	// A caller reading the event stream sees a create and then an update, not
 	// one create carrying values nothing could have known yet.
 	MetadataRefs map[string]Ref
+	// DefaultPriority is CreateRequest.DefaultPriority for this item: the item
+	// has no priority, and the create stores DefaultCreatePriority.
+	DefaultPriority bool
 }
 
 // UpdateItem patches one existing issue, under UpdateRequest's rules.
 type UpdateItem struct {
-	// Target names the issue to patch and must resolve BACKWARD — see Ref.
+	// Target names the issue to patch and must resolve BACKWARD — see Ref. A
+	// template target refuses with *TemplateReadOnlyError, exactly as
+	// Lifecycle.Update does: templates are read-only.
 	Target Ref
 	// Patch is the edit, read exactly as UpdateRequest.Patch is — including
 	// that Patch.Labels is the whole LabelPatch, so a label REMOVAL is
@@ -165,7 +170,8 @@ type CloseItem struct {
 	// Reason and Session are CloseRequest's, under its first-close-wins rule.
 	Reason  string
 	Session string
-	// Force bypasses blocker and open-child close policy, and nothing else.
+	// Force is CloseRequest.Force: it bypasses blocker and open-child close
+	// policy, the pin and the assignee fence, and never the template guard.
 	//
 	// CLOSE POLICY EVALUATES AT THIS ITEM, against the row as this request has
 	// already changed it — the same as-modified rule the update guards take. A

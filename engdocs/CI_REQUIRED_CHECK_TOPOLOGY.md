@@ -620,6 +620,38 @@ job's `if:` or rotating the key, in either of two ways:
   step's own kill switch, checked before any network call. Deleting the
   variable does not disable pre-warming; it restores the default of 1.
 
+## Remote Repo Contents Cache
+
+A cold lane client re-runs its repository rules (gazelle's `go_deps`, the Go
+SDK, the LLVM slice) before its first action. Bazel 9's remote repo contents
+cache serves those extracted trees from rbe-west's `oss` action cache instead
+(ported from gascity's `bazel.yml`; design: gascity
+`engdocs/design/bazel-remote-repo-contents-cache.md`). The repository variable
+`RBE_REPO_CONTENTS_CACHE` rolls it out, in mode `remote` only:
+
+| value | effect |
+|---|---|
+| unset / `off` | nothing (default) |
+| `seed` | each push to main runs `bazel.yml`'s `rrc-seed` job: every lane's command in `.github/scripts/rrc-lane-commands.txt` with `--nobuild`, uploading repository trees with a 30-minute `rbe-rrc-writer-beads` certificate that rbe-west's mint signs only for that job (GitHub OIDC; `.github/scripts/rrc-writer-credential.sh`). rbe-west's `rrc-gate` admits only repo-contents entries from it |
+| `canary` | `seed`, and the `test` lane reads the cache |
+| `on` | `seed`, and every lane but the release cross-compile and the package gates reads it |
+
+Readers append `startup --experimental_remote_repo_contents_cache` and
+`common --loading_phase_threads=64` to `.bazelrc.local` before setting up
+Bazel; both are key neutral, and the lanes keep
+`--noremote_upload_local_results`. While the variable is not `off`,
+nightly.yml's call also runs `rrc-verify`: a cold fetch of every lane,
+compared with the cached entries by `tools/bazel/rrc_verify.py`; a mismatch
+fails the job and opens an `rrc-verify` issue.
+
+`rrc-seed` asks for `id-token: write` and `rrc-verify` for `issues: write`, so
+every caller of `bazel.yml` (pr.yml, nightly.yml, bazel-farm.yml) grants both:
+GitHub checks a called workflow's job permissions when the run starts, even
+for jobs that skip. Neither job runs on a pull_request, merge_group or
+pull_request_target event, and every other `bazel.yml` job keeps
+`contents: read`. Rollback: set the variable to `off` (or `seed`, to keep the
+cache warm without readers).
+
 ## Required Check Contract
 
 After the aggregate checks are verified on the branch, branch protection or the
@@ -1037,11 +1069,13 @@ Required` requires them to have run remotely and passed.
     - The `args` and `env` of every target tagged `embedded`,
       `dolt-server-proxied` or `dolt-server-integration` are pinned.
   - `tools/bazel/check_shard_coverage.py` runs after each tier. It requires:
-    - every Bazel shard of `//cmd/bd:bd_embedded_test` (50; the manifest's
-      frozen 20-shard block was the retired `test-embedded-cmd` jobs' split,
-      F1), `//internal/storage/embeddeddolt:embeddeddolt_embedded_test` (15;
+    - every Bazel shard of `//cmd/bd:bd_embedded_test` and
+      `//cmd/bd:bd_embedded_part2_test` (50 each: shards 1-50 and 51-100 of
+      the manifest's 100-shard block, which their ranges must tile exactly
+      once; the manifest's frozen 20-shard block was the retired
+      `test-embedded-cmd` jobs' split, F1), `//internal/storage/embeddeddolt:embeddeddolt_embedded_test` (40;
       the frozen 5-shard block was `test-embedded-storage`'s, F1),
-      `//cmd/bd:bd_proxied_test` (30; the frozen 15-shard block was
+      `//cmd/bd:bd_proxied_test` (34; the frozen 15-shard block was
       `test-proxied-cmd`'s, F2) and
       `//internal/storage/dolt:dolt_server_full_test` (16) to have run
       exactly the tests its shard script lists (list-only mode, minus
@@ -1071,7 +1105,7 @@ Required` requires them to have run remotely and passed.
   Its Tier 3, the served HTTP corpus (`./internal/httpclient` with
   `BEADS_TEST_EMBEDDED_DOLT=1` and `BEADS_HTTP_TEST_REQUIRED=1`), runs in
   the embedded lane as `//internal/httpclient:httpclient_served_test`
-  (race build, 24 shards).
+  (race build, 16 shards).
   `docs-mintlify.yml` likewise drops its docsync job (`go test
   ./test/docsync`, which `bazel-test` runs as `//test/docsync:docsync_test`)
   and keeps only Mintlify's network-bound broken-link check.
