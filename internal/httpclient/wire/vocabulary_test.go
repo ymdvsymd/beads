@@ -69,6 +69,7 @@ func TestOperationIdsMatchTheServerRouteTable(t *testing.T) {
 		{OpWatchEvents, httpapi.OpWatchEvents},
 		{OpBatchGetIssues, httpapi.OpBatchGetIssues},
 		{OpReclaimIssues, httpapi.OpReclaimIssues},
+		{OpAdvanceMolecule, httpapi.OpAdvanceMolecule},
 	}
 
 	// The table is a HAND LIST, and a hand list's failure mode is omission: a new
@@ -147,6 +148,9 @@ func TestTheProjectIdentityVocabularyMatchesTheServer(t *testing.T) {
 	if CapListSort != httpapi.CapIssuesListSort {
 		t.Errorf("CapListSort = %q, server says %q", CapListSort, httpapi.CapIssuesListSort)
 	}
+	if CapListSearch != httpapi.CapIssuesListSearch {
+		t.Errorf("CapListSearch = %q, server says %q", CapListSearch, httpapi.CapIssuesListSearch)
+	}
 	if CapCountScope != httpapi.CapIssuesCountScope {
 		t.Errorf("CapCountScope = %q, server says %q", CapCountScope, httpapi.CapIssuesCountScope)
 	}
@@ -200,10 +204,11 @@ func TestTheProjectIdentityVocabularyMatchesTheServer(t *testing.T) {
 		httpapi.CapProjectEnforce, httpapi.CapBatchApplyLarge, httpapi.CapIssuesListSort, httpapi.CapIssuesCountScope,
 		httpapi.CapIssuesSweepWispsPlane, httpapi.CapIssuesSweepLiveDependents, httpapi.CapIssuesSweepLimit,
 		httpapi.CapBatchApplyDepAddLineage, httpapi.CapIssuesUpdateAllowTemplate, httpapi.CapIssuesCreateDefaultPriority,
+		httpapi.CapIssuesCloseAutoCloseMolecule, httpapi.CapIssuesListSearch,
 	}) {
 		t.Errorf("behaviorCapabilities = %v, want the server's project.enforce, issues.batchApplyLarge, issues.list.sort, "+
-			"issues.count.scope, issues.sweep.wispsPlane, issues.sweep.liveDependents, issues.sweep.limit and "+
-			"issues.batchApply.depAddLineage and issues.update.allowTemplate and issues.create.defaultPriority tokens", behaviorCapabilities)
+			"issues.count.scope, issues.sweep.wispsPlane, issues.sweep.liveDependents, issues.sweep.limit, "+
+			"issues.batchApply.depAddLineage, issues.update.allowTemplate, issues.create.defaultPriority, issues.close.autoCloseMolecule and issues.list.search tokens", behaviorCapabilities)
 	}
 }
 

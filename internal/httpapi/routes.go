@@ -119,6 +119,19 @@ const CapIssuesListSort = "issues.list.sort"
 // count.
 const CapIssuesCountScope = "issues.count.scope"
 
+// CapIssuesListSearch is the behavior capability that advertises GET
+// /v0/beads/issues' `q` parameter (reads.go, spec `q` on OpListIssues):
+// `bd search`'s free text, carried as issueops.ListRequest.Query. Like
+// CapIssuesListSort it names a PARAMETER added to an existing operation, so it
+// rides behaviorCapabilities, and it is the token the parameter's OpenAPI
+// description cites for TestNewParameterOnExistingOperationHasABehaviorToken.
+//
+// The client (internal/httpclient) refuses a search locally against a server
+// that does not advertise it, with ErrUnsupported naming the token, so a
+// search is never sent to a server that would answer `unknown_parameter` and
+// is never widened into an unsearched listing.
+const CapIssuesListSearch = "issues.list.search"
+
 // CapIssuesSweepWispsPlane is the behavior capability that advertises the
 // `wisps-plane` value of SweepRequest.tier (sweep.go, spec SweepRequest.tier):
 // a third, wider tier that clears the whole wisps table plus any durable bead
@@ -203,6 +216,16 @@ const CapExternalDependencies = "policy.external_dependencies"
 // when its configuration says the behavior is in force. Capabilities() never
 // lists them; advertisedCapabilities adds each one whose condition holds.
 var conditionalCapabilities = []string{CapExternalDependencies}
+
+// CapIssuesCloseAutoCloseMolecule is the behavior capability that advertises
+// CloseIssueRequest.auto_close_molecule and BatchCloseRequest.auto_close_molecule
+// with their paired response members (auto_closed_molecule,
+// molecule_auto_close_refusal): close a completed molecule's root in the same
+// transaction as the step close (issueops.CloseRequest.AutoCloseMolecule). An
+// older server answers the request member with `400
+// invalid_argument`/`unknown_parameter`; the client checks this token before
+// sending it.
+const CapIssuesCloseAutoCloseMolecule = "issues.close.autoCloseMolecule"
 
 // customMethodTarget splits the custom method off the segment the router
 // matched, and reports the row that claims it.
@@ -760,6 +783,16 @@ var routeTable = []route{
 		handler:      (*Server).handleReopen,
 	},
 	{
+		op:           OpAdvanceMolecule,
+		method:       http.MethodPost,
+		pattern:      customMethodPattern,
+		specPath:     "/v0/beads/issues/{id}:advanceMolecule",
+		customMethod: ":advanceMolecule",
+		capability:   "issues.advanceMolecule",
+		implemented:  true,
+		handler:      (*Server).handleAdvanceMolecule,
+	},
+	{
 		op:     OpBatchCloseIssues,
 		method: http.MethodPost,
 		// A collection-level custom method, spelled the way issues:batchCreate
@@ -966,6 +999,7 @@ var behaviorCapabilities = []string{
 	CapProjectEnforce, CapBatchApplyLarge, CapIssuesListSort, CapIssuesCountScope,
 	CapIssuesSweepWispsPlane, CapIssuesSweepLiveDependents, CapIssuesSweepLimit,
 	CapBatchApplyDepAddLineage, CapIssuesUpdateAllowTemplate, CapIssuesCreateDefaultPriority,
+	CapIssuesCloseAutoCloseMolecule, CapIssuesListSearch,
 }
 
 // Capabilities lists what this build advertises in ContextResponse.capabilities:

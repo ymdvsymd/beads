@@ -5,6 +5,7 @@ package httpclient
 import (
 	"context"
 	"net/http"
+	"slices"
 
 	"github.com/steveyegge/beads/internal/httpapi/apigen"
 	"github.com/steveyegge/beads/internal/httpclient/encode"
@@ -32,10 +33,18 @@ type httpReader struct{ store *Store }
 // server's own has_more ARE the page contract. An Offset is refused by the
 // encoder rather than dropped — ready work carries no keyset position, so there
 // is no honest way to page it (E-ReadyRequest.Offset).
+//
+// An explicit Limit of 0 (unlimited) is NOT sent as `limit=0`: it becomes one
+// request bounded at the client cap plus one, refused past the cap rather than
+// truncated (unlimited_read.go).
 func (r httpReader) Ready(ctx context.Context, req issueops.ReadyRequest) (issueops.IssuePage, error) {
 	params, err := encode.ReadyParams(req)
 	if err != nil {
 		return issueops.IssuePage{}, r.store.inexpressible("Reader.Ready", err)
+	}
+	readCap, err := boundUnlimitedPage(params, req.Limit != nil && *req.Limit == 0)
+	if err != nil {
+		return issueops.IssuePage{}, err
 	}
 	var body apigen.ReadyPage
 	if err := r.store.dispatch(ctx, wire.Request{
@@ -46,16 +55,46 @@ func (r httpReader) Ready(ctx context.Context, req issueops.ReadyRequest) (issue
 	}, &body); err != nil {
 		return issueops.IssuePage{}, err
 	}
+	if err := checkUnlimitedPage(wire.OpListReadyWork, readCap, len(body.Items), body.HasMore); err != nil {
+		return issueops.IssuePage{}, err
+	}
 	return issueops.IssuePage{Items: wireRows(body.Items, req.Brief), HasMore: body.HasMore}, nil
 }
 
 // List serves listIssues, through the pager in list_walk.go.
 func (r httpReader) List(ctx context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+	if err := r.refuseUnservedSearch(ctx, req); err != nil {
+		return issueops.IssuePage{}, err
+	}
 	params, err := encode.ListParams(req)
 	if err != nil {
 		return issueops.IssuePage{}, r.store.inexpressible("Reader.List", err)
 	}
 	return r.store.walkIssues(ctx, params, req)
+}
+
+// refuseUnservedSearch is the pre-dial gate for ListRequest.Query, which rides
+// listIssues' `q` only on a server advertising issues.list.search. An older
+// server answers `q` with 400 unknown_parameter, so a search against it is
+// refused HERE, with the typed capability error naming the token: never a
+// round trip that is refused anyway, and never the unsearched listing passed
+// off as the search.
+//
+// listIssues is a baseline operation, so dispatch preflights nothing for it;
+// this is the one handshake a search costs, and a request without Query never
+// asks for it.
+func (r httpReader) refuseUnservedSearch(ctx context.Context, req issueops.ListRequest) error {
+	if req.Query == "" {
+		return nil
+	}
+	snap, err := r.store.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snap != nil && slices.Contains(snap.Capabilities, wire.CapListSearch) {
+		return nil
+	}
+	return r.store.unsupportedCapability("Reader.List", wire.CapListSearch)
 }
 
 // Get serves getIssue, including the two landed include parameters that retired
