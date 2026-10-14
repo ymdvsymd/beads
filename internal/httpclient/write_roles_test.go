@@ -410,7 +410,9 @@ func TestUpdateRefusesEveryMemberTheWireExcludes(t *testing.T) {
 		"Patch.ClosedBySession": {Patch: issueops.IssuePatch{ClosedBySession: set("s1")}},
 		"Patch.SpecID":          {Patch: issueops.IssuePatch{SpecID: set("spec")}},
 		"Patch.AwaitID":         {Patch: issueops.IssuePatch{AwaitID: set("await")}},
-		"Patch.Persistence":     {Patch: issueops.IssuePatch{Persistence: set(issueops.PersistenceModeEphemeral)}},
+		// Patch.Persistence WAS here; issues.update.persistence publishes it
+		// (S21b). TestUpdatePersistenceIsSentOnlyToAServerThatAdvertisesIt
+		// is the positive assertion and the pre-dial capability refusal.
 
 		// Patch.Labels.Add and Patch.Labels.Remove WERE here, and their absence
 		// is the flip rather than an oversight: upstream #5510 published
@@ -1799,6 +1801,24 @@ func TestMemoryListAnswersAnEmptyMapNeverNil(t *testing.T) {
 	// term would be a second implementation of a rule that has one.
 	if w.lastSearch != "Term" {
 		t.Errorf("search parameter = %q, want the caller's term verbatim", w.lastSearch)
+	}
+}
+
+// TestMemoryListRefusesATruncatedPage: ListResult has no cursor, so a page that
+// reports more memories than it carries is refused rather than returned as the
+// whole plane (`bd export` would drop the rest silently).
+func TestMemoryListRefusesATruncatedPage(t *testing.T) {
+	w := &stubWire{page: &apigen.MemoriesPage{HasMore: true, Items: []apigen.Memory{{Key: "a", Value: "1"}}}}
+	memories, err := stubStore(t, w).Memories()
+	if err != nil {
+		t.Fatalf("Memories(): %v", err)
+	}
+	res, err := memories.List(t.Context(), memoryops.ListRequest{})
+	if err == nil {
+		t.Fatalf("List of a has_more page = %+v, want a refusal", res)
+	}
+	if !strings.Contains(err.Error(), "listMemories") {
+		t.Errorf("refusal %q does not name listMemories", err)
 	}
 }
 

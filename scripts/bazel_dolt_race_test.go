@@ -44,6 +44,22 @@ var bazelUnionLanes = map[string][]string{
 	bazelDoltRaceJobName: {bazelDoltJobName, bazelProxiedJobName},
 }
 
+// bazelUnionHasFlagGatedMember reports whether a union job runs in place of
+// at least one flag-gated, advisory member (bazel-dolt-int's bazel-cmd-dolt,
+// item 5 A2): such a union must carry that member's own continue-on-error, so
+// a failure confined to that member's tier stays out of the call's aggregate
+// result (BAZEL) in the union's mode exactly as it already is through the
+// member outside it. The gated member's id still reads the union's result
+// directly (bazelLaneReporter), unaffected either way.
+func bazelUnionHasFlagGatedMember(job string) bool {
+	for _, m := range bazelUnionLanes[job] {
+		if _, ok := bazelFlagGatedLanes[m]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // bazelUnionOf: the union job a gated member belongs to, or "".
 func bazelUnionOf(member string) string {
 	for union, members := range bazelUnionLanes {
@@ -54,11 +70,23 @@ func bazelUnionOf(member string) string {
 	return ""
 }
 
+// bazelUnionMemberOutputKey: the union job's own output key that carries a
+// member's tier result, for unions that do not report "result" uniformly
+// (item 5 A2's bazel-dolt-int: must-fix 2's per-tier outputs, since a
+// job-level continue-on-error would hide a server-storage failure from
+// anything that is not itself gated on that one tier). Members not listed
+// here read their union's plain "result" output, as dolt-race's do.
+var bazelUnionMemberOutputKey = map[string]string{
+	bazelServerJobName:  "server_storage_result",
+	bazelCmdDoltJobName: "cmd_dolt_result",
+}
+
 // bazelLaneCallOutput: the workflow_call output value bazel.yml must declare
 // for a lane that reports its job.status.
 func bazelLaneCallOutput(lane string) string {
 	if union := bazelUnionOf(lane); union != "" {
-		return "${{ jobs." + union + ".outputs.result || jobs." + lane + ".outputs.result }}"
+		key := cmp.Or(bazelUnionMemberOutputKey[lane], "result")
+		return "${{ jobs." + union + ".outputs." + key + " || jobs." + lane + ".outputs.result }}"
 	}
 	return "${{ jobs." + lane + ".outputs.result }}"
 }
@@ -100,11 +128,13 @@ func bazelCallOutputValue(t *testing.T, name string, jobs map[string]string) str
 	}
 	ctx := map[string]string{}
 	for _, m := range regexp.MustCompile(`jobs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)`).FindAllStringSubmatch(expr, -1) {
-		v := ""
-		if m[2] == "result" {
-			v = jobs[m[1]]
-		}
-		ctx[m[0]] = v
+		// Every job.outputs reference in a lane's own workflow_call output
+		// expression carries that job's conclusion for gating purposes,
+		// whatever its output key is named (plain "result", or one of a
+		// union's per-tier keys: must-fix 2). jobs is keyed by job name only,
+		// so every reference to a given job resolves to the same simulated
+		// value regardless of which output key reads it.
+		ctx[m[0]] = jobs[m[1]]
 	}
 	v, err := evalGHExpr(expr, ctx)
 	if err != nil {
@@ -154,6 +184,40 @@ func bazelRCConfigLines(rc, name string) []string {
 		out = append(out, cmd+" "+strings.TrimSpace(opt))
 	}
 	return out
+}
+
+// bazelUnionEffectiveJobs: the --jobs value in effect when a union job's
+// `bazel test //... --config=<unionConfig>` step runs in mode remote
+// (closed PR #7542). Mode remote's generated rc applies
+// `build --config=remote-exec` from an rc file, so --config=remote-exec's
+// --jobs line is the baseline every union inherits; but a --jobs line on
+// the union's own config outranks it, because that --config is given on
+// the command line (the step's own `--config=<unionConfig>`) and
+// command-line config outranks rc-file config regardless of which file's
+// line comes first (PR #7542's BEP showed `optionsParsed.cmdLine` carrying
+// "--jobs=64, --jobs=128" in that rank order, after a union config added
+// its own --jobs=128 override; the ordering there is a consequence of the
+// rank, not the rule itself, so reordering .bazelrc's lines cannot change
+// it). Reading remote-exec's line alone would miss that override silently
+// passing a budget check the real run does not meet.
+func bazelUnionEffectiveJobs(t *testing.T, rc, unionConfig string) int {
+	t.Helper()
+	base := regexp.MustCompile(`(?m)^build:remote-exec --jobs=(\d+)$`).FindStringSubmatch(rc)
+	if base == nil {
+		t.Fatal(".bazelrc has no build:remote-exec --jobs=N line")
+	}
+	budget, _ := strconv.Atoi(base[1])
+	jobsLine := regexp.MustCompile(`^--jobs=(\d+)$`)
+	for _, l := range bazelRCConfigLines(rc, unionConfig) {
+		_, opt, ok := strings.Cut(l, " ")
+		if !ok {
+			continue
+		}
+		if m := jobsLine.FindStringSubmatch(opt); m != nil {
+			budget, _ = strconv.Atoi(m[1])
+		}
+	}
+	return budget
 }
 
 // TestBazelDoltRaceConfigIsMemberUnion: --config=dolt-race is exactly the
@@ -442,8 +506,15 @@ func TestBazelDoltRaceArmsExactlyOnePerMode(t *testing.T) {
 // proxied-server (aquery, item 5 A1b), each a target's shard.
 const bazelDoltRaceTestActions = 62
 
-// TestBazelDoltRaceFitsTheJobsBudget: the union runs both tiers' shards in
-// one invocation under --config=remote-exec's --jobs, so all of them must
+// TestBazelDoltRaceFitsTheJobsBudget pins the one-wave rule (closed PR
+// #7542): a union's total test actions must fit in the effective --jobs so
+// every action starts in Bazel's first wave. Bazel does not schedule the
+// longest action first, so an action that lands in a second wave because
+// the first is full adds its own full duration to the critical path rather
+// than overlapping it; #7542's paired A/B runs measured this costing up to
+// +575 s of wall clock on a union that exceeded its --jobs by one tier's
+// worth of actions. The union runs both tiers' shards in one invocation
+// under the effective --jobs (bazelUnionEffectiveJobs), so all of them must
 // fit at once or the slower tier's shards queue behind the other's and the
 // union stops ending with the slower member. Every rule tagged with one of
 // the union's tags, read from the BUILD files: its shard_count (1 when
@@ -452,11 +523,7 @@ const bazelDoltRaceTestActions = 62
 func TestBazelDoltRaceFitsTheJobsBudget(t *testing.T) {
 	root := bazelPolicyRoot(t)
 	rc := readPolicyFile(t, root, ".bazelrc")
-	m := regexp.MustCompile(`(?m)^build:remote-exec --jobs=(\d+)$`).FindStringSubmatch(rc)
-	if m == nil {
-		t.Fatal(".bazelrc has no build:remote-exec --jobs=N line")
-	}
-	budget, _ := strconv.Atoi(m[1])
+	budget := bazelUnionEffectiveJobs(t, rc, bazelDoltRaceConfig)
 
 	var tags []string
 	for _, mem := range bazelDoltRaceMembers {
@@ -503,6 +570,6 @@ func TestBazelDoltRaceFitsTheJobsBudget(t *testing.T) {
 		t.Errorf("--config=%s: %d test actions over %d targets, want %d (aquery-verified at the cutover): re-check against --jobs=%d and update", bazelDoltRaceConfig, total, targets, bazelDoltRaceTestActions, budget)
 	}
 	if total > budget {
-		t.Errorf("--config=%s: %d test actions, more than --config=remote-exec's --jobs=%d: the tiers would no longer run at once", bazelDoltRaceConfig, total, budget)
+		t.Errorf("--config=%s: %d test actions, more than the effective --jobs=%d: a second wave would add its tail test's full duration to the critical path instead of overlapping it (closed PR #7542 measured up to +575s from exactly this)", bazelDoltRaceConfig, total, budget)
 	}
 }

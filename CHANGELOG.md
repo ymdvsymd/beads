@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bd promote` works over a connected HTTP workspace (S21b). Its one library
+  entry, `issueops.Promote(ctx, PromoteRoles{Reader, Lifecycle, Commenter},
+  PromoteRequest)`, reads the row, refuses one that is not a wisp
+  (`*issueops.NotAWispError`, the sentence `bd promote` always printed), moves
+  it with ONE `Lifecycle.Update` whose patch is `Persistence = persistent`
+  (labels, dependencies, events, comments and the child counter move with it
+  in the role's transaction), then records the promotion comment. The direct
+  and proxied-server routes run it over their own roles, so a local promote
+  now makes the same plane move `bd update --persistent` makes, honoring
+  `dolt.auto-commit`. That changes five things a script can see on those
+  routes: the workspace's `on_update` hook fires twice, once for the move and
+  once for the comment (the direct route never fired it, the proxied-server
+  route fired it once); the promotion comment is a row `bd comments` lists
+  (the direct route recorded only a `commented` event); a promoted parent
+  keeps its child counter, so its next `bd create --parent` mints the number
+  after its wisp children's instead of failing with
+  `issue already exists: <parent>.1`; a promotion records two Dolt
+  commits, `bd: promote <id>` for the move and `bd: comment <id>` for the
+  comment (an embedded workspace recorded one, `bd: promote (auto-commit)`,
+  and the proxied-server route one, `bd: promote <id>`); and a promote that
+  loses a race to a concurrent one fails with the not-a-wisp sentence instead
+  of `promoting <id>: wisp <id> not found`. A comment that cannot
+  be written leaves the promotion standing behind a warning on every route;
+  the proxied-server route used to roll the promotion back. `bd serve`
+  publishes the move as `patch.persistence` on `PATCH /v0/beads/issues/{id}`
+  behind the new `issues.update.persistence` capability (additive;
+  `wire_revision` is unchanged), which also carries `bd update --persistent`,
+  `--ephemeral` and `--no-history` over HTTP. Against a server without the
+  token the client refuses before the dial, naming it; nothing is written. A
+  move the workspace refuses (an `unversioned`-class row asked for
+  `--ephemeral` or `--no-history`, or a demotion of a row with retained
+  snapshots) matches `ErrValidation` on every route: `bd serve` answers it
+  `400 invalid_argument`, and the local refusal gains a `validation failed: `
+  prefix.
 - `issueops.LeaseReclaimer`, the stale-lease sweep behind `bd reclaim`, is a
   role on every leg (dolt, embedded dolt, the unit-of-work provider and the
   HTTP client), and `bd serve` publishes it as `POST /v0/beads/issues:reclaim`
@@ -32,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   description and metadata are unchanged, and omitting the flag (or passing
   `0`) is byte-identical to today's output. JSON output is untouched;
   `--include-comments` still streams every comment there.
+- `GET /v0/beads/issues` accepts `no_assignee`, `title` and a repeatable `id`
+  (one id per value, at most 200), each behind its own new capability token
+  (`issues.list.noAssignee`, `issues.list.title`, `issues.list.ids`; additive,
+  no wire_revision bump; `id` and its token are bd-enterprise's contract,
+  adopted unchanged), and applies them through
+  the same Reader role a local `bd list` reads through. Over a connected HTTP
+  workspace `bd list --no-assignee`, `--title` and `--id` now work instead of
+  refusing. Against a server that does not advertise a flag's token the
+  client refuses before dialing, and the refusal names the token (every
+  capability refusal over HTTP now names its token).
 - `GET /v0/beads/issues` accepts `q`, `bd search`'s free text, behind the
   new `issues.list.search` capability token (additive; no wire_revision
   bump). `issueops.ListRequest` gains `Query`, with `SearchIssues`' meaning
@@ -439,6 +483,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RunBatchApplyAppliesTheDefaultPriority`.
 
 ### Fixed
+
+- **`bd gate list` works over a connected HTTP workspace** (S20). The
+  workspace-wide listing built a raw `SearchIssues` filter, which the HTTP
+  backend refuses, so gc's `renudge-stale-human-gates` order failed on every
+  remote scope. Every route now calls one library entry,
+  `issueops.ListGates`, which asks the Querier role (`queryIssues`, served by
+  every deployed server) for `type=gate` with closed rows hidden unless
+  `--all`: the same rows the raw filter selected, on both planes. `--limit 0`
+  is unlimited, as before. The bead-scoped form (`bd gate list <id>`) is
+  unchanged.
+- **`bd export` works over a connected HTTP workspace** (S21). It read
+  through the raw `SearchIssues` method and the bulk label, dependency and
+  comment reads, which the HTTP backend refuses, so gc's 15-minute JSONL
+  export order (`gc bd export --all`) failed on every remote scope. On a remote
+  backend the read set now comes from one library entry, `issueops.ReadExport`,
+  composed over role reads every deployed server publishes: an unlimited
+  `Reader.List` for the rows, their labels and counts, `EdgeReader.ReadEdges`
+  for the dependency records, and `Reader.Get` with comments for each row
+  that has any. The JSONL is written by the same code as on every other
+  route. Memories (`--all`, `--include-memories`) come from the served memory
+  plane (`listMemories`), not the settings listing, which withholds every
+  `kv.*` row and so exported none. A failed read fails the export, never
+  shortens it. A remote export does not yet stamp the `wisp_plane` marker,
+  because the server publishes no plane membership. So a current `bd import`
+  of a remote export puts genuine no-history wisps on the durable issues
+  plane instead of the wisps plane, and gc's JSONL archive keeps them.
+  Nothing is dropped.
+- **A silent HTTP connection no longer costs a read the full 60s.** The HTTP
+  backend client gives a read's first attempt 15s from when it is sent to get
+  its response headers (`BEADS_HTTP_RESPONSE_HEADER_TIMEOUT`: a duration, a
+  number of seconds, or `off`), then retries it once on another connection
+  with no header timer, on what is left of the same 60s request timeout. A
+  slow but healthy read still finishes if its retry's headers and body
+  together fit in that remainder (about 45s); one that needs longer now fails
+  at 60s. A read whose connection is reset is retried the same way (on Windows
+  only when the reset surfaces as an early EOF), and each retry is logged to
+  stderr with its count. The events:watch stream's connect gets neither the
+  timer nor the retry. A write is never retried; one that was sent and timed
+  out before its headers fails with a typed `wire.ResponseHeaderTimeoutError`
+  naming the server's host, because it may or may not have been applied,
+  while a dial or TLS timeout stays a plain connection error. The batch get,
+  a read on POST, is now also retried on a 503 the way a GET is.
 - **An update of a template is now refused for every caller, not only
   `bd update`.** The template guard used to be a pre-read in `cmd/bd`, so an
   update through `bd serve` (`PATCH /v0/beads/issues/{id}`), an `update` item
