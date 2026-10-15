@@ -179,6 +179,15 @@ const (
 	CapListIDs        = "issues.list.ids"
 )
 
+// CapBlockingIsBlocked is the behavior capability announcing that
+// listBlockingAnnotations honors `is_blocked` (issueops.BlockingRequest.
+// IncludeIsBlocked), spelled exactly as httpapi's
+// CapDependenciesBlockingIsBlocked. The annotator refuses a request asking
+// for the flag LOCALLY, with a typed capability error naming this token, when
+// the server does not advertise it, so the IsBlockedBatch read never dials a
+// server that would answer `unknown_parameter`.
+const CapBlockingIsBlocked = "dependencies.blocking.isBlocked"
+
 // CapBatchApplyLarge is the behavior capability announcing that issues.batchApply
 // accepts a batch larger than the compiled-in floor (100 items), up to the
 // raised ceiling (1000), spelled exactly as httpapi's constant of the same name
@@ -256,6 +265,16 @@ const CapIssuesUpdateAllowTemplate = "issues.update.allowTemplate"
 // there is no client-side fallback, because the move is one transaction on
 // the server.
 const CapIssuesUpdatePersistence = "issues.update.persistence"
+
+// CapIssuesUpdateClaim is the behavior capability announcing that updateIssue
+// accepts `claim` and resolves the claimed id on both planes (a wisp included),
+// spelled exactly as httpapi's constant of the same name. Lifecycle.Update
+// reads it from the cached handshake before the dial: with it, a claim rides
+// updateIssue; without it, a claim alone goes to claimIssue (a wisp then
+// refuses by name, W-ClaimRequest.Wisp) and a claim beside a patch, a guard, a
+// force override or `allow_template` is refused before the dial with
+// ErrUnsupported naming it.
+const CapIssuesUpdateClaim = "issues.update.claim"
 
 // CapIssuesCreateDefaultPriority is the behavior capability announcing that
 // the server stores the create default priority for an ABSENT `priority`
@@ -416,7 +435,7 @@ var behaviorCapabilities = []string{
 	CapSweepWispsPlane, CapSweepLiveDependents, CapSweepLimit,
 	CapBatchApplyDepAddLineage, CapIssuesUpdateAllowTemplate, CapIssuesCreateDefaultPriority,
 	CapCloseAutoCloseMolecule, CapListSearch,
-	CapListNoAssignee, CapListTitle, CapListIDs, CapIssuesUpdatePersistence,
+	CapListNoAssignee, CapListTitle, CapListIDs, CapIssuesUpdatePersistence, CapBlockingIsBlocked, CapIssuesUpdateClaim,
 }
 
 // CapabilityFor reports the capability token gating op, and whether op is on

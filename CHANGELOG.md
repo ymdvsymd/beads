@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `GET /v0/beads/dependencies/blocking` accepts `is_blocked`, behind the new
+  `dependencies.blocking.isBlocked` capability token (additive; no
+  wire_revision bump), and answers each item's stored, transitive
+  `is_blocked` flag, the column `bd ready` filters on; an item whose id names
+  no row carries none. `issueops.BlockingRequest` gains `IncludeIsBlocked` on
+  every BlockingAnnotator implementation, and `issueops.BlockedFlags` is the
+  batched read over it. The HTTP backend's `IsBlockedBatch` now serves
+  through it; against a server that does not advertise the token it still
+  refuses before dialing, now with a typed capability error naming the
+  token. An unsatisfied `external:` blocker sets the flag on every route,
+  just as it keeps the issue out of `bd ready`.
 - `bd promote` works over a connected HTTP workspace (S21b). Its one library
   entry, `issueops.Promote(ctx, PromoteRoles{Reader, Lifecycle, Commenter},
   PromoteRequest)`, reads the row, refuses one that is not a wisp
@@ -43,6 +54,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots) matches `ErrValidation` on every route: `bd serve` answers it
   `400 invalid_argument`, and the local refusal gains a `validation failed: `
   prefix.
+- `bd serve` advertises the new `issues.update.claim` behavior token for what
+  `PATCH /v0/beads/issues/{id}` already served untokened: `claim` (upstream
+  #6890), resolved on both planes, so a wisp is claimable there (additive; no
+  wire_revision bump). The HTTP client now picks the claim route from the
+  handshake before dialing: with the token every claim is one updateIssue call;
+  without it a claim alone goes to `{id}:claim` (no doomed 400 first; a wisp
+  still refuses by name, W-ClaimRequest.Wisp, now naming the token), and a
+  claim beside a patch, a guard, a force override or `allow_template` is
+  refused before the dial with an unsupported error naming
+  `issues.update.claim`. Skew note: a server that serves `claim` untokened
+  (wire_revision 2 builds before this release) now gets those two refusals
+  from a new client where it used to serve them; upgrade bd serve. A template
+  claimed alone without the token is still refused, on the client's own
+  pre-read: `{id}:claim` has no template guard (bd-jkp9v3).
 - `issueops.LeaseReclaimer`, the stale-lease sweep behind `bd reclaim`, is a
   role on every leg (dolt, embedded dolt, the unit-of-work provider and the
   HTTP client), and `bd serve` publishes it as `POST /v0/beads/issues:reclaim`
