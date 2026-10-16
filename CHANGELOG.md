@@ -316,6 +316,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Over an http workspace, a bd command answers its repeated reads of a row
+  or setting from one response.** `bd show <id> --json` makes one request
+  instead of three, text `bd show` three instead of six, and `bd update`,
+  `bd close`, `bd label add`, `bd comments` and `bd dep add` one to seven
+  fewer (port of bd-enterprise e626072b8). A one-shot command's transport
+  answers an identical `getIssue`, `getSetting` or `listSettings` GET from the
+  answer it already received, for at most 5 s from that answer. Any write the
+  command makes clears it, and only a 2xx that decoded is kept. `bd serve`,
+  `--watch` and `--follow` never memoize, and neither do library embedders.
+  Within one command a re-read no longer sees another writer's change made in
+  the meantime (ledger row `L-read-memo`); `BD_HTTP_READ_MEMO=0` turns the
+  memo off. The identity-gate preview and the real open now share one
+  transport, so a write makes one handshake. `bd list` reads its vocabulary
+  with one `listSettings`, and the hook decorator skips its post-write re-reads
+  when no hook for the event is installed.
 - **`created_by` defaults to the actor in the library, for every create
   shape and every backend.** `PreparePublicCreateRequest`, which
   `Lifecycle.Create`, `BatchCreator` items and batch-apply create items all
@@ -550,6 +565,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming the server's host, because it may or may not have been applied,
   while a dial or TLS timeout stays a plain connection error. The batch get,
   a read on POST, is now also retried on a 503 the way a GET is.
+- **A large batch apply over HTTP no longer fails at 60s while the server
+  commits it.** `bd serve` runs an `issues:batchApply` of more than 100 items
+  (a large `bd create --graph` plan, say) under its `--large-apply-ceiling`
+  (5 minutes by default), on a context detached from the client, but the HTTP
+  backend client gave every request 60s. A large apply that took longer
+  failed client-side with a timeout while the server went on to commit it.
+  Such a request is now dialed with 6 minutes, which covers the server's
+  default ceiling plus what it may spend before (reading the request, waiting
+  for the one-wide large-apply slot) and after (writing the answer back).
+  Every other request keeps 60s. An `*http.Client` passed in through
+  `backend/http`'s `Options.HTTPClient` is raised the same way for that one
+  request when its `Timeout` is shorter than 6 minutes; one with no `Timeout`
+  stays unbounded. A server whose `--large-apply-ceiling` is raised past about
+  5m15s can still outlast the client: it does not advertise its ceiling, so
+  the client cannot learn it.
 - **An update of a template is now refused for every caller, not only
   `bd update`.** The template guard used to be a pre-read in `cmd/bd`, so an
   update through `bd serve` (`PATCH /v0/beads/issues/{id}`), an `update` item
@@ -619,6 +649,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rollout) still stores P0, with no error on either side.
   Out-of-tree storage backends must now honor `DefaultPriority`; see the
   BREAKING (out-of-tree storage backends) entry under `### Changed`.
+- Blocked-state repair no longer lets a stale `is_blocked` bit on a parent
+  with no reason row of its own hold itself up through a parent that blocks
+  on its own child, in a malformed parent-child cycle (gastownhall/beads#7386).
+  The explained-parent walk, on both the full repair and the per-write
+  recompute, now climbs through such a parent, whose bit is inherited,
+  instead of treating it as a final unexplained ancestor; `bd doctor`'s
+  Blocked State check counts the stale bit and `--fix` clears it.
 
 - `bd show --current` over the HTTP backend no longer prints the wrong issue.
   Its in-progress/hooked lookup used the raw `SearchIssues` method, which
