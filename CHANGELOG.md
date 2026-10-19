@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `bd versions <id>` lists the versions recorded for a bead, and
+  `versioned-history.enabled` turns recording on. While it is on, every
+  accepted change to a bead created while it is on, or that enters the issues
+  plane while it is on (a wisp promoted or made persistent), stores a
+  snapshot of it as a row of `issue_versions` in the same transaction. It is
+  off by default and nothing is backfilled: a bead already on the issues
+  plane when it is turned on is legacy, and editing it records nothing. A
+  recorded write leaves `updated_at` where an unrecorded one would, so
+  `bd import`'s stale check sees the same timestamps either way.
+  `bd versions --json` answers `{"versions": [...], "recording": bool}`; the
+  command still lists what was recorded after recording is turned off, and
+  proxied-server and HTTP workspaces refuse it. The setting is a row of each
+  store's `config` table (`bd config set versioned-history.enabled true`),
+  and every store reads its own when it is opened: a write routed into
+  another workspace (a prefix-routed `bd update` or `bd close`,
+  `bd create --repo`) follows the target store's row, a proxied-server
+  provider reads it when it is constructed, and a long-lived `bd serve`
+  keeps the value it read until it restarts.
+  `BD_VERSIONED_HISTORY_ENABLED=1` (or a `config.yaml` value) turns
+  recording on for every store the process opens, and never turns it off.
+  The row replicates on `bd dolt push`/`pull`, and recording is single-writer
+  only: two clones recording at once can mint the same revision and fail the
+  pull, and a write from a writer that is not recording is folded into the
+  next recorded version under that version's actor, so keep recording on for
+  every writer of a store or off for all of them. Turning it on with
+  `bd config set` first checks every issue the store would version and
+  refuses, writing nothing, while any holds a number outside the I-JSON
+  exact-integer range (magnitude above 2^53-1, however it is spelled) in its
+  metadata or in a gate's timeout (held as nanoseconds, so about 104.25
+  days), and prints the count, the ids, the field and the fix. There is no
+  override, and the check runs once; after that, a recorded write that would
+  hold such a number fails atomically. Migration 0071 adds a nullable
+  `removed_restriction` column to `issue_versions`. `bd version` now refuses
+  an argument and suggests `bd versions <arg>`, instead of printing bd's
+  build for a mistyped `bd version bd-123`.
 - `bd blocked --flags` prints the blocked flag for each id read from stdin
   (one per line; blank lines and repeats ignored), with `--json` as
   `[{"id","is_blocked"}]` in the order the ids were given, omitting an id that
@@ -728,6 +763,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Strict `--readonly` no longer creates workspace gate files.** A
+  `bd --readonly` command took its shared workspace gates with
+  create-if-missing, so on a workspace no bd command had gated yet it left
+  `<project>/.beads.gate.lock` and the physical-root gate file
+  (`.beads/embeddeddolt.gate.lock` or `.beads/dolt.gate.lock`) behind, although
+  strict readonly promises not to mutate the workspace. It now opens an
+  existing gate file read-only and holds it shared as before, so a maintenance
+  operation still sees it and a running one still makes it wait; when no gate
+  file exists it holds nothing. Every other command still creates the files.
+- **`bd init --server --external` no longer starts a Dolt server of its own.**
+  Init builds its store config by hand and turned auto-start on for every
+  server init, so an `--external` init that named no port launched a
+  repo-local `dolt sql-server`, although `--external` says the server is
+  managed outside bd. `--external` now turns auto-start off. When the
+  external server cannot be reached, init gives one message on every route
+  (host and port, socket, shared server, auto-start pinned off): it names the
+  endpoint it dialed, says that bd did not start a server, and no longer
+  advises `bd dolt start`. With no port named at all, it asks for one
+  (`--server-port` or `BEADS_DOLT_SERVER_PORT`) instead of offering a default.
+- **A failed `bd init --server` can be retried.** A first attempt that could
+  not reach its server left an empty `.beads/dolt` and nothing on disk that
+  records the server choice, so the legacy-upgrade guard refused every retry
+  as a "legacy Dolt workspace" and no bd command could repair it. When init
+  itself selects server mode, the guard now admits exactly that root: empty,
+  with no `.local_version` witness. A pre-1.0 witness, or a `.beads/dolt` that
+  holds anything, is still refused, and commands other than `bd init` are
+  decided as before.
 - **Time-bound filters and the keyset cursor compare the same instant on every
   engine, whatever zone they are given in.** The storage filter builder binds
   every time bound (`created_*`, `updated_*`, `closed_*`, `started_*`,
