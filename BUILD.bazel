@@ -74,6 +74,13 @@ exports_files(
     visibility = ["//scripts:__pkg__"],
 )
 
+# //scripts:shell_scripts_test: Oracle A's runner, whose EXIT-trap removal of
+# its reference worktree oracle_a_script_test.go checks in a fixture repository.
+exports_files(
+    ["tests/oracle-a/run-oracle-a.sh"],
+    visibility = ["//scripts:__pkg__"],
+)
+
 # The nested Go modules' go.mod files, which mark where the root module ends:
 # //scripts:go_test_sources_test's scan of every _test.go file skips their
 # trees, as `go test ./...` does. (go.mod is in no Go partition below: it is
@@ -253,6 +260,7 @@ filegroup(
     srcs = glob(
         ["**/*.go"],
         allow_empty = True,
+        exclude = ["bazel-*/**"],
     ),
     visibility = ["//:__subpackages__"],
 )
@@ -357,6 +365,7 @@ filegroup(
         "//internal/httpclient/encode:repo_doc_files",
         "//internal/httpclient/wire:repo_doc_files",
         "//internal/idgen:repo_doc_files",
+        "//internal/initprocs:repo_doc_files",
         "//internal/jira:repo_doc_files",
         "//internal/linear:repo_doc_files",
         "//internal/lockfile:repo_doc_files",
@@ -593,6 +602,7 @@ filegroup(
         "//internal/httpclient/encode:repo_go_srcs",
         "//internal/httpclient/wire:repo_go_srcs",
         "//internal/idgen:repo_go_srcs",
+        "//internal/initprocs:repo_go_srcs",
         "//internal/jira:repo_go_srcs",
         "//internal/linear:repo_go_srcs",
         "//internal/lockfile:repo_go_srcs",
@@ -814,6 +824,7 @@ filegroup(
         "//internal/httpclient/encode:repo_go_test_srcs",
         "//internal/httpclient/wire:repo_go_test_srcs",
         "//internal/idgen:repo_go_test_srcs",
+        "//internal/initprocs:repo_go_test_srcs",
         "//internal/jira:repo_go_test_srcs",
         "//internal/linear:repo_go_test_srcs",
         "//internal/lockfile:repo_go_test_srcs",
@@ -1044,6 +1055,7 @@ filegroup(
         "//internal/httpclient/encode:repo_other_files",
         "//internal/httpclient/wire:repo_other_files",
         "//internal/idgen:repo_other_files",
+        "//internal/initprocs:repo_other_files",
         "//internal/jira:repo_other_files",
         "//internal/linear:repo_other_files",
         "//internal/lockfile:repo_other_files",
