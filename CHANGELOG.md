@@ -15,18 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plane while it is on (a wisp promoted or made persistent), stores a
   snapshot of it as a row of `issue_versions` in the same transaction. It is
   off by default and nothing is backfilled: a bead already on the issues
-  plane when it is turned on is legacy, and editing it records nothing. A
+  plane when it is turned on is legacy, and editing it records nothing, nor
+  does making it a wisp and then persistent again while recording is on (a
+  bead that participates keeps its history across that round trip). A
   recorded write leaves `updated_at` where an unrecorded one would, so
   `bd import`'s stale check sees the same timestamps either way.
   `bd versions --json` answers `{"versions": [...], "recording": bool}`; the
   command still lists what was recorded after recording is turned off, and
   proxied-server and HTTP workspaces refuse it. The setting is a row of each
   store's `config` table (`bd config set versioned-history.enabled true`),
-  and every store reads its own when it is opened: a write routed into
-  another workspace (a prefix-routed `bd update` or `bd close`,
-  `bd create --repo`) follows the target store's row, a proxied-server
-  provider reads it when it is constructed, and a long-lived `bd serve`
-  keeps the value it read until it restarts.
+  and every store reads its own in its first write (a store that only reads
+  never reads it, and a write whose read fails fails with it, changing
+  nothing): a write routed into another workspace (a prefix-routed
+  `bd update` or `bd close`, `bd create --repo`) follows the target store's
+  row, a proxied-server provider reads it in its first unit of work, and a
+  long-lived `bd serve` keeps the value it read until it restarts.
   `BD_VERSIONED_HISTORY_ENABLED=1` (or a `config.yaml` value) turns
   recording on for every store the process opens, and never turns it off.
   The row replicates on `bd dolt push`/`pull`, and recording is single-writer
@@ -34,13 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pull, and a write from a writer that is not recording is folded into the
   next recorded version under that version's actor, so keep recording on for
   every writer of a store or off for all of them. Turning it on with
-  `bd config set` first checks every issue the store would version and
+  `bd config set` first checks every issue the store would version (one
+  created, or brought onto the issues plane, while recording was on) and
   refuses, writing nothing, while any holds a number outside the I-JSON
   exact-integer range (magnitude above 2^53-1, however it is spelled) in its
   metadata or in a gate's timeout (held as nanoseconds, so about 104.25
-  days), and prints the count, the ids, the field and the fix. There is no
-  override, and the check runs once; after that, a recorded write that would
-  hold such a number fails atomically. Migration 0071 adds a nullable
+  days), and prints the count, the ids, the field and the fix. A legacy bead
+  is not versioned while recording stays on, so what it holds blocks nothing:
+  a store that has never recorded, where every bead is legacy, is not
+  refused. There is no override, and the check runs once; after that, a
+  recorded write that would hold such a number fails atomically. Turning
+  recording on through `BD_VERSIONED_HISTORY_ENABLED` or `config.yaml`
+  checks nothing ahead of time, at open or anywhere else: such a write is
+  refused when it is made. Migration 0071 adds a nullable
   `removed_restriction` column to `issue_versions`. `bd version` now refuses
   an argument and suggests `bd versions <arg>`, instead of printing bd's
   build for a mistyped `bd version bd-123`.
@@ -781,6 +790,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bd events tail --follow` can stop when its parent goes away.** A
+  follower noticed that its reader was gone only when it next wrote a
+  record, so in a quiet workspace a follower whose parent died without
+  stopping it kept polling the journal until the next write. With
+  `--exit-on-stdin-eof` (accepted only with `--follow`) it exits 0 as soon
+  as its stdin closes, whenever that happens: the parent passes a pipe as
+  stdin, and closing its end, or dying, stops the follower on every OS.
+  Without the flag stdin is ignored, as before. A follower stopped with
+  Ctrl-C while a poll is reading now exits 0 too, instead of failing with
+  `reading events journal: context canceled`.
+
 - An HTTP workspace whose server cannot be reached now says which step
   failed. A connect that is refused names the address and says nothing is
   listening; one that times out (a filtered port, a down host) names the
@@ -868,6 +888,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A `metadata.json` rewrite keeps `graph_mode` and the `graph_*` fields
   graph-preview builds write, and like those builds it omits a zero
   `graph_schema_version` and a false `graph_ready`.
+- **A graph workspace without `graph_mode` in its metadata is refused too.**
+  Graph-preview builds write a `.beads/graph-preview-format` marker before
+  `metadata.json`. bd ignored it. When an older bd had rewritten
+  `metadata.json` without `graph_mode`, bd opened the graph database by its
+  recorded name and ran Issue schema initialization against it; when
+  `metadata.json` was never written or was lost, bd fell back to the default
+  database name and created an Issue database inside the graph workspace, and
+  `bd init` initialized an Issue workspace there. A `.beads` holding that
+  marker, whatever it contains and whatever its metadata says (absent,
+  stripped, unparseable or an explicit `dependency`), is now refused wherever
+  a `graph_mode` workspace is: commands run in it or naming it with `--db` or
+  `BEADS_DB`, `bd create --repo` aimed at it, and `bd bootstrap` in a
+  workspace below it that would take its metadata exit with code 16 and a
+  hint to restore `metadata.json`, and routed and cross-repository opens fail
+  without opening its database.
+- **The Go library's opens refuse a graph workspace too.**
+  `beads.OpenBestAvailable`, `OpenBestAvailableWith`, `OpenFromConfig` and
+  `OpenGated` opened a workspace whose `metadata.json` declares a
+  `graph_mode` other than `dependency`, or whose `.beads` holds the
+  `graph-preview-format` marker, as an Issue store and ran Issue schema
+  migrations into the graph database. They now
+  return `*beads.UnsupportedWorkspaceFormatError` (match it with `errors.As`)
+  before opening, creating or changing anything, the same refusal the CLI
+  exits 16 with.
+- **`bd doctor` no longer rewrites a graph workspace listed in
+  `repos.additional`.** Its multi-repo types check read each additional
+  repository's metadata with the loader that migrates a legacy `config.json`
+  into `metadata.json`. A graph workspace whose metadata was still a
+  `config.json` (marked by `graph_mode` in it, or by the
+  `graph-preview-format` marker beside it) therefore lost that file, and with
+  it any `graph_*` key bd does not know, to a new `metadata.json` before the
+  store open refused the workspace. The check now reads that metadata without
+  migrating it and skips the database of a workspace in a format this build
+  cannot open, leaving the workspace byte-identical; it still lists the
+  custom types in that repository's `config.yaml`, as before. It also no
+  longer migrates an ordinary additional repository's legacy `config.json`
+  when there is no Dolt database there to read.
+- **Activating the HTTP backend refuses a graph workspace too.**
+  `bdhttp.Attach` and `bdhttp.Connect` activated it in a workspace whose
+  `metadata.json` declares a `graph_mode` other than `dependency`, or whose
+  `.beads` holds the `graph-preview-format` marker: they wrote the http
+  sidecar and `.gitignore`, set the `metadata.json` backend to `http` and
+  migrated a legacy `config.json`, and `Connect` handshook with the server
+  first. They now return `*bdhttp.UnsupportedWorkspaceFormatError` (the type
+  `beads.UnsupportedWorkspaceFormatError` names) before writing anything, and
+  `Connect` before it dials. `bd connect` in a linked git worktree with no
+  `.beads` of its own attaches the main checkout's `.beads`, and attached a
+  graph workspace there that only the marker or a legacy `config.json`
+  declares (refused without `--force`, it still migrated that `config.json`);
+  it now exits 16 there too, without dialing or writing.
 - **`bd setup claude --remove` no longer leaves a blank-line hole.** Removing
   the beads section from `CLAUDE.md` (or, with the other setup recipes, from
   `AGENTS.md` or `GEMINI.md`) left the blank lines around it behind, three in
@@ -947,9 +1017,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.claude/CLAUDE.md` holds just the section, rendered the same whichever
   project you run from. Claude Code loads that file in every project, so its
   section, task-tracking rules included, applies only in repositories that use
-  beads. With global or plugin hooks `--check` accepts it when the project's
-  instructions have none, or names `--global` when it is missing and the
-  project has no `CLAUDE.md` of its own. Run from `~/.claude`,
+  beads. With global hooks, or a plugin enabled in `~/.claude/settings.json`,
+  `--check` accepts it when the project's instructions have none, or names
+  `--global` when it is missing and the project has no `CLAUDE.md` of its own.
+  Run from `~/.claude`,
   or from your home directory unless `~/CLAUDE.md` still holds a section an
   earlier run left there, `--check` judges the user-level files, and from your
   home directory it names `--global` when no hooks are installed. From your
@@ -958,6 +1029,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-run `bd setup claude --global` to add the section to `~/.claude/CLAUDE.md`.
   A section an earlier `--global` run left in a directory's `CLAUDE.md` stays
   there; delete it by hand if you don't want it.
+- **`bd setup claude` names the user-level files its global install uses.**
+  The `--global` flag help listed only `~/.claude/settings.json`; it now also
+  names `~/.claude/CLAUDE.md`, which holds the beads section. Run from
+  `~/.claude` with no hooks installed, `--check` suggested `bd setup claude`,
+  a project install that puts its hook in `~/.claude/.claude/settings.json`
+  and the project-worded section (inside project scaffolding when the file is
+  new) in `~/.claude/CLAUDE.md`, which Claude Code loads in every project; it
+  now suggests `bd setup claude --global`, as it already did from your home
+  directory. Run from your home directory, `--remove` removes the section
+  from `~/CLAUDE.md` and then from `~/.claude/CLAUDE.md`, and printed
+  "Removing Claude Code integration..." before each without naming either
+  file. That line now names the file it acts on, in `bd setup factory`,
+  `opencode`, `mux` and `gemini` `--remove` too.
+- **`bd setup claude --remove` run from `~/.claude` removes a global
+  install's hooks with its section.** There the directory's `CLAUDE.md` is
+  the user-level one, so `--remove` took the global install's beads section
+  out of `~/.claude/CLAUDE.md` but left its hook in `~/.claude/settings.json`,
+  and the next `--check` failed. It now removes that hook too, as `--remove`
+  from your home directory already removes both. If it then cannot remove
+  the section, for example because `~/.claude/CLAUDE.md` is a symlink, it
+  fails instead of warning and reporting success. That includes a
+  `~/.claude/CLAUDE.md` that is an `@AGENTS.md` stub with a
+  `~/.claude/AGENTS.md` beside it: `--remove` there now treats it as the
+  user-level file, as `--global` and `--check` do, not as a project stub
+  whose beads section lives in `AGENTS.md`.
+- **`bd setup claude --remove` leaves a settings file with no bd hook as it
+  is.** It rewrote any settings file that had hooks, `settings.local.json`
+  included: keys re-sorted, `&&` written as `\u0026\u0026`, mode reset to
+  0644. A symlinked `settings.json`, as dotfile managers leave it, failed
+  the removal with `refusing to write through symlink`. It now writes the
+  file only when it removes a bd hook from it. Its "No settings file
+  found", "No hooks found" and parse-error lines now name the settings file,
+  since a removal from `~/.claude` reads two, and a settings file it cannot
+  read now stops the removal instead of being reported as not found.
+- **`bd setup gemini` keeps its beads section in `~/.gemini/GEMINI.md`.** Its
+  default, global install (also what `--global` selects) put the hook in
+  `~/.gemini/settings.json` but wrote the section, with project scaffolding,
+  into the current directory's `GEMINI.md`, even in a directory that does not
+  use beads; run from your home directory it created `~/GEMINI.md`. `--remove`
+  stripped the section a project's own `--project` install had put in its
+  `GEMINI.md` while leaving that project's hooks in place, and `--check` failed
+  in every directory but the one the install ran from. A global install and
+  removal now use only the user-level files beside `~/.gemini/settings.json`. A
+  new `~/.gemini/GEMINI.md` holds just the section, rendered the same whichever
+  project you run from; Gemini CLI loads it in every project, so the section
+  applies only in repositories that use beads. In an existing file the section
+  goes ahead of the `## Gemini Added Memories` section that Gemini CLI
+  releases up to v0.43 keep there, so memories they save later stay outside
+  it. `--check` reports a section already below that heading as stale, an
+  install moves it ahead of the heading, and the move, like `--remove`,
+  keeps the memories saved inside it. With global hooks `--check` accepts
+  the user-level section when the project's `GEMINI.md` has none, and its
+  hints for a project's `GEMINI.md` name `bd setup gemini --project`. From
+  your home directory, whose `.gemini/settings.json` is the global one, and
+  from `~/.gemini`, `--project` is the global install: it adds and removes
+  the hook in `~/.gemini/settings.json` and the user-level section together,
+  and `--check` judges that section, not one in `~/GEMINI.md`. If you ran
+  `bd setup gemini` before, re-run it to add the section to
+  `~/.gemini/GEMINI.md`. A section an earlier run left in a directory's
+  `GEMINI.md` stays there; delete it by hand if you don't want it.
+- **`bd setup claude --global` installs its hook when the beads plugin is
+  enabled only in the current project.** It skipped the hook whenever the
+  current directory's `.claude/settings.json` or `.claude/settings.local.json`
+  enabled the plugin, which left every other project without one. Claude Code
+  runs a plugin enabled in a project's settings in that project only, so a
+  global install now leaves the hooks to the plugin only when
+  `~/.claude/settings.json` enables it. `--check` likewise treats the hooks of
+  a plugin enabled only in the project's settings as the project's: it judges
+  the project's own `CLAUDE.md`, as it does with project hooks, and names
+  `bd setup claude` rather than `--global` when that file is missing. In a
+  project that enables the plugin, a global install's hook and the plugin's
+  both run `bd prime`.
 - **`bd blocked --label`, `--label-any` and `--exclude-label` apply to a row
   blocked only by an unsatisfied `external:` dependency.** The
   external-dependency policy lists such a row itself, after the label query
