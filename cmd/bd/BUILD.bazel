@@ -418,6 +418,7 @@ go_library(
         "//internal/github",
         "//internal/gitignore",
         "//internal/gitlab",
+        "//internal/historicalsqlite",
         "//internal/hooks",
         "//internal/httpapi",
         "//internal/httpclient",
@@ -1368,6 +1369,7 @@ go_test(
     deps = [
         "//:beads",
         "//cmd/bd/doctor",
+        "//cmd/bd/setup",
         "//internal/ado",
         "//internal/beads",
         "//internal/ceiling",
