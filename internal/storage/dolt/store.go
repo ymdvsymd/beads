@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -44,6 +45,7 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/gittraceenv"
+	"github.com/steveyegge/beads/internal/remedy"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -442,6 +444,19 @@ type Config struct {
 	// consulted by newServerMode's auto-start path alongside
 	// ServerPortSource.IsAuthoritative() (GH#4052).
 	ServerPortSharedServer bool
+
+	// ServerPortResolved records that the caller already resolved ServerPort
+	// by the store's port chain (doltserver.DialConfig) under the
+	// configuration of the workspace being opened, which need not be the one
+	// the process loaded. A zero ServerPort then means that nothing there
+	// names a port: ResolveServerPort still applies the port environment
+	// variables, and New its test-mode guard (applyTestModePortGuard), but
+	// ResolveServerPort does not fill the port from
+	// doltserver.DefaultConfig, which reads the process's configuration. bd
+	// init sets it for a workspace it is creating, whose process
+	// configuration can be an enclosing workspace's config.yaml naming
+	// another project's server (GH#2336).
+	ServerPortResolved bool
 
 	// Remote auth for Hosted Dolt push/pull (optional)
 	// When set, Push/Pull use the --user flag and set DOLT_REMOTE_PASSWORD env var.
@@ -1707,6 +1722,7 @@ func applyConfigDefaults(cfg *Config) {
 		}
 	}
 	ResolveServerPort(cfg)
+	applyTestModePortGuard(cfg)
 	if cfg.ServerUser == "" {
 		cfg.ServerUser = "root"
 	}
@@ -1731,15 +1747,13 @@ func applyConfigDefaults(cfg *Config) {
 // ResolveServerPort applies the store's port rule to cfg, as New does before
 // it connects. Callers that dial the store's server without opening it
 // first, like bd init's clone into an external server, use it to dial the
-// port New will.
+// port New will. It leaves a port nothing resolved at 0: such an endpoint has
+// no address to dial. The BEADS_TEST_MODE guard New applies after it
+// (applyTestModePortGuard) is not part of the rule, so a dial target computed
+// outside New never carries its port 1.
 func ResolveServerPort(cfg *Config) {
 	// Port resolution: caller-preset explicit ServerPort > BEADS_DOLT_SERVER_PORT
-	// env (or legacy BEADS_DOLT_PORT) > BEADS_TEST_MODE guard > metadata config > default.
-	// CRITICAL: BEADS_TEST_MODE=1 forces port 1 (immediate fail) if the resolved port
-	// is the production port (DefaultSQLPort). This prevents test databases from leaking
-	// onto production even when the port env var is set to 3307 by the orchestrator's beads module.
-	// Only an explicit non-production port (e.g., 43211 for a test server)
-	// overrides test mode — that's a deliberate test server assignment.
+	// env (or legacy BEADS_DOLT_PORT) > metadata config > default.
 	if cfg.ServerPort != 0 && cfg.ServerPortSource == doltserver.PortSourceUnset {
 		// The caller (e.g. `bd init --server-port`, or initGlobalDatabaseConfig's
 		// copy-forward of it) already set an explicit port before this function
@@ -1768,11 +1782,12 @@ func ResolveServerPort(cfg *Config) {
 		}
 	}
 	// If env var didn't provide a port, consult the full resolution chain:
-	// port file > config.yaml > metadata.json (GH#2590).
+	// port file > config.yaml > metadata.json (GH#2590), unless the caller
+	// already did (ServerPortResolved).
 	// Resolve from the owning .beads dir when available; cfg.Path is the Dolt
 	// data path, not the config directory, and using it directly can miss the
 	// repo-local port file or metadata.
-	if cfg.ServerPort == 0 {
+	if cfg.ServerPort == 0 && !cfg.ServerPortResolved {
 		resolveDir := cfg.BeadsDir
 		if resolveDir == "" && cfg.Path != "" {
 			resolveDir = filepath.Dir(cfg.Path)
@@ -1788,17 +1803,42 @@ func ResolveServerPort(cfg *Config) {
 	// Port 0 means "not yet resolved" — auto-start (EnsureRunning) will
 	// allocate an ephemeral port. Don't default to 3307 as that caused
 	// cross-project data leakage (GH#2098, GH#2372).
-	//
-	// Test mode guard: force port 1 (immediate fail) if we'd hit production
-	// or have no port, to prevent test databases leaking onto production.
-	// Production-port detection is generalized via isProductionPort so cities
-	// using non-3307 ports (BEADS_PRODUCTION_PORT or dolt-server.port) are
-	// covered too.
+}
+
+// applyTestModePortGuard is New's BEADS_TEST_MODE guard, applied after the
+// store's port rule (ResolveServerPort): it forces port 1 (immediate fail)
+// when the resolved port is a production port or there is none, so test
+// databases never leak onto production, even when the orchestrator's beads
+// module sets the port env var to 3307. Only an explicit non-production port
+// (e.g. 43211 for a test server) overrides it. Production-port detection is
+// generalized via isProductionPort so cities using non-3307 ports
+// (BEADS_PRODUCTION_PORT or dolt-server.port) are covered too.
+func applyTestModePortGuard(cfg *Config) {
 	if os.Getenv("BEADS_TEST_MODE") == "1" {
 		if cfg.ServerPort == 0 || isProductionPort(cfg) {
 			cfg.ServerPort = 1
 		}
 	}
+}
+
+// ErrTestModeProductionPort is wrapped by TestModeRefusesPort's refusal.
+var ErrTestModeProductionPort = errors.New("BEADS_TEST_MODE=1 refuses to dial a production Dolt server port")
+
+// TestModeRefusesPort is New's BEADS_TEST_MODE guard (applyTestModePortGuard)
+// for a caller that dials beadsDir's server at port without New, such as
+// bd init's clone into its store's server: under
+// BEADS_TEST_MODE=1 it refuses a production port (isProductionPort), so a
+// test never writes to production through a dial New would have stopped.
+// It returns nil outside test mode and for a non-production port. A port of
+// 0 is the caller's to refuse: there is nothing to dial.
+func TestModeRefusesPort(beadsDir string, port int) error {
+	if os.Getenv("BEADS_TEST_MODE") != "1" || port <= 0 {
+		return nil
+	}
+	if reasons := productionPortReasons(&Config{BeadsDir: beadsDir, ServerPort: port}); len(reasons) > 0 {
+		return fmt.Errorf("%w %d (%s)", ErrTestModeProductionPort, port, strings.Join(reasons, "; "))
+	}
+	return nil
 }
 
 // New creates a new Dolt storage backend.
@@ -1832,7 +1872,7 @@ func New(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			"refusing to connect test database %q to server %s: "+
 				"set BEADS_TEST_SERVER=1 on a dedicated test server, "+
 				"or use test helpers in internal/storage/dolt/testserver",
-			cfg.Database, addr)
+			cfg.Database, remedy.PrintedValue(addr))
 	}
 
 	return newServerMode(ctx, cfg)
@@ -1842,13 +1882,13 @@ func New(ctx context.Context, cfg *Config) (*DoltStore, error) {
 // server configurations whose storage ownership is known. It deliberately
 // does not infer locality from Path, CLIDir, or filesystem existence: external
 // servers may leave unrelated client-local directories at those locations.
-// Nor is a server at the IPv6 loopback ever one whose data directory bd
-// knows: bd's own server, shared or not, listens on 127.0.0.1 only.
+// Nor is a server at a host bd does not run its server at
+// (configfile.BdRunsServerAt) ever one whose data directory bd knows: bd's
+// own server, shared or not, listens on 127.0.0.1 only.
 func resolveLocalActiveDatabaseDir(cfg *Config) string {
 	if cfg == nil || cfg.BeadsDir == "" || cfg.Database == "" ||
 		cfg.Gateway || cfg.ProxiedServer || cfg.ServerSocket != "" ||
-		cfg.ServerTLS || !isLocalHost(cfg.ServerHost) ||
-		configfile.IsIPv6LoopbackHost(cfg.ServerHost) {
+		cfg.ServerTLS || !configfile.BdRunsServerAt(cfg.ServerHost) {
 		return ""
 	}
 
@@ -1925,7 +1965,7 @@ func buildTestModeProductionPortPanic(cfg *Config) string {
 			"%s",
 		cfg.Database,
 		cfg.Path,
-		addr,
+		remedy.PrintedValue(addr),
 		rules.String(),
 		fixLines.String(),
 	)
@@ -1964,18 +2004,12 @@ var dialProbe = func(network, addr string, timeout time.Duration) error {
 // a unit-of-work provider against the same server from the same connection
 // settings, and a transport policy that only one of them applies is a workspace
 // where CLI commands work and the HTTP server cannot connect.
+//
+// The policy is doltserver.SocketTransport's, which a dial through the
+// endpoint (doltserver.Endpoint.DialDSN) uses too, so it picks the
+// transport the store does.
 func ResolveSocketTransport(socket, host string, port int, timeout time.Duration) string {
-	if socket == "" {
-		return ""
-	}
-	if dialProbe("unix", socket, timeout) == nil {
-		return socket // socket is live — keep using it
-	}
-	if port > 0 && dialProbe("tcp", doltutil.ServerAddr(host, port), timeout) == nil {
-		debug.Logf("dolt: socket %s unreachable, falling back to TCP %s\n", socket, doltutil.ServerAddr(host, port))
-		return "" // socket down but TCP up — transparently fall back to TCP
-	}
-	return socket // both down (or no TCP port) — keep socket for the error path
+	return doltserver.SocketTransportWith(dialProbe, socket, host, port, timeout)
 }
 
 // ensureRunningDetailed starts (or reuses) the repo-local auto-started dolt
@@ -2048,6 +2082,11 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		conn, dialErr = net.DialTimeout("tcp", addr, 500*time.Millisecond)
 	}
 	if dialErr != nil {
+		// The endpoint comes from metadata.json (dolt_server_host,
+		// dolt_server_socket), which a cloned repository commits, and a
+		// dial error repeats it: each message below names both through
+		// the remedy printer, so neither can redraw the advice under it.
+		dialErr = remedy.PrintedError(dialErr)
 		// Auto-start: if enabled and connecting locally via TCP, start a server.
 		// Socket mode is excluded — auto-start creates a TCP listener, not a
 		// unix socket, so the DSN would still fail. Socket users are expected
@@ -2080,13 +2119,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 				// and "bd dolt start" describe a start bd must not make.
 				if errors.Is(startErr, doltserver.ErrExternallyManaged) {
 					if hint := externallyManagedPortHint(cfg, resolvedBeadsDir, addr); hint != "" {
-						return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\n%s", addr, dialErr, hint)
+						return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\n%s", remedy.PrintedValue(addr), dialErr, hint)
 					}
 				}
 				return nil, fmt.Errorf("Dolt server unreachable at %s and auto-start failed: %w\n\n"+
 					"To start manually: bd dolt start\n"+
 					"To disable auto-start: set dolt.auto-start: false in .beads/config.yaml",
-					addr, startErr)
+					remedy.PrintedValue(addr), remedy.PrintedTextError(startErr))
 			}
 			// Only tests should stop auto-started servers on Close(). In normal
 			// repo-local server mode, leaving the server up avoids endpoint churn
@@ -2171,7 +2210,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 					breaker.RecordFailure()
 				}
 				return nil, fmt.Errorf("Dolt server auto-started but still unreachable at %s: %w\n\n"+
-					"Check logs: %s", addr, dialErr, doltserver.LogPath(resolvedBeadsDir))
+					"Check logs: %s", remedy.PrintedValue(addr), remedy.PrintedError(dialErr), doltserver.LogPath(resolvedBeadsDir))
 			}
 		} else {
 			if breaker != nil {
@@ -2179,13 +2218,18 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			}
 			var hint string
 			if cfg.ServerSocket != "" {
+				// The socket path is metadata.json's dolt_server_socket,
+				// which a cloned repository commits: it goes into the
+				// command as one shell word, or as a <path> placeholder
+				// with the path named escaped beside it.
+				socket, note := remedy.CommandArg(runtime.GOOS, cfg.ServerSocket, "<path>")
 				hint = fmt.Sprintf("The Dolt server is not listening on socket %s.\n"+
 					"Ensure the server is started with --socket:\n"+
-					"  dolt sql-server --socket %s\n"+
+					"  dolt sql-server --socket %s%s\n"+
 					"Auto-start is not supported in socket mode.",
-					cfg.ServerSocket, cfg.ServerSocket)
+					remedy.PrintedValue(cfg.ServerSocket), socket, note)
 			} else if isExternalServerHost(cfg.ServerHost) {
-				// External (non-localhost or IPv6 loopback) server: bd
+				// A server bd does not run (configfile.BdRunsServerAt): bd
 				// does not manage it; "bd dolt start" would be wrong
 				// advice (GH#3518). Suggest verifying the external server
 				// instead. The endpoint is addr, which brackets an IPv6
@@ -2194,7 +2238,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 				hint = fmt.Sprintf("Configured Dolt server at %s is unreachable.\n"+
 					"Verify the external server is running and reachable from this host:\n"+
 					"  %s",
-					addr, doltserver.ReachabilityCheck(cfg.ServerHost, cfg.ServerPort))
+					remedy.PrintedValue(addr), doltserver.ReachabilityCheck(cfg.ServerHost, cfg.ServerPort))
 			} else if named := externallyManagedPortHint(cfg, resolvedBeadsDir, addr); named != "" {
 				// A named port declares the server externally managed
 				// (BEADS_DOLT_SERVER_PORT, dolt_server_port), which is
@@ -2210,7 +2254,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 				hint = "The Dolt server may not be running. Try:\n  bd dolt start"
 			}
 			return nil, fmt.Errorf("Dolt server unreachable at %s: %w\n\n%s",
-				addr, dialErr, hint)
+				remedy.PrintedValue(addr), dialErr, hint)
 		}
 	}
 	// Drain the MySQL handshake before closing so Close() sends FIN, not RST
@@ -2357,13 +2401,12 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		}
 	}
 
-	if isLocalHost(cfg.ServerHost) {
-		beadsDir := cfg.BeadsDir
-		if beadsDir == "" && cfg.Path != "" {
-			beadsDir = filepath.Dir(cfg.Path)
-		}
-		_ = persistResolvedPortFile(cfg, beadsDir)
+	// persistResolvedPortFile records the port only for a server bd runs.
+	portFileDir := cfg.BeadsDir
+	if portFileDir == "" && cfg.Path != "" {
+		portFileDir = filepath.Dir(cfg.Path)
 	}
+	_ = persistResolvedPortFile(cfg, portFileDir)
 
 	// All writers operate on main — transaction isolation via RunInTransaction
 	// replaces the former branch-per-worker approach (BD_BRANCH).
@@ -2476,13 +2519,15 @@ func initializeServerCircuitBreaker(cfg *Config) *circuitBreaker {
 // also set cfg.ReadOnly but must still be able to auto-start a stopped
 // managed server, per dolt_autostart_lifecycle_integration_test.go.
 //
-// The IPv6 loopback is a local host that never auto-starts: the server bd
-// would start listens on 127.0.0.1 only, so the retry would still find
-// nothing at [::1]:port and leave that server running.
+// The dial must be one the started server answers
+// (doltserver.AutoStartReaches, which doltserver.Endpoint.BDStartsServer asks
+// too): TCP, since that server never listens on a unix socket, to a host bd
+// runs its server at (configfile.BdRunsServerAt), since it listens on
+// 127.0.0.1 only, so at any other host, the IPv6 loopback included, the
+// retry would still find nothing at host:port and leave bd's server running.
 func serverOpenCanAutoStart(cfg *Config) bool {
 	return !cfg.DisableAutoStart && cfg.AutoStart && cfg.Path != "" &&
-		cfg.ServerSocket == "" && isLocalHost(cfg.ServerHost) &&
-		!configfile.IsIPv6LoopbackHost(cfg.ServerHost)
+		doltserver.AutoStartReaches(cfg.ServerHost, cfg.ServerSocket)
 }
 
 // ErrUnresolvedServerPort is wrapped by the error an open returns when it has
@@ -2490,7 +2535,7 @@ func serverOpenCanAutoStart(cfg *Config) bool {
 // unresolvedServerPortError). A caller with its own advice for that case,
 // such as `bd init --external` asking for --server-port, tests for it with
 // errors.Is.
-var ErrUnresolvedServerPort = errors.New("no Dolt server port resolved")
+var ErrUnresolvedServerPort = doltserver.ErrUnresolvedPort
 
 // unresolvedServerPortError explains an open that has no server address: no
 // socket, and no port source resolved a port. It returns nil when cfg has
@@ -2523,22 +2568,10 @@ func unresolvedServerPortError(cfg *Config, beadsDir, serverDir string) error {
 	}
 	b.WriteString("\n")
 
-	const pinPort = "BEADS_DOLT_SERVER_PORT or dolt.port in .beads/config.yaml"
-	switch {
-	case isExternalServerHost(cfg.ServerHost):
-		b.WriteString(doltserver.UnresolvedPortAdvice(cfg.ServerHost))
-	case doltserver.IsAutoStartDisabled() || !cfg.AutoStart:
-		if doltserver.IsAutoStartDisabled() {
-			b.WriteString("dolt.auto-start is off, so bd does not start this workspace's Dolt server.\n")
-		} else {
-			b.WriteString("This workspace's Dolt server is externally managed, so bd does not start it.\n")
-		}
-		fmt.Fprintf(&b, "Whatever manages the server must publish its port again (normally by writing %s), "+
-			"or pin the port with %s.", portFile, pinPort)
-	default:
-		b.WriteString("This command does not start a Dolt server. Run a bd command that can start one, " +
-			"or start it with:\n  bd dolt start")
-	}
+	// The remedy paragraph is the one an endpoint with no port gives
+	// (doltserver.Endpoint.UnresolvedAdvice).
+	b.WriteString(doltserver.UnresolvedPortRemedy(cfg.ServerHost, portFile,
+		doltserver.IsAutoStartDisabled(), !cfg.AutoStart))
 	return fmt.Errorf("%w for %s\n\n%s", ErrUnresolvedServerPort, beadsDir, b.String())
 }
 
@@ -2562,12 +2595,12 @@ func externallyManagedPortHint(cfg *Config, beadsDir, addr string) string {
 // persistResolvedPortFile records the port a successful local open reached in
 // bd's port file. It writes no pid file, so the record does not make the
 // server bd's own: doltserver.ExternalPortSetting still names the setting
-// that declared the port when a later open finds the server down. A server at
-// the IPv6 loopback gets no record: the port file names a port on 127.0.0.1,
-// where bd's own server listens, and doltserver.DefaultConfig ignores it for
-// that host.
+// that declared the port when a later open finds the server down. Only a
+// server at a host bd runs its server at (configfile.BdRunsServerAt) gets a
+// record: the port file names a port on 127.0.0.1, where bd's own server
+// listens, and doltserver.DefaultConfig ignores it for any other host.
 func persistResolvedPortFile(cfg *Config, beadsDir string) error {
-	if cfg.DisableAutoStart || !shouldPersistResolvedPortFile() || configfile.IsIPv6LoopbackHost(cfg.ServerHost) {
+	if cfg.DisableAutoStart || !shouldPersistResolvedPortFile() || !configfile.BdRunsServerAt(cfg.ServerHost) {
 		return nil
 	}
 	return ensureResolvedPortFile(beadsDir, cfg.ServerPort)
@@ -2587,8 +2620,9 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string, 
 		return nil // can't verify without knowing beadsDir
 	}
 
-	// Load local project ID from metadata.json
-	metaCfg, err := configfile.Load(beadsDir)
+	// Load local project ID from metadata.json. A read: LoadForDiscovery
+	// never migrates a legacy config.json, which a read-only open must not.
+	metaCfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil || metaCfg == nil {
 		return nil // no local config — skip verification
 	}
@@ -2661,7 +2695,8 @@ func (s *DoltStore) verifyGlobalProjectIdentity(ctx context.Context, beadsDir st
 		return nil
 	}
 
-	metaCfg, err := configfile.Load(beadsDir)
+	// A read, as in verifyProjectIdentity.
+	metaCfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil || metaCfg == nil {
 		return nil
 	}
@@ -2685,25 +2720,13 @@ func (s *DoltStore) verifyGlobalProjectIdentity(ctx context.Context, beadsDir st
 	return nil
 }
 
-// isLocalHost returns true if the host refers to the local machine.
-func isLocalHost(host string) bool {
-	switch host {
-	case "", "127.0.0.1", "localhost", "::1", "[::1]":
-		return true
-	}
-	return false
-}
-
 // isExternalServerHost reports whether host names a server bd does not
-// manage, for the purposes of connect-failure hints (GH#3518). That is a
-// host off this machine by the mode-inference classification in
-// internal/configfile, which unlike isLocalHost normalizes case/whitespace
-// and treats 0.0.0.0 as local (the two must agree, or an unreachable local
-// server gets external-server advice with no "bd dolt start" recovery
-// hint), or the IPv6 loopback in either spelling: bd's own server listens
-// on 127.0.0.1 only, so "bd dolt start" cannot bring up a server there.
+// manage, for the purposes of connect-failure hints (GH#3518): any host but
+// the one bd runs its own server at (doltserver.HostRunsBDServer, which is
+// configfile.BdRunsServerAt), so "bd dolt start" is advised exactly where bd
+// would auto-start.
 func isExternalServerHost(host string) bool {
-	return !configfile.IsLocalHostString(host) || configfile.IsIPv6LoopbackHost(host)
+	return !doltserver.HostRunsBDServer(host)
 }
 
 // createDatabaseRefusedError is the error for a CREATE DATABASE whose
@@ -2711,7 +2734,8 @@ func isExternalServerHost(host string) bool {
 // in the dial-failure hint, only a server bd can start gets `bd dolt start`;
 // an external one, or one at the IPv6 loopback, gets the reachability check.
 func createDatabaseRefusedError(cfg *Config, err error) error {
-	addr := doltutil.ServerAddr(cfg.ServerHost, cfg.ServerPort)
+	addr := doltutil.PrintedServerAddr(cfg.ServerHost, cfg.ServerPort)
+	err = remedy.PrintedError(err)
 	if isExternalServerHost(cfg.ServerHost) {
 		return fmt.Errorf("failed to connect to Dolt server at %s: %w\n\n"+
 			"Verify the external server is running and reachable from this host:\n  %s",
@@ -2965,7 +2989,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 	if cfg.Gateway {
 		if err := db.PingContext(ctx); err != nil {
 			return nil, "", serverConnFacts{}, fmt.Errorf("failed to connect to gateway server %s (database %q): %w",
-				doltutil.ServerAddr(cfg.ServerHost, cfg.ServerPort), cfg.Database, err)
+				doltutil.PrintedServerAddr(cfg.ServerHost, cfg.ServerPort), cfg.Database, remedy.PrintedError(err))
 		}
 		// A connect proves the gateway accepted the credential, NOT that it
 		// honored the database name. A gateway scopes connections by
@@ -3064,7 +3088,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 	dbExists, checkErr := databaseExistsOnServer(ctx, initDB, cfg.Database)
 	if checkErr != nil {
 		return nil, "", serverConnFacts{}, fmt.Errorf("failed to check if database %q exists on server %s: %w",
-			cfg.Database, doltutil.ServerAddr(cfg.ServerHost, cfg.ServerPort), checkErr)
+			cfg.Database, doltutil.PrintedServerAddr(cfg.ServerHost, cfg.ServerPort), remedy.PrintedError(checkErr))
 	}
 
 	// created reports whether THIS call's CREATE DATABASE won the race and
@@ -3362,13 +3386,13 @@ func sharedServerDatabase(cfg *Config) bool {
 	if cfg == nil || cfg.BeadsDir == "" {
 		return true
 	}
-	// Somebody else's server by construction: a host that is not this
-	// machine, the IPv6 loopback, a TLS endpoint (Hosted Dolt), or a unix
-	// socket — bd's own auto-start only ever creates a TCP listener on
+	// Somebody else's server by construction: a host bd does not run its
+	// server at (configfile.BdRunsServerAt: another machine, the IPv6
+	// loopback, another loopback address), a TLS endpoint (Hosted Dolt), or
+	// a unix socket — bd's own auto-start only ever creates a TCP listener on
 	// 127.0.0.1. So state files a server bd started there left behind prove
 	// nothing about a server at [::1], even on the same port.
-	if !isLocalHost(cfg.ServerHost) || configfile.IsIPv6LoopbackHost(cfg.ServerHost) ||
-		cfg.ServerTLS || cfg.ServerSocket != "" {
+	if !configfile.BdRunsServerAt(cfg.ServerHost) || cfg.ServerTLS || cfg.ServerSocket != "" {
 		return true
 	}
 	// The one shared topology that is otherwise indistinguishable from an
@@ -4550,7 +4574,7 @@ func (s *DoltStore) prepareCLIRouteForGitProtocol(ctx context.Context, remote st
 			continue
 		}
 		if !doltutil.IsGitProtocolURL(r.URL) {
-			return false, fmt.Errorf("remote %q (%s) is persisted on disk but not yet visible to this sql-server (GH#2118 cold start); retry shortly, or restart the dolt sql-server if it persists", remote, r.URL)
+			return false, fmt.Errorf("remote %q (%s) is persisted on disk but not yet visible to this sql-server (GH#2118 cold start); retry shortly, or restart the dolt sql-server if it persists", remote, remedy.PrintedValue(r.URL))
 		}
 		if r.Ref != "" {
 			// The proxied CLI refuses remote parameters, so a ref remote is
@@ -4559,12 +4583,16 @@ func (s *DoltStore) prepareCLIRouteForGitProtocol(ctx context.Context, remote st
 			// about an external server. The remedy names the procedure the
 			// server accepts (the proxied CLI in its directory would refuse
 			// the same --ref, and bd's own remote add finds the persisted
-			// remote and returns without a SQL add).
+			// remote and returns without a SQL add). The remote, URL and ref
+			// are named escaped (remedy.EscapedValue), as the statement that
+			// re-adds them is when no quoting passes it on: a $( ) or a
+			// backtick in a persisted URL is not live on the line a user
+			// copies the remedy from.
 			if s.localActiveDatabaseDir == "" || s.localActiveDatabaseDir != s.CLIDir() {
-				return false, fmt.Errorf("remote %q (%s on %s) is persisted on disk but not visible to this sql-server (GH#2118 cold start), and this bd does not own the server's data directory; re-add it on that server with: %s", remote, r.URL, r.Ref, coldStartReaddRemedy(remote, r.URL, r.Ref))
+				return false, fmt.Errorf("remote %s (%s on %s) is persisted on disk but not visible to this sql-server (GH#2118 cold start), and this bd does not own the server's data directory; re-add it on that server %s", remedy.EscapedValue(remote), remedy.EscapedValue(r.URL), remedy.EscapedValue(r.Ref), coldStartReaddRemedy(runtime.GOOS, remote, r.URL, r.Ref))
 			}
 			if err := versioncontrolops.AddRemote(ctx, s.db, remote, r.URL, r.Ref); err != nil && !strings.Contains(strings.ToLower(err.Error()), "already exists") {
-				return false, fmt.Errorf("remote %q (%s on %s) is persisted on disk but not visible to this sql-server (GH#2118 cold start), and re-adding it over SQL failed: %w", remote, r.URL, r.Ref, err)
+				return false, fmt.Errorf("remote %q (%s on %s) is persisted on disk but not visible to this sql-server (GH#2118 cold start), and re-adding it over SQL failed: %w", remote, remedy.PrintedValue(r.URL), remedy.PrintedValue(r.Ref), err)
 			}
 		}
 		if err := s.ensureMatchingCLIRemote(remote, r.URL, r.Ref); err != nil {
@@ -4575,17 +4603,36 @@ func (s *DoltStore) prepareCLIRouteForGitProtocol(ctx context.Context, remote st
 	return false, nil
 }
 
-// coldStartReaddRemedy is the command an operator runs to register a ref
-// remote on a sql-server this bd does not own: bd sql with a DOLT_REMOTE call.
-// The values are user data that lands in a message meant to be pasted into a
-// shell, so the SQL literals are double-quoted with their escapes and the
-// whole statement is single-quoted for the shell, which keeps an apostrophe,
-// a dollar sign, or a backtick in a URL from changing the command.
-func coldStartReaddRemedy(remote, url, ref string) string {
+// coldStartReaddRemedy completes the refusal of a ref remote on a sql-server
+// this bd does not own ("re-add it on that server ..."): the DOLT_REMOTE call
+// that registers it there. The values are repository data (the persisted
+// remote's URL and ref), so the SQL literals are double-quoted with their
+// escapes, and the statement goes into a paste-ready bd sql command only as
+// the remedy printer quotes it for the shell on goos
+// (remedy.ShellQuotedFor): single-quoted on POSIX, which keeps a dollar sign
+// or a backtick in a URL from changing the command. On Windows the
+// statement's own double quotes and commas cannot be passed through cmd.exe or
+// PowerShell to bd.exe as one argument (Go's argument parsing split the
+// single-quoted form into eight). On POSIX the statement has no quoting
+// PowerShell and fish agree on when it holds an apostrophe or a backslash,
+// which a value's double quote becomes too (SQLDoubleQuoted spells it \"),
+// or one of ‘ ’ ‚ ‛ (U+2018 to U+201B), which end single quotes in
+// PowerShell, and none at all when a value does not print as itself. In
+// each of those cases the remedy names the statement on its own, to run as
+// bd sql's one argument or in a Dolt SQL shell, rather than a command that
+// would run something else, and escaped (remedy.EscapedValue), as a value no
+// quoting passes on is named beside a placeholder (remedy.CommandArg): printed
+// as it is, a $( ) or a backtick in the URL sits inside the statement's own
+// double quotes, where PowerShell and Git Bash run it for a user who pastes
+// the line.
+func coldStartReaddRemedy(goos, remote, url, ref string) string {
 	stmt := fmt.Sprintf("CALL DOLT_REMOTE(%s, %s, %s, %s, %s)",
 		doltutil.SQLDoubleQuoted("add"), doltutil.SQLDoubleQuoted("--ref"),
 		doltutil.SQLDoubleQuoted(ref), doltutil.SQLDoubleQuoted(remote), doltutil.SQLDoubleQuoted(url))
-	return "bd sql " + doltutil.ShellQuote(stmt)
+	if quoted, ok := remedy.ShellQuotedFor(goos, stmt); ok {
+		return "with: bd sql " + quoted
+	}
+	return "by running this SQL statement there, as the one argument of bd sql (quoted for your shell) or in a Dolt SQL shell: " + remedy.EscapedValue(stmt)
 }
 
 // shouldUseCLIForGitProtocol is a compatibility wrapper for tests and older
