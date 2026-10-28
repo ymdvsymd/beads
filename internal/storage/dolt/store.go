@@ -52,6 +52,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/kvkeys"
 	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -261,6 +262,11 @@ func autoStartRelease(serverDir string) error {
 // running — we didn't start it, so we don't stop it, but its port file
 // write must still be undone.
 //
+// Stop accepts a server this process launched even where the process list
+// cannot be read (GH#7214), so the restore below does not leave the new
+// server's pid file beside another port. Skipping the restore when a stop
+// fails would reopen the bypass described above.
+//
 // Best-effort throughout: cleanup failures are reported on stderr but never
 // returned, so they cannot mask the caller's fail-closed error, which is the
 // one that matters.
@@ -372,6 +378,10 @@ type DoltStore struct {
 	// auto-start. Close() uses it to stop the server when the last store
 	// referencing it is closed (tracked via autoStartRefs).
 	autoStartedServerDir string
+
+	// createdDatabase reports whether this store's open created its database
+	// (serverConnFacts.created); see CreatedDatabase.
+	createdDatabase bool
 }
 
 // Config holds Dolt database configuration
@@ -397,6 +407,24 @@ type Config struct {
 	// value. That default is the guarantee — setting it true on such an open
 	// would make it eligible to sweep.
 	ClassifiedRead bool
+
+	// RequireReadableSchema makes an open that will not migrate the database
+	// (ReadOnly, or Gateway, whose server owns the schema) refuse one whose
+	// schema is behind this binary's and lacks a column the shared issue
+	// projection selects, with *schema.SchemaBehindError
+	// (schema.CheckReadableDrift). Such a database cannot answer a single
+	// issue read; without the check the open succeeds and every list, show
+	// and ready fails afterwards on an unknown column. A behind database that
+	// has every projected column still opens, so reads keep working through
+	// the upgrade window (bd-578h9.5, gastownhall/beads#5920). A migrating
+	// open needs none of this: its consent and gate refusals name a behind
+	// schema before anything reads it.
+	//
+	// Opt-in, false by default, because diagnostic opens (bd doctor, the
+	// version-bump probe) must still reach a behind database to report on it,
+	// and a preview reports an incompatibility through its own query
+	// (embeddeddolt.OpenForPreviewCommand's policy).
+	RequireReadableSchema bool
 
 	// LenientOpen opens the store leniently: a migration gate refusal (#4259),
 	// a dirty-working-set refusal (#4566) or a migration-consent refusal
@@ -2026,6 +2054,35 @@ var ensureRunningDetailed = doltserver.EnsureRunningDetailed
 // dolt sql-server process.
 var stopRejectedAutoStartedServer = doltserver.Stop
 
+// dialServer makes newServerMode's fail-fast connection to the server.
+// Declared as a var (matching dialProbe above) so unit tests can stub a dial
+// failure, such as a sandbox refusing the connection, without a live server.
+var dialServer = net.DialTimeout
+
+// issueProjectionColumns are the columns every issue read selects from the
+// row (sqlbuild.IssueBaseColumns, shared by both planes). checkOpenSchemaDrift
+// requires them on issues, the replicated table whose shape the schema cursor
+// describes.
+var issueProjectionColumns = sqlbuild.ColumnNames(sqlbuild.IssueBaseColumns)
+
+// checkOpenSchemaDrift is newServerMode's schema drift check. Every open
+// refuses a database ahead of this binary (schema.CheckForwardDrift). An open
+// that will not migrate and sets Config.RequireReadableSchema also refuses,
+// from the same version read, one behind it that lacks a projected column
+// (schema.CheckReadableDrift). Through a gateway that refusal names the
+// server administrator's remedy, since bd never migrates a gateway's schema.
+func checkOpenSchemaDrift(ctx context.Context, db *sql.DB, cfg *Config) error {
+	if !cfg.RequireReadableSchema || (!cfg.ReadOnly && !cfg.Gateway) {
+		return schema.CheckForwardDrift(ctx, db)
+	}
+	err := schema.CheckReadableDrift(ctx, db, "issues", issueProjectionColumns)
+	var behind *schema.SchemaBehindError
+	if cfg.Gateway && errors.As(err, &behind) {
+		behind.Gateway = true
+	}
+	return err
+}
+
 // newServerMode creates a DoltStore connected to a running dolt sql-server.
 // This path is pure Go and does not require CGO.
 func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
@@ -2077,10 +2134,10 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	var dialErr error
 	if cfg.ServerSocket != "" {
 		addr = cfg.ServerSocket
-		conn, dialErr = net.DialTimeout("unix", cfg.ServerSocket, 500*time.Millisecond)
+		conn, dialErr = dialServer("unix", cfg.ServerSocket, 500*time.Millisecond)
 	} else {
 		addr = doltutil.ServerAddr(cfg.ServerHost, cfg.ServerPort)
-		conn, dialErr = net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		conn, dialErr = dialServer("tcp", addr, 500*time.Millisecond)
 	}
 	if dialErr != nil {
 		// The endpoint comes from metadata.json (dolt_server_host,
@@ -2168,9 +2225,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 					// unreachable").
 					if cfg.ServerPortSharedServer {
 						undoRejectedAutoStart(serverDir, startedByUs, autoStartedDir, portFileSnap, snapErr)
-						if breaker != nil {
-							breaker.RecordFailure()
-						}
+						recordDialFailure(breaker, dialErr)
 						return nil, fmt.Errorf(
 							"Shared Dolt server configured at port %d (source: %s) is unreachable; "+
 								"auto-start started a repo-local server on port %d instead, but bd will "+
@@ -2184,9 +2239,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 					}
 					if cfg.ServerPortSource.IsAuthoritative() {
 						undoRejectedAutoStart(serverDir, startedByUs, autoStartedDir, portFileSnap, snapErr)
-						if breaker != nil {
-							breaker.RecordFailure()
-						}
+						recordDialFailure(breaker, dialErr)
 						return nil, fmt.Errorf(
 							"Dolt server configured at port %d (source: %s) is unreachable; "+
 								"auto-start started a new server on port %d, but bd will not "+
@@ -2209,22 +2262,17 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 				breaker = maybeNewCircuitBreaker(cfg.ServerHost, cfg.ServerPort, cfg.Database)
 			}
 			// Retry connection with longer timeout (server just started)
-			conn, dialErr = net.DialTimeout("tcp", addr, 2*time.Second)
+			conn, dialErr = dialServer("tcp", addr, 2*time.Second)
 			if dialErr != nil {
 				// Release auto-start ref on connection failure
 				if autoStartedDir != "" {
 					_ = autoStartRelease(autoStartedDir)
 				}
-				if breaker != nil {
-					breaker.RecordFailure()
-				}
-				return nil, fmt.Errorf("Dolt server auto-started but still unreachable at %s: %w\n\n"+
-					"Check logs: %s", remedy.PrintedValue(addr), remedy.PrintedError(dialErr), doltserver.LogPath(resolvedBeadsDir))
+				recordDialFailure(breaker, dialErr)
+				return nil, autoStartRedialError(addr, dialErr, startedByUs, doltserver.LogPath(resolvedBeadsDir))
 			}
 		} else {
-			if breaker != nil {
-				breaker.RecordFailure()
-			}
+			recordDialFailure(breaker, dialErr)
 			var hint string
 			if cfg.ServerSocket != "" {
 				// The socket path is metadata.json's dolt_server_socket,
@@ -2328,6 +2376,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		readOnly:               cfg.ReadOnly,
 		classifiedRead:         cfg.ClassifiedRead,
 		autoStartedServerDir:   autoStartedDir,
+		createdDatabase:        dbFacts.created,
 	}
 
 	// Forward-drift guard runs on read-only AND writable opens. A binary older
@@ -2335,8 +2384,10 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	// when the DB is already past the binary's latest migration (atLatest uses
 	// >=), so without this guard a writable open would proceed and later queries
 	// would fail with cryptic unknown-column errors instead of a clear
-	// "upgrade bd" message (the stale-binary incident behind #4135/#4137).
-	if err := schema.CheckForwardDrift(ctx, db); err != nil {
+	// "upgrade bd" message (the stale-binary incident behind #4135/#4137). An
+	// open that will not migrate also refuses, when it asks to, a database
+	// behind the binary that its reads cannot query (checkOpenSchemaDrift).
+	if err := checkOpenSchemaDrift(ctx, db, cfg); err != nil {
 		return nil, err
 	}
 
@@ -2599,6 +2650,30 @@ func externallyManagedPortHint(cfg *Config, beadsDir, addr string) string {
 		decl.Setting = "--server-port"
 	}
 	return decl.Advice(addr)
+}
+
+// autoStartRedialError explains newServerMode's failed dial of the server
+// auto-start returned at addr: one it started (startedByUs), or a tracked one
+// it adopted, which it may not have been able to verify (GH#7214). A dial
+// refused by local policy says nothing about the server, so its log would not
+// explain it either.
+func autoStartRedialError(addr string, dialErr error, startedByUs bool, logPath string) error {
+	what := "Dolt server unreachable"
+	if startedByUs {
+		what = "Dolt server auto-started but still unreachable"
+	}
+	var advice string
+	switch {
+	case isLocalDialRefusal(dialErr):
+		advice = fmt.Sprintf("A local policy (a sandbox or firewall) refused the connection, so the server may be healthy.\n"+
+			"Allow bd to connect to %s, or run bd outside the sandbox", remedy.PrintedValue(addr))
+	case startedByUs:
+		advice = "Check logs: " + logPath
+	default:
+		advice = "Check logs: " + logPath + "\n" +
+			"If the recorded server is gone, clear its state: bd dolt stop"
+	}
+	return fmt.Errorf("%s at %s: %w\n\n%s", what, remedy.PrintedValue(addr), remedy.PrintedError(dialErr), advice)
 }
 
 // persistResolvedPortFile records the port a successful local open reached in
@@ -3661,6 +3736,19 @@ func (s *DoltStore) Path() string {
 // migrations into its history (bd-6dnrw.32, GH#3231).
 func (s *DoltStore) IsReadOnly() bool {
 	return s.readOnly
+}
+
+// CreatedDatabase reports whether opening this store created its database
+// on the server: its bare CREATE DATABASE won the server's arbitration
+// (serverConnFacts.created), so the database holds nothing bd did not just
+// put there. It is false for every open that found the database on the
+// server, by connecting to it, by SHOW DATABASES, or by losing the CREATE
+// DATABASE race to another open, and for a gateway server, on which bd never
+// creates a database. bd doctor --fix's Database repair imports issues.jsonl
+// into a database its own open created, and into one a local directory's
+// absence merely suggested was missing only when that has no issues.
+func (s *DoltStore) CreatedDatabase() bool {
+	return s.createdDatabase
 }
 
 // CLIDir returns the directory for dolt CLI operations (push/pull/remote/fetch).
